@@ -18,10 +18,14 @@ for dev in "$@"; do
         [[ -d $pdir ]] || continue
         pn="$(basename "$pdir")"
         devspec="$(cat "$pdir/dev")"
-        if [[ ! -b /dev/$pn ]]; then
-            mknod "/dev/$pn" b "${devspec%%:*}" "${devspec##*:}"
-            echo "partprobe-shim: created /dev/$pn (${devspec})" >&2
-        fi
+        # Always recreate rather than skipping when the node exists. Partition
+        # minors are allocated dynamically, so a node left over from an earlier
+        # losetup can point at the wrong device -- which surfaces later as
+        # "Can't open blockdev" on an otherwise valid partition. partprobe is
+        # only ever called before anything is mounted, so replacing is safe.
+        rm -f "/dev/$pn"
+        mknod "/dev/$pn" b "${devspec%%:*}" "${devspec##*:}"
+        echo "partprobe-shim: /dev/$pn -> ${devspec}" >&2
     done
 done
 exit $rc

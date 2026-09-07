@@ -109,17 +109,17 @@ set_pw root
 set_pw alarm
 rm -f /tmp/firstboot-pw.err
 
-# Autologin this user on tty1; ~/.bash_profile then starts sway.
-install -d "$(dirname "$DROPIN")"
-cat > "$DROPIN" <<EOF
-[Service]
-ExecStart=
-ExecStart=-/sbin/agetty --autologin ${USERNAME} --noclear %I \$TERM
-EOF
-systemctl daemon-reload
+# No autologin: the machine requires a login at every boot. Remove any drop-in
+# left by an earlier image so an upgrade does not silently keep autologin on.
+if [[ -f $DROPIN ]]; then
+    rm -f "$DROPIN"
+    rmdir "$(dirname "$DROPIN")" 2>/dev/null || true
+    systemctl daemon-reload
+    printf '  Removed a stale autologin override; this machine requires a login.\n'
+fi
 
 install -d "$(dirname "$STAMP")"
 printf 'user=%s\ndate=%s\n' "$USERNAME" "$(date -Iseconds)" > "$STAMP"
 
-printf '\n  Account ready. Starting the desktop as %s ...\n\n' "$USERNAME"
+printf '\n  Account ready. Log in as %s at the prompt.\n\n' "$USERNAME"
 sleep 2

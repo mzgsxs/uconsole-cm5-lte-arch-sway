@@ -1,20 +1,40 @@
 #!/usr/bin/env bash
-# Toggle the panel backlight. Bound to a short power-key press.
+# Toggle the panel backlight, locking the session on the way down.
 #
-# Deliberately uses the backlight, NOT 'output dpms off': on this cwu50 DSI
-# panel a dpms power-down has been observed not to come back (report S3.8),
-# which presents as a hung machine. The backlight is safe and instant.
+# Bound to a short power-key press. Deliberately drives the BACKLIGHT and not
+# `output dpms off`: on this cwu50 DSI panel a dpms power-down has been observed
+# never to come back (report S3.8), which presents as a hung machine.
+#
+# Blanking also starts swaylock, so bringing the device back requires the
+# password. Locking happens BEFORE the backlight goes out, so the desktop is
+# never briefly visible on wake.
 set -uo pipefail
 STATE=/run/user/$(id -u)/uconsole-backlight.save
 
 cur=$(brightnessctl get 2>/dev/null || echo 0)
 max=$(brightnessctl max 2>/dev/null || echo 0)
 
+lock_session() {
+    command -v swaylock >/dev/null 2>&1 || {
+        logger -t uconsole-screen-toggle "WARNING: swaylock not installed; blanking WITHOUT locking"
+        return 0
+    }
+    # Already locked from a previous press -- nothing to do.
+    pgrep -x swaylock >/dev/null 2>&1 && return 0
+    # -f daemonises. Without it this script would block until the user unlocked,
+    # and the backlight would never actually go off.
+    if ! swaylock -f -c 000000 >/dev/null 2>&1; then
+        logger -t uconsole-screen-toggle "WARNING: swaylock failed to start; screen blanked WITHOUT locking"
+    fi
+}
+
 if [[ ${cur:-0} -gt 0 ]]; then
     echo "$cur" > "$STATE" 2>/dev/null || true
+    lock_session
     brightnessctl set 0 >/dev/null 2>&1
 else
-    # Restore the saved level; fall back to 40% if we have no record.
+    # Waking: restore the previous level. swaylock is already on screen and will
+    # ask for the password.
     if [[ -r $STATE ]]; then
         brightnessctl set "$(cat "$STATE")" >/dev/null 2>&1
     else

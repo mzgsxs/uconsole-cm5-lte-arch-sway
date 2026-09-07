@@ -121,7 +121,8 @@ check "sway config scales the DSI panel" "grep -q 'output DSI-2 scale' $MNT/home
 check "waybar config present"            "[[ -s $MNT/home/alarm/.config/waybar/config ]]"
 check "alarm home owned by alarm"        "[[ -d $MNT/home/alarm/.config ]] && [[ \$(stat -c%U $MNT/home/alarm/.config) == alarm ]]"
 check "expand-root script executable"    "[[ -x $MNT/usr/local/bin/uconsole-expand-root ]]"
-check "tty1 autologin drop-in present"   "[[ -s $MNT/etc/systemd/system/getty@tty1.service.d/autologin.conf ]]"
+# Autologin removed deliberately: the machine must require a login at boot.
+check "no tty1 autologin drop-in"       "[[ ! -e $MNT/etc/systemd/system/getty@tty1.service.d/autologin.conf ]]"
 check "bash_profile launches sway on vt1" "grep -q 'exec sway' $MNT/home/alarm/.bash_profile"
 
 echo
@@ -204,6 +205,8 @@ check "firstboot script present"      "[[ -x $MNT/usr/local/bin/uconsole-firstbo
 check "firstboot service present"     "[[ -s $MNT/etc/systemd/system/uconsole-firstboot-user.service ]]"
 check "firstboot service enabled"     "[[ -L $MNT/etc/systemd/system/multi-user.target.wants/uconsole-firstboot-user.service ]]"
 check "firstboot runs before the getty" "grep -q 'Before=getty@tty1.service' $MNT/etc/systemd/system/uconsole-firstboot-user.service"
+check "firstboot does not enable autologin" "! grep -q 'agetty --autologin' $MNT/usr/local/bin/uconsole-firstboot-user"
+check "firstboot clears a stale autologin"  "grep -q 'rm -f \"\$DROPIN\"' $MNT/usr/local/bin/uconsole-firstboot-user"
 check "firstboot owns tty1"           "grep -q 'TTYPath=/dev/tty1' $MNT/etc/systemd/system/uconsole-firstboot-user.service"
 check "firstboot sets root password"  "grep -q 'set_pw root' $MNT/usr/local/bin/uconsole-firstboot-user"
 check "firstboot sets alarm password" "grep -q 'set_pw alarm' $MNT/usr/local/bin/uconsole-firstboot-user"
@@ -384,6 +387,35 @@ check "dispatcher not group/world writable" "[[ \$(stat -c%a $MNT/etc/NetworkMan
 check "dispatcher skips tailscale's own iface" "grep -q 'tailscale\*|ts\*' $MNT/etc/NetworkManager/dispatcher.d/50-uconsole-tailscale"
 check "uconsole-wan nudges on switch"   "grep -c 'tailscale_follow' $MNT/usr/local/bin/uconsole-wan | grep -qE '[4-9]'"
 check "overlay scripts are root-owned"  "[[ -f $MNT/usr/local/bin/uconsole-wan ]] && [[ \$(stat -c%u $MNT/usr/local/bin/uconsole-wan) -eq 0 ]]"
+
+echo
+echo "### 19. login and lock-on-wake"
+check "swaylock installed"             "[[ -x $MNT/usr/bin/swaylock ]]"
+check "swaylock has a PAM config"      "[[ -s $MNT/etc/pam.d/swaylock ]]"
+check "screen toggle locks the session" "grep -q 'swaylock -f' $MNT/usr/local/bin/uconsole-screen-toggle"
+check "lock happens before blanking"   "grep -q 'lock_session' $MNT/usr/local/bin/uconsole-screen-toggle"
+check "unlock failure is logged, not silent" "grep -q 'WITHOUT locking' $MNT/usr/local/bin/uconsole-screen-toggle"
+check "sway still starts after login"  "grep -q 'exec sway' $MNT/etc/skel/.bash_profile"
+
+echo
+echo "### 20. hardening and resources"
+echo "-- zram (was installed but inert) --"
+check "zram-generator config present"  "[[ -s $MNT/etc/systemd/zram-generator.conf ]]"
+check "zram sized against RAM"         "grep -q 'zram-size' $MNT/etc/systemd/zram-generator.conf"
+check "zram uses zstd"                 "grep -q 'compression-algorithm = zstd' $MNT/etc/systemd/zram-generator.conf"
+check "zram-generator installed"       "[[ -x $MNT/usr/lib/systemd/system-generators/zram-generator ]]"
+echo "-- firewall --"
+check "nftables ruleset present"       "[[ -s $MNT/etc/nftables.conf ]]"
+check "nftables.service enabled"       "[[ -L $MNT/etc/systemd/system/multi-user.target.wants/nftables.service ]]"
+check "input policy is drop"           "grep -qE 'policy drop' $MNT/etc/nftables.conf"
+check "ssh restricted to LAN/tailnet"  "grep -q '100.64.0.0/10' $MNT/etc/nftables.conf"
+check "ssh is NOT open to the world"   "! grep -qE '^[[:space:]]*tcp dport ssh accept' $MNT/etc/nftables.conf"
+check "tailscale interface trusted"    "grep -q 'iifname \"tailscale0\" accept' $MNT/etc/nftables.conf"
+check "loopback and conntrack allowed" "grep -q 'iif lo accept' $MNT/etc/nftables.conf && grep -q 'established, related' $MNT/etc/nftables.conf"
+echo "-- kernel update path --"
+check "kernel-check helper present"    "[[ -x $MNT/usr/local/bin/uconsole-kernel-check ]]"
+check "kernel-check queries upstream"  "grep -q 'ak-rex/ClockworkPi-linux' $MNT/usr/local/bin/uconsole-kernel-check"
+check "kernel-check explains pacman will not update it" "grep -q 'never update this kernel' $MNT/usr/local/bin/uconsole-kernel-check"
 
 echo
 echo "########################################"

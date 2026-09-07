@@ -106,6 +106,12 @@ systemctl enable uconsole-battery-guard.timer
 # hardcoded 5s timer is the whole wait, and push the hardware force-off to its
 # maximum so the clean shutdown always beats the unclean cut.
 systemctl enable uconsole-powerkey-tune.service
+# Inbound firewall. sshd listens on every interface with password auth, and this
+# machine roams onto public Wi-Fi and a carrier LTE address; the ruleset limits
+# SSH to private LANs and the tailnet rather than disabling password auth.
+systemctl enable nftables.service
+# zram needs no unit enabled: zram-generator reads /etc/systemd/zram-generator.conf
+# at boot and synthesises systemd-zram-setup@zram0.service itself.
 
 # Tailscale: the daemon runs but does nothing until someone authenticates with
 # `tailscale up`. No auth key, no state and no identity is baked into the image

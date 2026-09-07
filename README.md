@@ -1,11 +1,16 @@
 # uConsole CM5 — Arch Linux ARM + Sway
 
-A reproducible build system that produces a bootable **Arch Linux ARM** image with a
+A build system that produces a bootable **Arch Linux ARM** image with a
 **Sway** desktop for the [ClockworkPi uConsole](https://www.clockworkpi.com/uconsole)
 fitted with a **Raspberry Pi Compute Module 5**.
 
 The kernel is compiled from source; the image is assembled and then checked by an
-automated verification suite — currently **228 checks**, all passing.
+automated verification suite — currently **250 checks**, all passing.
+
+Inputs are pinned where upstream allows it: the kernel commit, the upstream builder, and
+the tmux plugins. Arch Linux ARM publishes only a rolling `latest` rootfs tarball, so
+builds are not bit-for-bit reproducible across a rootfs refresh; the build records the
+tarball's SHA-256 and says so when it differs.
 
 > **Read [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) before your first boot.**
 > A CM5 Lite will very likely *not* boot from SD until its bootloader EEPROM is
@@ -26,9 +31,12 @@ automated verification suite — currently **228 checks**, all passing.
 | **LTE** | SIM7600G-H support: power-on, auto-connect, and a WAN routing switch |
 | **VPN** | Tailscale pre-installed, daemon enabled — unauthenticated, no key baked in |
 | **Terminal** | tmux with TPM, resurrect and continuum — sessions survive reboots |
+| **Security** | Login required at boot and on wake; firewall limits SSH to LAN/tailnet |
 | **First boot** | Prompts for a username and password; expands the root filesystem to fill the card |
 
 ## Quick start
+
+The image build fetches the upstream builder and rootfs itself, so a fresh clone works.
 
 ```bash
 # 1. Fetch the third-party tmux plugins into the overlay
@@ -92,7 +100,7 @@ different question from "packages installed during the build" and caught two rea
 that structural checks alone had missed.
 
 ```
-RESULT: 228 passed, 0 failed
+RESULT: 250 passed, 0 failed
 ```
 
 Structural verification is not a boot test. Nothing here has been validated by an

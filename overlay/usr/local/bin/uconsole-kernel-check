@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# Is the running kernel behind the upstream tree it was built from?
+#
+# This kernel is compiled from source by the image build pipeline and is served
+# by NO pacman repository. That is deliberate -- it avoids trusting an unsigned
+# third-party repo -- but it has a consequence worth stating plainly: `pacman
+# -Syu` updates all of userspace and silently leaves the kernel exactly where it
+# is, forever. Nothing on the device will otherwise tell you it has fallen
+# behind. This does.
+set -uo pipefail
+
+UPSTREAM=ak-rex/ClockworkPi-linux
+PKG=linux-uconsole-cm5-4k-git
+
+echo "Running kernel : $(uname -r)"
+
+pkgver="$(pacman -Q "$PKG" 2>/dev/null | awk '{print $2}')"
+if [[ -z $pkgver ]]; then
+    echo "Package        : $PKG is not installed"
+    exit 0
+fi
+echo "Package        : $pkgver"
+
+# Version looks like r1448726.84258d9b0b91-1; the short commit sits between the
+# first '.' and the '-'.
+local_commit="${pkgver#*.}"; local_commit="${local_commit%%-*}"
+echo "Built from     : $local_commit"
+
+if ! command -v curl >/dev/null 2>&1; then
+    echo
+    echo "curl is not installed, so the upstream check was skipped."
+    exit 0
+fi
+
+head_json="$(curl -sfL --max-time 20 "https://api.github.com/repos/${UPSTREAM}/commits?per_page=1" 2>/dev/null)" || head_json=""
+if [[ -z $head_json ]]; then
+    echo
+    echo "Could not reach GitHub; upstream state unknown (offline?)."
+    exit 0
+fi
+
+upstream_commit="$(printf '%s' "$head_json" | python3 -c '
+import json,sys
+try:
+    c=json.load(sys.stdin)
+    print(c[0]["sha"] if isinstance(c,list) and c else "")
+except Exception:
+    print("")' 2>/dev/null)"
+
+if [[ -z $upstream_commit ]]; then
+    echo
+    echo "Could not parse the upstream response; state unknown."
+    exit 0
+fi
+
+echo "Upstream HEAD  : ${upstream_commit:0:12}"
+echo
+
+if [[ $upstream_commit == ${local_commit}* ]]; then
+    echo "Up to date -- the kernel matches upstream HEAD."
+else
+    echo "BEHIND upstream. pacman will never update this kernel; it has to be"
+    echo "rebuilt from the project repository:"
+    echo
+    echo "  docker run --rm --platform linux/arm64 -v \"\$PWD\":/work -w /work \\"
+    echo "    -e KERNEL_COMMIT=${upstream_commit} -e PKGDIR=${PKG} \\"
+    echo "    alarm-base:latest /bin/bash /work/build/build-kernel.sh"
+    echo
+    echo "then rebuild the image and reflash. See docs/BUILDING.md."
+fi

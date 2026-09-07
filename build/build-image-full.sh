@@ -21,7 +21,44 @@ pacman-key --populate archlinuxarm
 pacman -Syu --noconfirm
 pacman -S --needed --noconfirm \
   parted util-linux dosfstools e2fsprogs libarchive curl \
-  arch-install-scripts psmisc systemd coreutils gawk sed grep python
+  arch-install-scripts psmisc systemd coreutils gawk sed grep python git
+
+echo "=== [1b/6] upstream builder and rootfs ==="
+# Pinned so a build is reproducible and so a fresh clone of THIS repository can
+# actually build -- uconsole-arch is gitignored and was previously expected to
+# already exist, which meant the documented quick start only worked on the
+# machine that happened to have cloned it by hand.
+UCONSOLE_ARCH_COMMIT=896a3acd39e0831fa4a1093ff4bb0db71d09c07d
+ROOTFS_SHA256=42a4eeaa038994ffd31fa173256ef2f0ef511358eeb41b9ea1f8626391b9b319
+ROOTFS=/work/cache/ArchLinuxARM-aarch64-latest.tar.gz
+
+if [[ ! -d /work/uconsole-arch/.git ]]; then
+    echo "cloning wdkdot/uconsole-arch"
+    rm -rf /work/uconsole-arch
+    git clone --quiet https://github.com/wdkdot/uconsole-arch.git /work/uconsole-arch
+fi
+git -C /work/uconsole-arch fetch --quiet origin 2>/dev/null || true
+# reset --hard, not checkout: the build patches these scripts in place, and a
+# clean tree each run keeps the build idempotent.
+git -C /work/uconsole-arch reset --hard --quiet "$UCONSOLE_ARCH_COMMIT"
+echo "upstream builder pinned at $(git -C /work/uconsole-arch rev-parse --short HEAD)"
+
+if [[ ! -f $ROOTFS ]]; then
+    echo "fetching the Arch Linux ARM rootfs"
+    install -d /work/cache
+    curl -L --retry 3 -o "$ROOTFS" http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz
+fi
+actual_sha="$(sha256sum "$ROOTFS" | awk '{print $1}')"
+if [[ $actual_sha == "$ROOTFS_SHA256" ]]; then
+    echo "rootfs matches the recorded build"
+else
+    echo "NOTE: rootfs differs from the recorded build"
+    echo "      recorded: $ROOTFS_SHA256"
+    echo "      actual  : $actual_sha"
+    echo "      Arch Linux ARM publishes only a rolling 'latest' tarball, so this"
+    echo "      drifts over time. The build is pinned everywhere it can be, but is"
+    echo "      not bit-for-bit reproducible across rootfs refreshes."
+fi
 
 echo "=== [2/6] building local pacman repo from source-built packages ==="
 rm -rf /work/repo/aarch64
@@ -103,5 +140,32 @@ for p in "${PKGS[@]}"; do EXTRA_ARGS+=(--extra-package "$p"); done
 
 echo "=== [6/6] applying uConsole overlay ==="
 bash /work/build/customize-image.sh "$IMG"
+
+echo "=== [7/7] flash verification artifacts ==="
+# Generated here rather than by hand. Producing them manually risked leaving a
+# stale manifest behind, and verify-card.sh comparing a card against the wrong
+# image is worse than not checking at all -- a stale PASS is the dangerous case.
+ART_LOOP="$(losetup -Pf --show "$IMG")"
+partprobe "$ART_LOOP" >/dev/null 2>&1 || true
+sleep 1
+install -d /mnt/artman
+mount -o ro "${ART_LOOP}p1" /mnt/artman
+( cd /mnt/artman && find . -type f | sort | xargs sha256sum ) > /tmp/boot-manifest.sha256
+umount /mnt/artman
+losetup -d "$ART_LOOP"
+cp /tmp/boot-manifest.sha256 /work/out/boot-manifest.sha256
+echo "boot manifest: $(wc -l < /work/out/boot-manifest.sha256) files"
+
+img_bytes=$(stat -c%s "$IMG")
+img_mib=$(( img_bytes / 1048576 ))
+root_mib=$(( img_mib - 513 ))
+{
+  echo "# region hashes for $(basename "$IMG")"
+  echo "mbr_gap   0 1        $(dd if="$IMG" bs=1M count=1 2>/dev/null | sha256sum | awk '{print $1}')"
+  echo "fat_boot  1 512      $(dd if="$IMG" bs=1M skip=1 count=512 2>/dev/null | sha256sum | awk '{print $1}')"
+  echo "ext4_root 513 ${root_mib}   $(dd if="$IMG" bs=1M skip=513 count=${root_mib} 2>/dev/null | sha256sum | awk '{print $1}')"
+} > /work/out/region-hashes.txt
+sha256sum "$IMG" | sed "s| .*| $(basename "$IMG")|" > "${IMG}.sha256"
+cat /work/out/region-hashes.txt
 
 echo "IMAGE BUILD OK: $IMG"

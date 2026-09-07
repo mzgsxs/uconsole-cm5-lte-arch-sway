@@ -4,7 +4,11 @@
 
 The machine prompts on tty1 for a **username and password**. That account gets sudo via
 `wheel`, and the same password is applied to `root` and to the stock `alarm` account.
-Autologin is then pointed at your new user, and the wizard disables itself.
+The wizard then disables itself.
+
+**There is no autologin.** Every boot presents a login prompt; sway starts once you log in
+on tty1. A short press of the power button blanks the backlight *and locks the session*, so
+waking the device also requires your password.
 
 Two other things happen on first boot without any input:
 
@@ -172,6 +176,38 @@ echo 'net.ipv4.ip_forward = 1' | sudo tee /etc/sysctl.d/99-tailscale.conf
 echo 'net.ipv6.conf.all.forwarding = 1' | sudo tee -a /etc/sysctl.d/99-tailscale.conf
 sudo sysctl -p /etc/sysctl.d/99-tailscale.conf
 ```
+
+## Security
+
+**Login is required** at boot and whenever you wake the device from a short power-button
+press. Waking shows `swaylock`; type your password to get back in. If `swaylock` ever fails
+to start, the screen still blanks but the session is *not* locked — that case is logged to
+the journal under `uconsole-screen-toggle` rather than failing silently.
+
+The idle timeout (5 minutes) only dims the backlight; it does **not** lock. If you want idle
+to lock too, add `timeout 600 'swaylock -f -c 000000'` to the `swayidle` line in
+`~/.config/sway/config`.
+
+An **nftables firewall** runs by default with a drop policy on input. SSH is reachable only
+from private LANs (`10/8`, `172.16/12`, `192.168/16`) and the tailnet (`100.64/10`) — never
+from a public or carrier-assigned address. The tailnet interface itself is fully trusted.
+Password authentication stays enabled, because the firewall is what closes the exposure:
+
+```bash
+sudo nft list ruleset          # what is actually loaded
+```
+
+## Keeping the kernel current
+
+```bash
+uconsole-kernel-check
+```
+
+The kernel is built from source and served by **no** pacman repository, so `pacman -Syu`
+updates all of userspace and silently leaves the kernel where it is, forever. This helper
+compares the installed build against upstream `ak-rex/ClockworkPi-linux` and prints the exact
+rebuild command when it has fallen behind. Worth running occasionally — nothing else will
+tell you.
 
 ## Networking
 
