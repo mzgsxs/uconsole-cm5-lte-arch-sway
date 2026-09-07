@@ -16,6 +16,7 @@ StandardError=tty
 TTYPath=/dev/tty1
 TTYReset=yes
 TTYVHangup=yes
+TTYVTDisallocate=yes
 TimeoutStartSec=0
 
 [Install]

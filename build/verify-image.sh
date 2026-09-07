@@ -203,6 +203,15 @@ check "firstboot sets root password"  "grep -q 'set_pw root' $MNT/usr/local/bin/
 check "firstboot sets alarm password" "grep -q 'set_pw alarm' $MNT/usr/local/bin/uconsole-firstboot-user"
 check "firstboot grants wheel"        "grep -q 'wheel,video,audio,input' $MNT/usr/local/bin/uconsole-firstboot-user"
 check "firstboot is one-shot (stamp)" "grep -q 'uconsole-firstboot-done' $MNT/usr/local/bin/uconsole-firstboot-user"
+# The prompt shares tty1 with kernel printk and systemd status output; both are
+# silenced for the duration of the wizard and restored on exit.
+check "firstboot silences kernel printk"   "grep -q 'proc/sys/kernel/printk' $MNT/usr/local/bin/uconsole-firstboot-user"
+check "firstboot silences systemd status"  "grep -q 'kill -s RTMIN+21 1' $MNT/usr/local/bin/uconsole-firstboot-user"
+check "firstboot re-enables systemd status" "grep -q 'kill -s RTMIN+20 1' $MNT/usr/local/bin/uconsole-firstboot-user"
+check "firstboot restores console on exit"  "grep -q 'trap console_restore EXIT' $MNT/usr/local/bin/uconsole-firstboot-user"
+check "firstboot clears the screen"         "grep -qE 'clear 2>/dev/null' $MNT/usr/local/bin/uconsole-firstboot-user"
+check "unit allocates a clean VT"           "grep -q 'TTYVTDisallocate=yes' $MNT/etc/systemd/system/uconsole-firstboot-user.service"
+check "setterm available for msg off"       "[[ -x $MNT/usr/bin/setterm ]]"
 
 echo
 echo "### 13. requested customisations"

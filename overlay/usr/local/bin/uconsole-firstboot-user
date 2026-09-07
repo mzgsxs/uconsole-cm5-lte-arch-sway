@@ -16,6 +16,42 @@ DROPIN=/etc/systemd/system/getty@tty1.service.d/autologin.conf
 [[ -e $STAMP ]] && exit 0
 [[ -t 0 ]] || { echo "firstboot: no terminal, skipping"; exit 0; }
 
+# ---------------------------------------------------------------------------
+# Take sole ownership of the console while we prompt.
+#
+# Two things otherwise scribble over the prompt: kernel printk (cmdline.txt has
+# console=tty1, so KERN_ERR and worse land here) and systemd's own
+# "[ OK ] Started ..." status lines. Both are silenced only for the duration of
+# the wizard and restored on exit, so a boot that goes wrong later still prints
+# diagnostics to the panel -- which matters on a machine whose only display is
+# this one.
+# ---------------------------------------------------------------------------
+SAVED_PRINTK=""
+SYSTEMD_QUIETED=0
+
+console_quiet() {
+    # /proc/sys/kernel/printk holds four values; the first is console_loglevel.
+    # Save and restore only that one, so the write is an unambiguous integer.
+    SAVED_PRINTK="$(awk '{print $1}' /proc/sys/kernel/printk 2>/dev/null || true)"
+    echo 1 > /proc/sys/kernel/printk 2>/dev/null || true
+    # SIGRTMIN+21 tells PID 1 to stop emitting status messages to the console.
+    if kill -s RTMIN+21 1 2>/dev/null; then SYSTEMD_QUIETED=1; fi
+    # Belt and braces: stop this specific console accepting kernel messages.
+    setterm --msg off 2>/dev/null || true
+    clear 2>/dev/null || printf '\033[2J\033[H'
+}
+
+console_restore() {
+    if [[ -n $SAVED_PRINTK ]]; then
+        echo "$SAVED_PRINTK" > /proc/sys/kernel/printk 2>/dev/null || true
+    fi
+    setterm --msg on 2>/dev/null || true
+    (( SYSTEMD_QUIETED )) && kill -s RTMIN+20 1 2>/dev/null || true
+}
+trap console_restore EXIT
+
+console_quiet
+
 printf '\n'
 printf '  ==========================================\n'
 printf '   uConsole  -  Arch Linux + Sway\n'

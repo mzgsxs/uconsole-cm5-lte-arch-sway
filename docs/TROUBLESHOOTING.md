@@ -166,6 +166,28 @@ If it persists, try `scale 1.0` to rule scaling out entirely.
 
 ---
 
+## Kernel messages scribble over the first-boot prompt
+
+Two separate things compete for tty1 during early boot: **kernel printk** (`cmdline.txt`
+carries `console=tty1`, so `KERN_ERR` and worse are printed there) and **systemd's own
+`[ OK ] Started ...` status lines**. Either will interleave with the account prompt.
+
+The wizard now silences both for its duration and restores them from an `EXIT` trap:
+
+- `console_loglevel` is set to 1 via `/proc/sys/kernel/printk`, so only `KERN_EMERG`
+  reaches the console. Only the first of the file's four values is saved and rewritten,
+  so the restore is an unambiguous integer.
+- `kill -s RTMIN+21 1` tells PID 1 to stop emitting status messages; `RTMIN+20` re-enables
+  them.
+- `setterm --msg off` stops this particular console accepting kernel messages.
+- The unit sets `TTYVTDisallocate=yes` so the VT starts clean.
+
+Silencing is deliberately **temporary**. Permanently quieting the console (`quiet` in
+`cmdline.txt`, or dropping `console=tty1`) would also hide the messages you need when a
+boot goes wrong — and on this machine the panel is often the only output available.
+
+---
+
 ## Lessons that shaped the verification suite
 
 Several checks are written in a non-obvious way because the obvious version was wrong.

@@ -47,6 +47,8 @@ the reasoning rather than the final file contents.
 
 - A wizard on tty1 prompts for a username and password, creates the account with sudo,
   applies the same password to `root` and `alarm`, repoints autologin, and disables itself.
+- The wizard temporarily silences kernel printk and systemd status output, which otherwise
+  interleave with the prompt, restoring both on exit so later boot diagnostics survive.
 - Root filesystem expansion rewritten: the previous version used `parted -s`, which
   answers *No* to the in-use prompt, then stamped itself complete — stranding 52 GB of a
   64 GB card permanently. Now uses `growpart`, asserts the partition actually grew, and
