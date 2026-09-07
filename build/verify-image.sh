@@ -113,7 +113,7 @@ check "sway config in alarm home"        "[[ -s $MNT/home/alarm/.config/sway/con
 check "sway config uses Alt as modifier" "grep -q 'set \$mod Mod1' $MNT/home/alarm/.config/sway/config"
 check "sway config scales the DSI panel" "grep -q 'output DSI-2 scale' $MNT/home/alarm/.config/sway/config"
 check "waybar config present"            "[[ -s $MNT/home/alarm/.config/waybar/config ]]"
-check "alarm home owned by alarm"        "[[ \$(stat -c%U $MNT/home/alarm/.config) == alarm ]]"
+check "alarm home owned by alarm"        "[[ -d $MNT/home/alarm/.config ]] && [[ \$(stat -c%U $MNT/home/alarm/.config) == alarm ]]"
 check "expand-root script executable"    "[[ -x $MNT/usr/local/bin/uconsole-expand-root ]]"
 check "tty1 autologin drop-in present"   "[[ -s $MNT/etc/systemd/system/getty@tty1.service.d/autologin.conf ]]"
 check "bash_profile launches sway on vt1" "grep -q 'exec sway' $MNT/home/alarm/.bash_profile"
@@ -312,7 +312,7 @@ for f in .bashrc .vimrc .tmux.conf .bash_profile; do
   if [[ -f $MNT/home/alarm/$f ]]; then ok "alarm has $f"; else bad "alarm MISSING $f"; fi
 done
 check "alarm has tmux plugins"         "[[ -x $MNT/home/alarm/.tmux/plugins/tpm/tpm ]]"
-check "alarm home still owned by alarm" "[[ \$(stat -c%U $MNT/home/alarm/.tmux.conf) == alarm ]]"
+check "alarm home still owned by alarm" "[[ -f $MNT/home/alarm/.tmux.conf ]] && [[ \$(stat -c%U $MNT/home/alarm/.tmux.conf) == alarm ]]"
 echo "-- tmux config parses --"
 if chroot "$MNT" /usr/bin/tmux -f /etc/skel/.tmux.conf start-server \; kill-server 2>&1 | grep -q .; then
   bad "tmux config produced errors"
@@ -329,6 +329,30 @@ check "stops above the PMU cutoff"     "grep -q 'FLOOR_UV:-3500000' $MNT/usr/loc
 check "warns when the modem is powered" "grep -q 'modem_is_on' $MNT/usr/local/bin/uconsole-battery-calibrate"
 check "floor sits above the guard's 3.40V" "[[ 3500000 -gt 3400000 ]]"
 check "guard and calibrator agree on the battery path" "grep -q 'axp20x-battery' $MNT/usr/local/bin/uconsole-battery-guard && grep -q 'axp20x-battery' $MNT/usr/local/bin/uconsole-battery-calibrate"
+
+echo
+echo "### 18. Tailscale"
+check "tailscale CLI installed"        "[[ -x $MNT/usr/bin/tailscale ]]"
+check "tailscaled installed"           "[[ -x $MNT/usr/bin/tailscaled || -x $MNT/usr/sbin/tailscaled ]]"
+check "tailscaled.service enabled"     "[[ -L $MNT/etc/systemd/system/multi-user.target.wants/tailscaled.service ]]"
+check "netfilter userspace present"    "[[ -x $MNT/usr/bin/nft ]]"
+check "tun module available"           "find $MNT/usr/lib/modules/$KVER -name 'tun.ko*' | grep -q ."
+echo "-- no identity or credentials baked into the image --"
+check "no tailscaled state directory"  "[[ ! -e $MNT/var/lib/tailscale/tailscaled.state ]]"
+check "no auth key in any unit"        "! grep -rqiE 'tskey-|TS_AUTHKEY|--authkey' $MNT/etc/systemd/system/ 2>/dev/null"
+check "no auth key in our scripts"     "! grep -rqiE 'tskey-|TS_AUTHKEY' $MNT/usr/local/bin/ 2>/dev/null"
+check "no tailscale node key on disk"  "! find $MNT/var/lib/tailscale -type f 2>/dev/null | grep -q ."
+echo "-- follows the WAN when it changes --"
+check "tailscale nudge script present"  "[[ -x $MNT/usr/local/bin/uconsole-tailscale-nudge ]]"
+check "nudge rebinds magicsock"         "grep -q 'debug rebind' $MNT/usr/local/bin/uconsole-tailscale-nudge"
+check "nudge forces endpoint restun"    "grep -q 'debug restun' $MNT/usr/local/bin/uconsole-tailscale-nudge"
+check "nudge is a no-op when logged out" "grep -q 'tailscale status >/dev/null 2>&1 || exit 0' $MNT/usr/local/bin/uconsole-tailscale-nudge"
+check "NM dispatcher hook present"      "[[ -x $MNT/etc/NetworkManager/dispatcher.d/50-uconsole-tailscale ]]"
+check "dispatcher hook is root-owned"   "[[ -f $MNT/etc/NetworkManager/dispatcher.d/50-uconsole-tailscale ]] && [[ \$(stat -c%u $MNT/etc/NetworkManager/dispatcher.d/50-uconsole-tailscale) -eq 0 ]]"
+check "dispatcher not group/world writable" "[[ \$(stat -c%a $MNT/etc/NetworkManager/dispatcher.d/50-uconsole-tailscale) =~ ^7[05][05]$ ]]"
+check "dispatcher skips tailscale's own iface" "grep -q 'tailscale\*|ts\*' $MNT/etc/NetworkManager/dispatcher.d/50-uconsole-tailscale"
+check "uconsole-wan nudges on switch"   "grep -c 'tailscale_follow' $MNT/usr/local/bin/uconsole-wan | grep -qE '[4-9]'"
+check "overlay scripts are root-owned"  "[[ -f $MNT/usr/local/bin/uconsole-wan ]] && [[ \$(stat -c%u $MNT/usr/local/bin/uconsole-wan) -eq 0 ]]"
 
 echo
 echo "########################################"

@@ -212,5 +212,16 @@ shipped because nothing ran `foot --check-config`. Both `sway --validate` and
 `foot --check-config` now run against the shipped configs, and the sway check was itself
 validated by injecting a syntax error to confirm it fails.
 
+**`stat` on a missing file passes an arithmetic comparison.** `[[ $(stat -c%u missing) -eq 0 ]]`
+is *true*, because `stat` prints nothing and bash treats the empty string as 0 in arithmetic
+context. Two ownership checks therefore passed for files that were not in the image at all.
+Every `stat`-based check now asserts the file exists first.
+
+**Wait on the container, not the launcher.** Backgrounding `docker run ... &` returns the
+shell's exit status immediately, not the container's. Acting on that "success" started a
+second build while the first was still extracting the rootfs, and verification then ran
+against a half-built image and reported 115 failures. Build scripts now wait on
+`docker ps --filter name=...` instead.
+
 **Docker Desktop's shared filesystem lags.** A host-side `rm` of the output image is not
 always visible inside the container, so the build removes stale images from *inside*.

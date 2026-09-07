@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Nudge Tailscale whenever NetworkManager changes an interface.
+#
+# uconsole-wan calls the nudge directly for explicit switches, but that misses
+# the cases nobody drives by hand: Wi-Fi dropping and LTE taking over under
+# `uconsole-wan auto`, reconnecting to a different access point, or the modem
+# re-establishing its bearer. This hook covers those.
+#
+# $1 = interface, $2 = action
+set -uo pipefail
+
+IFACE="${1-}"
+ACTION="${2-}"
+
+# Never recurse on Tailscale's own interface.
+case "$IFACE" in
+    tailscale*|ts*) exit 0 ;;
+esac
+
+case "$ACTION" in
+    up|down|vpn-up|vpn-down|connectivity-change) ;;
+    *) exit 0 ;;
+esac
+
+# Fail quiet rather than noisy: a missing nudge would otherwise make every
+# interface change log a dispatcher error.
+NUDGE=/usr/local/bin/uconsole-tailscale-nudge
+[[ -x $NUDGE ]] || exit 0
+
+exec "$NUDGE" "nm:${ACTION}:${IFACE}"

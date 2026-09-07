@@ -5,7 +5,7 @@ A reproducible build system that produces a bootable **Arch Linux ARM** image wi
 fitted with a **Raspberry Pi Compute Module 5**.
 
 The kernel is compiled from source; the image is assembled and then checked by an
-automated verification suite — currently **182 checks**, all passing.
+automated verification suite — currently **208 checks**, all passing.
 
 > **Read [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) before your first boot.**
 > A CM5 Lite will very likely *not* boot from SD until its bootloader EEPROM is
@@ -24,6 +24,7 @@ automated verification suite — currently **182 checks**, all passing.
 | **Audio** | PipeWire + WirePlumber |
 | **Network** | NetworkManager with a patched `wpa_supplicant` (fixes WPA2 on Broadcom) |
 | **LTE** | SIM7600G-H support: power-on, auto-connect, and a WAN routing switch |
+| **VPN** | Tailscale pre-installed, daemon enabled — unauthenticated, no key baked in |
 | **Terminal** | tmux with TPM, resurrect and continuum — sessions survive reboots |
 | **First boot** | Prompts for a username and password; expands the root filesystem to fill the card |
 
@@ -74,7 +75,7 @@ are deliberately untracked — see `.gitignore`.
 |---|---|
 | [`docs/BUILDING.md`](docs/BUILDING.md) | The build pipeline in detail, and how to modify it |
 | [`docs/HARDWARE.md`](docs/HARDWARE.md) | uConsole + CM5 hardware notes and known defects |
-| [`docs/USAGE.md`](docs/USAGE.md) | Operator commands: LTE, WAN routing, battery, tmux |
+| [`docs/USAGE.md`](docs/USAGE.md) | Operator commands: LTE, WAN routing, Tailscale, battery, tmux |
 | [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) | Problems hit during development and their fixes |
 | [`docs/CHANGELOG.md`](docs/CHANGELOG.md) | What changed and why |
 
@@ -91,7 +92,7 @@ different question from "packages installed during the build" and caught two rea
 that structural checks alone had missed.
 
 ```
-RESULT: 182 passed, 0 failed
+RESULT: 208 passed, 0 failed
 ```
 
 Structural verification is not a boot test. Nothing here has been validated by an

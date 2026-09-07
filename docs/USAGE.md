@@ -106,6 +106,72 @@ measures real pack capacity by integrating current, stopping at 3.50 V so it can
 trigger the undervoltage cut. It refuses to start quietly while the LTE modem is powered,
 because transmit bursts both corrupt the measurement and risk a crash.
 
+## Tailscale
+
+Pre-installed with `tailscaled` enabled, but **not authenticated**. The daemon runs and
+does nothing until you connect it to a tailnet:
+
+```bash
+sudo tailscale up
+```
+
+That prints a login URL. Authenticate in a browser — on the device, or by copying the URL
+elsewhere — and the machine joins your tailnet.
+
+```bash
+tailscale status          # peers and connection state
+tailscale ip -4           # this machine's tailnet address
+sudo tailscale down       # disconnect, leaving the daemon running
+```
+
+**No identity ships in the image.** There is no auth key, no node key and no
+`tailscaled.state` — deliberately, because these images get published and a baked-in key
+would let anyone who downloaded one join your tailnet. Verification asserts their absence
+on every build.
+
+### Following the WAN
+
+Tailscale binds its UDP sockets against whichever default route existed when it started,
+and discovers its public endpoints through that path. Switching the WAN therefore leaves it
+talking over a route that no longer exists until its own link monitor catches up — the
+tunnel can black-hole for anywhere from seconds to a minute.
+
+This image nudges it explicitly. After any switch, `uconsole-wan` runs `tailscale debug
+rebind` (re-opens the sockets on the new path) and `tailscale debug restun` (forces endpoint
+rediscovery so peers relearn the address). You will see `tailscale: rebound and re-STUNed
+onto the new path` in the output.
+
+Explicit switches are only half the problem, so a NetworkManager dispatcher hook at
+`/etc/NetworkManager/dispatcher.d/50-uconsole-tailscale` does the same on *any* interface
+change — Wi-Fi dropping and LTE taking over under `uconsole-wan auto`, roaming to a
+different access point, or the modem re-establishing its bearer. Both paths call
+`uconsole-tailscale-nudge`, which is a silent no-op when Tailscale is not connected.
+
+`uconsole-wan status` shows the Tailscale address, and `uconsole-wan test` pings a tailnet
+peer through the tunnel — the quickest way to confirm the underlay actually survived a
+switch.
+
+**One caveat.** `uconsole-wan lte` makes the carrier's DNS authoritative for all lookups
+(`~.` on the LTE interface). If you run Tailscale with MagicDNS, both want to own `~.` and
+name resolution can flap. If that bites you, either use `uconsole-wan auto` instead (which
+does not claim `~.`) or run `tailscale up --accept-dns=false`.
+
+Two notes specific to this hardware:
+
+- Tailscale defaults its interface MTU to 1280, which happens to match exactly what the
+  LTE bearer advertises — so it works over the modem without further tuning.
+- The legacy `iptable_filter`/`iptable_nat` kernel modules are absent, so Tailscale uses
+  the nftables path. `nft` and `iptables-nft` are both installed.
+
+If you want this machine to act as an exit node or subnet router, that additionally needs
+IP forwarding enabled — not on by default, since it changes how the box treats traffic:
+
+```bash
+echo 'net.ipv4.ip_forward = 1' | sudo tee /etc/sysctl.d/99-tailscale.conf
+echo 'net.ipv6.conf.all.forwarding = 1' | sudo tee -a /etc/sysctl.d/99-tailscale.conf
+sudo sysctl -p /etc/sysctl.d/99-tailscale.conf
+```
+
 ## Networking
 
 ```bash

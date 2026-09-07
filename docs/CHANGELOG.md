@@ -77,6 +77,18 @@ the reasoning rather than the final file contents.
 - Power key: short press blanks the backlight, long press powers off cleanly.
 - Added `wireless-regdb` and `iw`; without them brcmfmac errors were 14.5 % of the journal.
 
+### VPN
+
+- Tailscale pre-installed with `tailscaled` enabled. It is deliberately
+  **unauthenticated** — no auth key, node key or `tailscaled.state` is baked in, since
+  these images are published and a shipped key would let any downloader join the tailnet.
+  Verification asserts their absence on every build.
+
+- Tailscale follows the WAN. `uconsole-wan` runs `tailscale debug rebind` and
+  `debug restun` after every switch, and a NetworkManager dispatcher hook does the same on
+  any interface change, so automatic Wi-Fi/LTE failover is covered too. Without this the
+  tunnel stays bound to a path that no longer routes until Tailscale notices by itself.
+
 ### Terminal
 
 - tmux with TPM, resurrect and continuum pre-installed, and a user service that starts the
@@ -88,7 +100,7 @@ the reasoning rather than the final file contents.
   because macOS writes Spotlight metadata to the card between `dd` and verification,
   making it fail on every good write.
 - `verify-card.sh` verifies correctly instead — raw compare on ext4, file-level on FAT.
-- `verify-image.sh` grew from 64 to 182 checks, including config parsing and a post-build
+- `verify-image.sh` grew from 64 to 208 checks, including config parsing and a post-build
   proof that the image can install packages.
 
 ### Fixed along the way

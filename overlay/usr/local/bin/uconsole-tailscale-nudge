@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Re-bind Tailscale after the WAN path changes.
+#
+# Tailscale's magicsock binds UDP sockets against the current default route and
+# discovers its public endpoints through it. When the WAN moves -- uconsole-wan
+# switching between Wi-Fi and LTE, or NetworkManager failing over on its own --
+# the old binding and the old discovered endpoints survive until Tailscale's
+# link monitor notices. In between, the tunnel can be black-holed: peers keep
+# sending to an address that no longer routes.
+#
+#   debug rebind  re-opens the sockets on the new path
+#   debug restun  forces endpoint rediscovery so peers relearn the address
+#
+# Both are no-ops when Tailscale is not connected, so this is safe to call
+# unconditionally from a dispatcher hook.
+set -uo pipefail
+
+command -v tailscale >/dev/null 2>&1 || exit 0
+systemctl is-active --quiet tailscaled 2>/dev/null || exit 0
+
+# `tailscale status` exits non-zero when logged out or stopped, which is the
+# cheapest reliable way to ask "is there anything to rebind?".
+tailscale status >/dev/null 2>&1 || exit 0
+
+tailscale debug rebind  >/dev/null 2>&1 || true
+tailscale debug restun  >/dev/null 2>&1 || true
+logger -t uconsole-tailscale "rebound magicsock after WAN change (${1:-manual})"

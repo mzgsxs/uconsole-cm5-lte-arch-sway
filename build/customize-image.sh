@@ -25,7 +25,19 @@ mount "${LOOP}p1" "$MNT/boot"
 
 echo "--- copying overlay ---"
 cp -a /work/overlay/. "$MNT/"
-chmod 755 "$MNT/usr/local/bin/uconsole-expand-root"
+
+# Normalise ownership and modes rather than inheriting whatever the build host
+# happened to have. Docker Desktop presents bind-mounted files as root-owned, so
+# this is a no-op there -- but on a Linux build host `cp -a` preserves the
+# building user's uid, and NetworkManager silently refuses to run dispatcher
+# scripts that are not root-owned. Depending on the mount's behaviour would make
+# the image correct on one host and quietly broken on another.
+chown -R root:root "$MNT/usr/local/bin" "$MNT/etc/systemd" "$MNT/etc/skel" 2>/dev/null || true
+[[ -d $MNT/etc/NetworkManager ]] && chown -R root:root "$MNT/etc/NetworkManager"
+chmod 755 "$MNT/usr/local/bin"/uconsole-* 2>/dev/null || true
+if [[ -d $MNT/etc/NetworkManager/dispatcher.d ]]; then
+    chmod 755 "$MNT/etc/NetworkManager/dispatcher.d"/* 2>/dev/null || true
+fi
 
 echo "--- chroot configuration ---"
 cat > "$MNT/root/uconsole-customize.sh" <<'EOF_C'
@@ -90,6 +102,12 @@ systemctl enable uconsole-modem-connect.service
 # S3.5: voltage-based low-battery guard. The fuel gauge reads ~71% shortly
 # before an undervoltage cut, so percentage-based logic fires far too late.
 systemctl enable uconsole-battery-guard.timer
+
+# Tailscale: the daemon runs but does nothing until someone authenticates with
+# `tailscale up`. No auth key, no state and no identity is baked into the image
+# -- deliberately, since these images are published. tailscaled needs /dev/net/tun
+# (the tun module is present) and drives netfilter through nft/iptables-nft.
+systemctl enable tailscaled.service
 
 # S3.4: NetworkManager owns Wi-Fi, but systemd-networkd is also enabled in the
 # stock ALARM rootfs. It manages nothing, its wait-online times out after two

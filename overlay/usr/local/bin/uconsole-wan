@@ -63,6 +63,17 @@ lte_dns_off() {
     resolvectl default-route "$i" no 2>/dev/null
 }
 
+# Tailscale binds its UDP sockets to whatever the default route was at the time,
+# so a WAN switch leaves it talking over a path that no longer exists until its
+# own link monitor catches up. Nudge it explicitly instead of waiting.
+tailscale_follow() {
+    [[ -x /usr/local/bin/uconsole-tailscale-nudge ]] || return 0
+    command -v tailscale >/dev/null 2>&1 || return 0
+    tailscale status >/dev/null 2>&1 || return 0
+    /usr/local/bin/uconsole-tailscale-nudge "uconsole-wan:${1-}"
+    inf "tailscale: rebound and re-STUNed onto the new path"
+}
+
 show_status() {
     say "WAN status"
     local live
@@ -86,6 +97,15 @@ show_status() {
         inf "lte   : not connected"
     fi
     command -v resolvectl >/dev/null && { echo; inf "dns default-route flags:"; resolvectl default-route 2>/dev/null | sed 's/^/        /'; }
+    if command -v tailscale >/dev/null 2>&1; then
+        echo
+        if tailscale status >/dev/null 2>&1; then
+            inf "tailscale: up as $(tailscale ip -4 2>/dev/null | head -1)"
+            inf "           $(tailscale status 2>/dev/null | grep -c . ) entries in the tailnet view"
+        else
+            inf "tailscale: installed but not connected (sudo tailscale up)"
+        fi
+    fi
 }
 
 case "${1-status}" in
@@ -93,6 +113,7 @@ lte)
     need_root lte
     lte_route_add "$LTE_METRIC_PREFER"
     lte_dns_on
+    tailscale_follow lte
     ok "LTE is now the default route (metric $LTE_METRIC_PREFER)"
     inf "Wi-Fi remains configured at metric $WIFI_METRIC_ASSUMED but is unused."
     inf "roaming data is now being consumed."
@@ -102,6 +123,7 @@ wifi)
     IFACE=$(ls /sys/class/net | grep -E '^(wwu|wwan)' | head -1)
     [[ -n $IFACE ]] && ip route del default dev "$IFACE" 2>/dev/null
     lte_dns_off "$IFACE"
+    tailscale_follow wifi
     ok "LTE default route removed; Wi-Fi carries traffic"
     inf "bearer left connected for instant switch-back (~4 MiB/month)"
     ;;
@@ -109,6 +131,7 @@ auto)
     need_root auto
     lte_route_add "$LTE_METRIC_AUTO"
     lte_dns_off "$IFACE"
+    tailscale_follow auto
     ok "LTE armed as failover (metric $LTE_METRIC_AUTO, below Wi-Fi)"
     inf "kernel switches to LTE only if the Wi-Fi route disappears."
     inf "note: a Wi-Fi that stays associated with a dead uplink will NOT fail over."
@@ -125,6 +148,18 @@ test)
     inf "rtt: ${R:-?}   (Wi-Fi is typically ~10ms; roamed LTE can be 200ms+)"
     E=$(curl -s --max-time 20 https://api.ipify.org 2>/dev/null)
     [[ -n $E ]] && ok "public exit IP: $E" || no "could not fetch exit IP"
+    if command -v tailscale >/dev/null 2>&1 && tailscale status >/dev/null 2>&1; then
+        TS=$(tailscale ip -4 2>/dev/null | head -1)
+        inf "tailscale addr: ${TS:-?}"
+        # Ping a peer over the tunnel to prove the underlay survived the switch.
+        P=$(tailscale status 2>/dev/null | awk '$1 ~ /^100\./ && $1 != "'"${TS:-x}"'" {print $1; exit}')
+        if [[ -n $P ]]; then
+            tailscale ping -c 2 --timeout 5s "$P" >/dev/null 2>&1 \
+                && ok "tailnet reachable (peer $P)" || no "tailnet peer $P unreachable"
+        else
+            inf "no other peers online to test the tunnel against"
+        fi
+    fi
     ;;
 status) show_status ;;
 *) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
