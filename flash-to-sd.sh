@@ -15,7 +15,29 @@ RAW="/dev/r${DISK}"
 [[ -f $IMG ]] || { echo "image not found: $IMG"; exit 1; }
 
 echo "=== target safety check ==="
-info="$(diskutil info "/dev/$DISK")"
+# Fail helpfully rather than passing diskutil's bare "Could not find disk" up.
+# An SD reader can take a moment to enumerate, and the identifier is not stable
+# across reboots, so list the plausible candidates instead of just erroring.
+if ! info="$(diskutil info "/dev/$DISK" 2>/dev/null)"; then
+    echo "No such disk: /dev/$DISK"
+    echo
+    echo "Removable SD devices currently attached:"
+    found=0
+    for d in $(diskutil list 2>/dev/null | grep -oE '^/dev/disk[0-9]+'); do
+        i="$(diskutil info "$d" 2>/dev/null)" || continue
+        grep -q 'Removable Media:  *Removable' <<<"$i" || continue
+        grep -q 'Protocol:  *Secure Digital'   <<<"$i" || continue
+        printf '  %s  %s  %s\n' \
+            "${d#/dev/}" \
+            "$(awk -F'[()]' '/Disk Size/{print $2; exit}' <<<"$i")" \
+            "$(awk -F': *' '/Device \/ Media Name/{print $2; exit}' <<<"$i")"
+        found=1
+    done
+    (( found )) || echo "  (none -- is the card inserted? it can take a second to appear)"
+    echo
+    echo "Re-run with the right identifier, e.g.:  sudo $0 disk4"
+    exit 1
+fi
 echo "$info" | grep -E 'Device / Media Name|Protocol|Removable Media|Disk Size'
 
 # Refuse to touch anything that is not a removable SD card of roughly the right size.
