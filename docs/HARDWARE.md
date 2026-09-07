@@ -12,6 +12,7 @@
 | PMIC | X-Powers AXP223 (`axp20x-battery`, `axp22x-ac`) |
 | Keyboard/trackball | USB HID via a LeafLabs Maple MCU, `1eaf:0024` |
 | Audio | **PWM on GPIO 12/13**, not a codec |
+| Thermal | AVS block, driven by `bcm2711_thermal`; single zone `cpu-thermal` |
 | LTE (optional) | SIMCOM SIM7600G-H in the mini-PCIe slot, USB-signalled |
 | RTC | **None usable** — no battery-backed clock |
 
@@ -34,6 +35,13 @@ and will fail. Detect by label.
 releases it, and the pin floats. Holding a power rail requires `gpioset -z` (daemonised).
 A fix that corrects the chip name but not this will appear to work, then fail
 intermittently.
+
+**The thermal driver is `bcm2711_thermal`, on a BCM2712.** The SoC is a 2712, but
+Raspberry Pi reuses the BCM2711 AVS thermal block, so the CM5 device tree declares
+`compatible = "brcm,bcm2711-thermal"` and the 2711 driver binds it. `cpu-thermal` is the
+only zone in the tree, which is why `thermal-zone: 0` is the right waybar setting. Reasoning
+from the part number rather than the DTB leads you to look for a 2712 driver that does not
+exist.
 
 **The panel is 1280×720, not 1280×480.** At 5″ that is ~294 PPI, so scaling is essential.
 Prefer a scale that divides evenly: 1.25 → 1024×576, 1.6 → 800×450, 2.0 → 640×360. A
