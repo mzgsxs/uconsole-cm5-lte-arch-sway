@@ -188,6 +188,38 @@ boot goes wrong — and on this machine the panel is often the only output avail
 
 ---
 
+## Power button: long press takes 8 s, and the screen strobes while held
+
+Two unrelated causes.
+
+**The strobing was a missing `--no-repeat`.** The binding was
+`bindsym XF86PowerOff exec uconsole-screen-toggle`. Sway repeats a held binding at
+the keyboard repeat rate, which this image sets to 30/s — so holding the power button
+toggled the backlight about thirty times a second. The binding is now
+`bindsym --no-repeat --release`: `--no-repeat` stops the storm, and `--release` means a
+long press never toggles at all, because logind powers off while the key is still down
+and the release event never arrives.
+
+**The 8 seconds is the PMIC delaying the press.** systemd's long-press threshold is a
+hardcoded 5 s — `logind.conf` exposes the `Handle*LongPress=` *actions* but no duration —
+and that timer only starts once logind sees the key go down. The AXP's `startup` register
+sets how long the button must be held before the PMIC reports a press at all; at 3 s the
+whole gesture takes ~8 s.
+
+`uconsole-powerkey-tune` runs at boot and sets two registers on the `axp221-pek` device:
+
+- **`startup` → 128 ms**, so systemd's 5 s is essentially the whole wait.
+- **`shutdown` → 10000 ms**, the maximum. This is the PMIC's *hardware* force-off, an
+  unclean cut of exactly the kind that previously corrupted the journal and left the FAT
+  boot partition dirty. Pushing it to the maximum guarantees systemd's clean shutdown
+  always wins the race, leaving the hardware cut as a genuine last resort.
+
+Worth checking on any given unit which of the two actually fired: if the machine cuts at
+the `shutdown` value rather than ~5 s, it was the hardware, and the filesystem took an
+unclean shutdown.
+
+---
+
 ## Lessons that shaped the verification suite
 
 Several checks are written in a non-obvious way because the obvious version was wrong.

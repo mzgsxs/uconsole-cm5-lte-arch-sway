@@ -1,0 +1,13 @@
+[Unit]
+Description=Tune the AXP power button timings for a clean long-press poweroff
+Documentation=man:logind.conf(5)
+After=systemd-udev-settle.service
+ConditionPathExistsGlob=/sys/bus/platform/devices/*pek*
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/uconsole-powerkey-tune
+
+[Install]
+WantedBy=multi-user.target

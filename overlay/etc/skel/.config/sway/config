@@ -130,7 +130,12 @@ bindsym XF86AudioMute exec wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle
 # Power key: short press blanks the backlight (logind is set to ignore it so the
 # compositor sees it); a ~5s long press is a clean poweroff, handled by logind.
 # Suspend is not used -- see S3.9, the kernel registers no sleep states.
-bindsym XF86PowerOff exec /usr/local/bin/uconsole-screen-toggle
+# --no-repeat and --release both matter here. Without --no-repeat sway fires this
+# binding at the keyboard repeat rate (30/s) for as long as the key is held, so a
+# long press toggles the backlight dozens of times and the screen strobes.
+# --release means a long press never toggles at all: logind powers off while the
+# key is still down, so the release event never arrives.
+bindsym --no-repeat --release XF86PowerOff exec /usr/local/bin/uconsole-screen-toggle
 
 ### Idle behaviour
 # Dim the BACKLIGHT rather than powering the panel down.

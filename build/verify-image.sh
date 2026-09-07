@@ -285,6 +285,13 @@ check "screen toggle uses backlight"   "grep -q 'brightnessctl' $MNT/usr/local/b
 check "logind ignores short power press" "grep -q 'HandlePowerKey=ignore' $MNT/etc/systemd/logind.conf.d/uconsole-powerkey.conf"
 check "long press powers off"          "grep -q 'HandlePowerKeyLongPress=poweroff' $MNT/etc/systemd/logind.conf.d/uconsole-powerkey.conf"
 check "sway binds the power key"       "grep -q 'XF86PowerOff exec /usr/local/bin/uconsole-screen-toggle' $MNT/etc/skel/.config/sway/config"
+# Without --no-repeat the binding fires at the 30/s repeat rate while held, which
+# strobes the backlight for the whole length of a long press.
+check "power key binding does not repeat" "grep -q 'bindsym --no-repeat --release XF86PowerOff' $MNT/etc/skel/.config/sway/config"
+check "powerkey tuner present"         "[[ -x $MNT/usr/local/bin/uconsole-powerkey-tune ]]"
+check "powerkey tuner enabled"         "[[ -L $MNT/etc/systemd/system/multi-user.target.wants/uconsole-powerkey-tune.service ]]"
+check "tuner shortens press detection" "grep -q 'set_first_accepted \"\$f\" 128' $MNT/usr/local/bin/uconsole-powerkey-tune"
+check "tuner defers the hardware cut"  "grep -q 'set_first_accepted \"\$f\" 10000' $MNT/usr/local/bin/uconsole-powerkey-tune"
 echo "-- kernel suspend (S3.9) --"
 gzip -dc "$MNT/boot/vmlinuz-linux-uconsole-cm5-git" > /tmp/vmlinux2.raw 2>/dev/null || true
 _susp=$(strings /tmp/vmlinux2.raw | grep -ci "suspend_ops\|mem_sleep\|PM: suspend" || true)

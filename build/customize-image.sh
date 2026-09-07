@@ -102,6 +102,10 @@ systemctl enable uconsole-modem-connect.service
 # S3.5: voltage-based low-battery guard. The fuel gauge reads ~71% shortly
 # before an undervoltage cut, so percentage-based logic fires far too late.
 systemctl enable uconsole-battery-guard.timer
+# Long-press poweroff: shorten the PMIC's press-detect delay so systemd's
+# hardcoded 5s timer is the whole wait, and push the hardware force-off to its
+# maximum so the clean shutdown always beats the unclean cut.
+systemctl enable uconsole-powerkey-tune.service
 
 # Tailscale: the daemon runs but does nothing until someone authenticates with
 # `tailscale up`. No auth key, no state and no identity is baked into the image

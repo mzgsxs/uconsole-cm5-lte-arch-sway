@@ -74,7 +74,12 @@ the reasoning rather than the final file contents.
   undervoltage cut, so percentage-based logic fires far too late.
 - On-demand battery calibration utility that measures real capacity by integrating
   current, stopping safely above the PMU cutoff.
-- Power key: short press blanks the backlight, long press powers off cleanly.
+- Power key: short press blanks the backlight, long press powers off cleanly. The sway
+  binding uses `--no-repeat --release`; without `--no-repeat` a held key fired the
+  backlight toggle at the 30/s repeat rate and the screen strobed. `uconsole-powerkey-tune`
+  sets the AXP `startup` register to 128 ms so systemd's hardcoded 5 s long-press is the
+  whole wait rather than ~8 s, and pushes the PMIC's hardware force-off to its 10 s maximum
+  so the clean shutdown always beats the unclean cut.
 - Added `wireless-regdb` and `iw`; without them brcmfmac errors were 14.5 % of the journal.
 
 ### VPN
@@ -100,7 +105,7 @@ the reasoning rather than the final file contents.
   because macOS writes Spotlight metadata to the card between `dd` and verification,
   making it fail on every good write.
 - `verify-card.sh` verifies correctly instead — raw compare on ext4, file-level on FAT.
-- `verify-image.sh` grew from 64 to 208 checks, including config parsing and a post-build
+- `verify-image.sh` grew from 64 to 217 checks, including config parsing and a post-build
   proof that the image can install packages.
 
 ### Fixed along the way

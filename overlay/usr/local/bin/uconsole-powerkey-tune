@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Tune the AXP power button so a long press lands on systemd's CLEAN poweroff.
+#
+# Two PMIC registers matter, both exposed by axp20x-pek in sysfs:
+#
+#   startup    how long the button must be held before the PMIC reports a press
+#              at all. systemd's long-press timer is a hardcoded 5 s that only
+#              starts once it SEES the key go down, so a 3 s startup makes the
+#              whole gesture take ~8 s. Set it to the minimum.
+#
+#   shutdown   how long a hold takes for the PMIC to cut power in HARDWARE.
+#              That is an unclean cut -- the kind that previously corrupted the
+#              journal and left the FAT boot partition dirty. Push it to the
+#              maximum so systemd's clean shutdown always wins the race, leaving
+#              the hardware cut as a genuine last resort.
+#
+# Values are written in milliseconds; the driver accepts only a fixed set, so we
+# try candidates in order and keep the first the kernel accepts.
+set -uo pipefail
+
+log() { printf '[uconsole-powerkey-tune] %s\n' "$*"; }
+
+DEV="${PEK_DEV:-}"
+for d in /sys/bus/platform/devices/*pek* /sys/devices/platform/*/*pek*; do
+    [[ -n $DEV ]] && break
+    [[ -d $d ]] || continue
+    DEV="$d"; break
+done
+[[ -n $DEV && -d $DEV ]] || { log "no AXP power-key device found; nothing to tune"; exit 0; }
+log "device: $DEV"
+
+# Attribute names differ across kernels; accept either spelling.
+attr() {
+    local base="$1" f
+    for f in "$DEV/$base" "$DEV/${base}_time"; do
+        [[ -w $f ]] && { printf '%s' "$f"; return 0; }
+    done
+    return 1
+}
+
+set_first_accepted() {
+    local file="$1"; shift
+    local before; before="$(cat "$file" 2>/dev/null)"
+    local v
+    for v in "$@"; do
+        if printf '%s' "$v" > "$file" 2>/dev/null; then
+            log "$(basename "$file"): ${before} -> $(cat "$file" 2>/dev/null)"
+            return 0
+        fi
+    done
+    log "$(basename "$file"): kernel rejected all of: $* (left at ${before})"
+    return 1
+}
+
+if f=$(attr startup); then
+    # Shortest first; the AXP221 table is 128/1000/2000/3000 ms.
+    set_first_accepted "$f" 128 1000 2000
+else
+    log "startup attribute not writable; skipping"
+fi
+
+if f=$(attr shutdown); then
+    # Longest first; the table is 4000/6000/8000/10000 ms.
+    set_first_accepted "$f" 10000 8000 6000
+else
+    log "shutdown attribute not writable; skipping"
+fi
