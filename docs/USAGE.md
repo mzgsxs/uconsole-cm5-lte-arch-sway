@@ -11,10 +11,20 @@ on tty1. A short press of the power button blanks the backlight, **locks the ses
 silences the keyboard and trackball**, so the machine can sit in a bag without stray input
 reaching your work. Pressing it again restores input and asks for your password.
 
-The power button itself is never silenced — it is the only device that can bring the machine
-back. If input ever did get stuck disabled, a long press still powers off cleanly (logind
-sees the power key directly, not through sway), and SSH still works:
-`swaymsg input '*' events enabled`.
+Only **pointer** devices are silenced — the trackball, which is what actually generates
+spurious events rolling around in a bag. Keyboards are deliberately left alone: the power
+key is a keyboard-type device whose identifier cannot be predicted reliably, and silencing
+it would be unrecoverable. Keyboard input is not a hazard anyway, because swaylock holds the
+session and keystrokes go to the password prompt rather than to your work.
+
+If you are ever stuck at a black screen, SSH in and run:
+
+```bash
+brightnessctl set 50% && swaymsg input '*' events enabled && pkill swaylock
+```
+
+A long power press also still shuts down cleanly, since logind sees the power key directly
+rather than through sway.
 
 Two other things happen on first boot without any input:
 

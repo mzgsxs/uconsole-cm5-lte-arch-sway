@@ -15,29 +15,35 @@ STATE=/run/user/$(id -u)/uconsole-backlight.save
 cur=$(brightnessctl get 2>/dev/null || echo 0)
 max=$(brightnessctl max 2>/dev/null || echo 0)
 
-# Emit sway input identifiers. mode=except-power skips the power button, which
-# is the only device that can bring the machine back -- silencing it would be an
-# unrecoverable lockout.
+# Emit sway input identifiers.
+#
+# mode=pointers deliberately covers ONLY pointer-like devices, never keyboards.
+# The power key arrives as a keyboard-type device, and its identifier is not
+# something this script can reliably predict -- disabling keyboards risked
+# silencing the one device that can bring the machine back. Keyboard input is
+# not a real hazard anyway: while swaylock holds the session, keystrokes go to
+# the password prompt and cannot reach whatever was on screen. The trackball is
+# the input that actually matters here, since a ball rolling in a bag is what
+# generates spurious events.
 list_inputs() {
     command -v swaymsg >/dev/null 2>&1 || return 0
     swaymsg -t get_inputs -r 2>/dev/null | python3 -c '
 import json, sys
 mode = sys.argv[1] if len(sys.argv) > 1 else "all"
+POINTERS = ("pointer", "touchpad", "touch", "tablet_tool")
+ALL = POINTERS + ("keyboard",)
 try:
     devs = json.load(sys.stdin)
 except Exception:
     sys.exit(0)
+wanted = POINTERS if mode == "pointers" else ALL
 for d in devs:
-    ident = d.get("identifier", "")
-    blob = (ident + " " + (d.get("name") or "")).lower()
-    if mode == "except-power" and any(k in blob for k in ("power", "pek", "axp")):
-        continue
-    if d.get("type") in ("keyboard", "pointer", "touchpad", "touch", "tablet_tool"):
-        print(ident)
+    if d.get("type") in wanted:
+        print(d.get("identifier", ""))
 ' "$1" 2>/dev/null
 }
 
-set_inputs() {   # $1 = enabled|disabled   $2 = all|except-power
+set_inputs() {   # $1 = enabled|disabled   $2 = all|pointers
     local ident
     while read -r ident; do
         [[ -n $ident ]] && swaymsg input "$ident" events "$1" >/dev/null 2>&1
@@ -61,9 +67,9 @@ if [[ ${cur:-0} -gt 0 ]]; then
     echo "$cur" > "$STATE" 2>/dev/null || true
     # Lock before blanking so the desktop is never briefly visible on wake.
     lock_session
-    set_inputs disabled except-power
+    set_inputs disabled pointers
     brightnessctl set 0 >/dev/null 2>&1
-    logger -t uconsole-screen-toggle "blanked, locked, input silenced"
+    logger -t uconsole-screen-toggle "blanked, locked, pointer input silenced"
 else
     # Re-enable EVERY input, not just what we silenced. If anything went wrong on
     # the way down, this is the path that has to recover it -- an input left

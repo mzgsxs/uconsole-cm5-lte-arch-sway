@@ -149,7 +149,7 @@ the reasoning rather than the final file contents.
   because macOS writes Spotlight metadata to the card between `dd` and verification,
   making it fail on every good write.
 - `verify-card.sh` verifies correctly instead — raw compare on ext4, file-level on FAT.
-- `verify-image.sh` grew from 64 to 261 checks, including config parsing and a post-build
+- `verify-image.sh` grew from 64 to 265 checks, including config parsing and a post-build
   proof that the image can install packages.
 
 ### Fixed along the way

@@ -248,7 +248,10 @@ check "trackball scroll on right btn"  "grep -q 'scroll_button button3' $MNT/etc
 check "idle dims the backlight"        "grep -q \"timeout 300 'brightnessctl -s set 0'\" $MNT/etc/skel/.config/sway/config"
 check "idle restores the backlight"    "grep -q \"resume    'brightnessctl -r'\" $MNT/etc/skel/.config/sway/config"
 check "no active dpms idle action"     "! grep -vE '^\\s*#' $MNT/etc/skel/.config/sway/config | grep -q dpms"
-check "idle config has no suspend/poweroff" "! grep -qE 'systemctl (suspend|poweroff)|swaylock' $MNT/etc/skel/.config/sway/config"
+# Comment lines are excluded: the config now *explains* swaylock in a comment,
+# and an earlier version of this check matched that prose rather than a setting.
+# grep -c (not -q) so a large file cannot SIGPIPE the upstream grep under pipefail.
+check "idle itself does not lock or power off" "[[ \$(grep -vE '^[[:space:]]*#' $MNT/etc/skel/.config/sway/config | grep -cE 'systemctl (suspend|poweroff)|swaylock' || true) -eq 0 ]]"
 check "logind never idle-acts"         "grep -q 'IdleAction=ignore' $MNT/etc/systemd/logind.conf.d/uconsole-idle.conf"
 check "foot background is black"       "grep -qx 'background=000000' $MNT/etc/skel/.config/foot/foot.ini"
 check "foot uses colors-dark section"  "grep -qx '\[colors-dark\]' $MNT/etc/skel/.config/foot/foot.ini"
@@ -313,9 +316,17 @@ check "screen toggle uses backlight"   "grep -q 'brightnessctl' $MNT/usr/local/b
 check "logind ignores short power press" "grep -q 'HandlePowerKey=ignore' $MNT/etc/systemd/logind.conf.d/uconsole-powerkey.conf"
 check "long press powers off"          "grep -q 'HandlePowerKeyLongPress=poweroff' $MNT/etc/systemd/logind.conf.d/uconsole-powerkey.conf"
 check "sway binds the power key"       "grep -q 'XF86PowerOff exec /usr/local/bin/uconsole-screen-toggle' $MNT/etc/skel/.config/sway/config"
+# Without --locked sway refuses to run a binding while a locker is active, so the
+# power key would stop working the instant swaylock started -- no way back from
+# a blanked screen.
+check "power key works while locked"   "grep -q 'bindsym --no-repeat --release --locked XF86PowerOff' $MNT/etc/skel/.config/sway/config"
+check "brightness keys work while locked" "[[ \$(grep -c 'bindsym --locked XF86' $MNT/etc/skel/.config/sway/config) -ge 5 ]]"
 # Without --no-repeat the binding fires at the 30/s repeat rate while held, which
 # strobes the backlight for the whole length of a long press.
-check "power key binding does not repeat" "grep -q 'bindsym --no-repeat --release XF86PowerOff' $MNT/etc/skel/.config/sway/config"
+# Match the flags independently of their order, so adding another one later does
+# not silently break the check.
+check "power key binding does not repeat" "grep -qE '^bindsym .*--no-repeat.*XF86PowerOff' $MNT/etc/skel/.config/sway/config"
+check "power key fires on release"        "grep -qE '^bindsym .*--release.*XF86PowerOff' $MNT/etc/skel/.config/sway/config"
 check "powerkey tuner present"         "[[ -x $MNT/usr/local/bin/uconsole-powerkey-tune ]]"
 check "powerkey tuner enabled"         "[[ -L $MNT/etc/systemd/system/multi-user.target.wants/uconsole-powerkey-tune.service ]]"
 check "tuner shortens press detection" "grep -q 'set_first_accepted \"\$f\" 128' $MNT/usr/local/bin/uconsole-powerkey-tune"
@@ -407,11 +418,14 @@ check "screen toggle locks the session" "grep -q 'swaylock -f' $MNT/usr/local/bi
 check "lock happens before blanking"   "grep -q 'lock_session' $MNT/usr/local/bin/uconsole-screen-toggle"
 check "unlock failure is logged, not silent" "grep -q 'WITHOUT locking' $MNT/usr/local/bin/uconsole-screen-toggle"
 echo "-- input silenced while blanked --"
-check "blanking disables input"        "grep -q 'set_inputs disabled except-power' $MNT/usr/local/bin/uconsole-screen-toggle"
+check "blanking disables pointers"     "grep -q 'set_inputs disabled pointers' $MNT/usr/local/bin/uconsole-screen-toggle"
+# Keyboards are never disabled: the power key is a keyboard-type device whose
+# identifier this script cannot predict, and silencing it is unrecoverable.
+check "keyboards are never disabled"   "grep -q 'POINTERS = (\"pointer\", \"touchpad\", \"touch\", \"tablet_tool\")' $MNT/usr/local/bin/uconsole-screen-toggle"
 check "wake re-enables ALL input"      "grep -q 'set_inputs enabled all' $MNT/usr/local/bin/uconsole-screen-toggle"
 # Silencing the power key would be an unrecoverable lockout: it is the only
 # device that can bring the machine back.
-check "power key is never disabled"    "grep -q '\"power\", \"pek\", \"axp\"' $MNT/usr/local/bin/uconsole-screen-toggle"
+check "no fragile name-based power match" "! grep -q '\"pek\"' $MNT/usr/local/bin/uconsole-screen-toggle"
 check "input filter needs python3, which is installed" "[[ -x $MNT/usr/bin/python3 ]]"
 check "swaymsg available for input control" "[[ -x $MNT/usr/bin/swaymsg ]]"
 check "sway still starts after login"  "grep -q 'exec sway' $MNT/etc/skel/.bash_profile"

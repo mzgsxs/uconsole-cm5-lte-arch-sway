@@ -121,11 +121,11 @@ bindsym $mod+space focus mode_toggle
 bindsym Print exec grim -g "$(slurp)" ~/screenshot-$(date +%Y%m%d-%H%M%S).png
 
 ### Hardware keys
-bindsym XF86MonBrightnessUp exec brightnessctl set +10%
-bindsym XF86MonBrightnessDown exec brightnessctl set 10%-
-bindsym XF86AudioRaiseVolume exec wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%+
-bindsym XF86AudioLowerVolume exec wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-
-bindsym XF86AudioMute exec wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle
+bindsym --locked XF86MonBrightnessUp exec brightnessctl set +10%
+bindsym --locked XF86MonBrightnessDown exec brightnessctl set 10%-
+bindsym --locked XF86AudioRaiseVolume exec wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%+
+bindsym --locked XF86AudioLowerVolume exec wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-
+bindsym --locked XF86AudioMute exec wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle
 
 # Power key: short press blanks the backlight (logind is set to ignore it so the
 # compositor sees it); a ~5s long press is a clean poweroff, handled by logind.
@@ -135,7 +135,10 @@ bindsym XF86AudioMute exec wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle
 # long press toggles the backlight dozens of times and the screen strobes.
 # --release means a long press never toggles at all: logind powers off while the
 # key is still down, so the release event never arrives.
-bindsym --no-repeat --release XF86PowerOff exec /usr/local/bin/uconsole-screen-toggle
+# --locked is essential: without it sway refuses to run a binding while a screen
+# locker is active, so the moment swaylock started the power key stopped working
+# and there was no way back from a blanked screen.
+bindsym --no-repeat --release --locked XF86PowerOff exec /usr/local/bin/uconsole-screen-toggle
 
 ### Idle behaviour
 # Dim the BACKLIGHT rather than powering the panel down.

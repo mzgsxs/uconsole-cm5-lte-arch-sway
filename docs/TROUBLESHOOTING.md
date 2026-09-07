@@ -220,6 +220,36 @@ unclean shutdown.
 
 ---
 
+## Screen blanks on a power press and never comes back
+
+Caused by a missing `--locked` on the sway binding. From `sway(5)`:
+
+> Unless the flag `--locked` is set, the command will not be run when a screen locking
+> program is active.
+
+Locking and the power-key binding were introduced in the same change, so the instant
+`swaylock` started, the key that was supposed to bring the screen back stopped being
+delivered. Pressing it again did nothing, however many times.
+
+The binding is now `bindsym --no-repeat --release --locked XF86PowerOff`, and the
+brightness and volume keys carry `--locked` too.
+
+A second, compounding hazard was silencing input devices by name — the filter skipped
+anything matching `power`/`pek`/`axp`, which is a guess about a device identifier that
+cannot be verified in advance. It now silences **pointer devices only** and never
+keyboards, so whatever the power key's device happens to be called, it survives.
+
+**Recovering a machine that is stuck black**, over SSH:
+
+```bash
+brightnessctl set 50% && swaymsg input '*' events enabled && pkill swaylock
+```
+
+A long power press also still powers off cleanly, because logind sees the power key
+directly rather than through the compositor.
+
+---
+
 ## Lessons that shaped the verification suite
 
 Several checks are written in a non-obvious way because the obvious version was wrong.
