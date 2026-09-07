@@ -207,7 +207,12 @@ check "firstboot service enabled"     "[[ -L $MNT/etc/systemd/system/multi-user.
 check "firstboot runs before the getty" "grep -q 'Before=getty@tty1.service' $MNT/etc/systemd/system/uconsole-firstboot-user.service"
 check "firstboot does not enable autologin" "! grep -q 'agetty --autologin' $MNT/usr/local/bin/uconsole-firstboot-user"
 check "firstboot clears a stale autologin"  "grep -q 'rm -f \"\$DROPIN\"' $MNT/usr/local/bin/uconsole-firstboot-user"
-check "firstboot owns tty1"           "grep -q 'TTYPath=/dev/tty1' $MNT/etc/systemd/system/uconsole-firstboot-user.service"
+# The wizard runs on its own VT: cmdline.txt sets console=tty1, so tty1 gets
+# every printk no matter how quiet we ask the kernel to be.
+check "firstboot runs on its own VT"   "grep -q 'TTYPath=/dev/tty7' $MNT/etc/systemd/system/uconsole-firstboot-user.service"
+check "firstboot switches to that VT"  "grep -q 'chvt \"\$WIZARD_VT\"' $MNT/usr/local/bin/uconsole-firstboot-user"
+check "firstboot switches back on exit" "grep -q 'chvt \"\${SAVED_VT:-1}\"' $MNT/usr/local/bin/uconsole-firstboot-user"
+check "chvt available"                 "[[ -x $MNT/usr/bin/chvt ]]"
 check "firstboot sets root password"  "grep -q 'set_pw root' $MNT/usr/local/bin/uconsole-firstboot-user"
 check "firstboot sets alarm password" "grep -q 'set_pw alarm' $MNT/usr/local/bin/uconsole-firstboot-user"
 check "firstboot grants wheel"        "grep -q 'wheel,video,audio,input' $MNT/usr/local/bin/uconsole-firstboot-user"
@@ -395,13 +400,21 @@ check "swaylock has a PAM config"      "[[ -s $MNT/etc/pam.d/swaylock ]]"
 check "screen toggle locks the session" "grep -q 'swaylock -f' $MNT/usr/local/bin/uconsole-screen-toggle"
 check "lock happens before blanking"   "grep -q 'lock_session' $MNT/usr/local/bin/uconsole-screen-toggle"
 check "unlock failure is logged, not silent" "grep -q 'WITHOUT locking' $MNT/usr/local/bin/uconsole-screen-toggle"
+echo "-- input silenced while blanked --"
+check "blanking disables input"        "grep -q 'set_inputs disabled except-power' $MNT/usr/local/bin/uconsole-screen-toggle"
+check "wake re-enables ALL input"      "grep -q 'set_inputs enabled all' $MNT/usr/local/bin/uconsole-screen-toggle"
+# Silencing the power key would be an unrecoverable lockout: it is the only
+# device that can bring the machine back.
+check "power key is never disabled"    "grep -q '\"power\", \"pek\", \"axp\"' $MNT/usr/local/bin/uconsole-screen-toggle"
+check "input filter needs python3, which is installed" "[[ -x $MNT/usr/bin/python3 ]]"
+check "swaymsg available for input control" "[[ -x $MNT/usr/bin/swaymsg ]]"
 check "sway still starts after login"  "grep -q 'exec sway' $MNT/etc/skel/.bash_profile"
 
 echo
 echo "### 20. hardening and resources"
 echo "-- zram (was installed but inert) --"
 check "zram-generator config present"  "[[ -s $MNT/etc/systemd/zram-generator.conf ]]"
-check "zram sized against RAM"         "grep -q 'zram-size' $MNT/etc/systemd/zram-generator.conf"
+check "zram is 4 GB"                   "grep -qx 'zram-size = 4096' $MNT/etc/systemd/zram-generator.conf"
 check "zram uses zstd"                 "grep -q 'compression-algorithm = zstd' $MNT/etc/systemd/zram-generator.conf"
 check "zram-generator installed"       "[[ -x $MNT/usr/lib/systemd/system-generators/zram-generator ]]"
 echo "-- firewall --"

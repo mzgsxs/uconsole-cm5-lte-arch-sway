@@ -48,10 +48,12 @@ the reasoning rather than the final file contents.
 
 ### First boot
 
-- A wizard on tty1 prompts for a username and password, creates the account with sudo,
-  applies the same password to `root` and `alarm`, repoints autologin, and disables itself.
-- The wizard temporarily silences kernel printk and systemd status output, which otherwise
-  interleave with the prompt, restoring both on exit so later boot diagnostics survive.
+- A wizard prompts for a username and password, creates the account with sudo, applies
+  the same password to `root` and `alarm`, and disables itself. It runs on its own VT
+  (tty7) because `console=tty1` means tty1 receives every kernel printk, which otherwise
+  interleaves with the prompt. There is no autologin.
+- The wizard also silences kernel printk and systemd status output as belt-and-braces,
+  restoring both on exit so later boot diagnostics survive.
 - Root filesystem expansion rewritten: the previous version used `parted -s`, which
   answers *No* to the in-use prompt, then stamped itself complete — stranding 52 GB of a
   64 GB card permanently. Now uses `growpart`, asserts the partition actually grew, and
@@ -106,9 +108,13 @@ the reasoning rather than the final file contents.
   tailnet. sshd previously listened on every interface with password auth while the machine
   roamed onto public Wi-Fi and a carrier LTE address; restricting the source beats disabling
   password auth, which would have broken the paste-over-SSH workflow.
+- A short power press also **silences the keyboard and trackball** so the device can be
+  carried without stray input landing in whatever was on screen. The power button is
+  excluded from that — silencing it would be an unrecoverable lockout — and waking
+  re-enables every input, not just the ones that were silenced.
 - **zram configured.** The package was installed but had no `zram-generator.conf`, so it did
   nothing at all — 4 GB of RAM, no swap, and `cgroup_disable=memory` meant an OOM hard-locked
-  the machine. Now 2 GB of zstd-compressed swap.
+  the machine. Now 4 GB of zstd-compressed swap.
 - **`uconsole-kernel-check`.** The kernel is in no pacman repository, so `pacman -Syu` would
   silently never update it. This reports whether the build has fallen behind upstream and
   prints the rebuild command.
@@ -139,7 +145,7 @@ the reasoning rather than the final file contents.
   because macOS writes Spotlight metadata to the card between `dd` and verification,
   making it fail on every good write.
 - `verify-card.sh` verifies correctly instead — raw compare on ext4, file-level on FAT.
-- `verify-image.sh` grew from 64 to 250 checks, including config parsing and a post-build
+- `verify-image.sh` grew from 64 to 258 checks, including config parsing and a post-build
   proof that the image can install packages.
 
 ### Fixed along the way

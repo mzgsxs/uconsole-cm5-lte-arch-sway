@@ -3,7 +3,7 @@
 #
 # Prompts for a username and password, creates that account as the primary
 # administrator, and gives root and the stock 'alarm' account the same
-# password. Then points tty1 autologin at the new user and disables itself.
+# password. There is no autologin: the machine requires a login at every boot.
 #
 # Deliberately not 'set -e': every failure path here re-prompts rather than
 # aborting, because aborting would leave a machine nobody can log into.
@@ -28,6 +28,11 @@ DROPIN=/etc/systemd/system/getty@tty1.service.d/autologin.conf
 # ---------------------------------------------------------------------------
 SAVED_PRINTK=""
 SYSTEMD_QUIETED=0
+SAVED_VT=""
+# cmdline.txt sets console=tty1, so every kernel printk lands on tty1 no matter
+# how quiet we ask it to be. Rather than compete for that console, run the
+# wizard on a VT the kernel never writes to. Only tty1 has a getty, so 7 is free.
+WIZARD_VT=7
 
 console_quiet() {
     # /proc/sys/kernel/printk holds four values; the first is console_loglevel.
@@ -38,6 +43,11 @@ console_quiet() {
     if kill -s RTMIN+21 1 2>/dev/null; then SYSTEMD_QUIETED=1; fi
     # Belt and braces: stop this specific console accepting kernel messages.
     setterm --msg off 2>/dev/null || true
+    # Switch the user to our own VT. This is the fix that actually works: the
+    # printk silencing above only lowers the volume, whereas tty7 is somewhere
+    # the kernel does not write at all.
+    SAVED_VT="$(fgconsole 2>/dev/null || echo 1)"
+    chvt "$WIZARD_VT" 2>/dev/null || true
     clear 2>/dev/null || printf '\033[2J\033[H'
 }
 
@@ -47,6 +57,8 @@ console_restore() {
     fi
     setterm --msg on 2>/dev/null || true
     (( SYSTEMD_QUIETED )) && kill -s RTMIN+20 1 2>/dev/null || true
+    # Hand the screen back to tty1, where the login prompt lives.
+    chvt "${SAVED_VT:-1}" 2>/dev/null || true
 }
 trap console_restore EXIT
 

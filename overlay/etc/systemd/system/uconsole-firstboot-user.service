@@ -1,8 +1,10 @@
 [Unit]
 Description=uConsole first-boot account setup
 ConditionPathExists=!/var/lib/uconsole-firstboot-done
-# Own the console before the autologin getty starts, so the prompt is visible
-# and the getty picks up the rewritten autologin user afterwards.
+# Run before the login getty so the prompt is visible and the account exists by
+# the time anyone is asked to log in. Uses tty7 rather than tty1: cmdline.txt
+# sets console=tty1, so tty1 receives every kernel printk and the prompt would
+# be scribbled over.
 Before=getty@tty1.service
 After=systemd-user-sessions.service plymouth-quit-wait.service
 
@@ -13,7 +15,7 @@ ExecStart=/usr/local/bin/uconsole-firstboot-user
 StandardInput=tty
 StandardOutput=tty
 StandardError=tty
-TTYPath=/dev/tty1
+TTYPath=/dev/tty7
 TTYReset=yes
 TTYVHangup=yes
 TTYVTDisallocate=yes

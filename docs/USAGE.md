@@ -7,8 +7,14 @@ The machine prompts on tty1 for a **username and password**. That account gets s
 The wizard then disables itself.
 
 **There is no autologin.** Every boot presents a login prompt; sway starts once you log in
-on tty1. A short press of the power button blanks the backlight *and locks the session*, so
-waking the device also requires your password.
+on tty1. A short press of the power button blanks the backlight, **locks the session, and
+silences the keyboard and trackball**, so the machine can sit in a bag without stray input
+reaching your work. Pressing it again restores input and asks for your password.
+
+The power button itself is never silenced — it is the only device that can bring the machine
+back. If input ever did get stuck disabled, a long press still powers off cleanly (logind
+sees the power key directly, not through sway), and SSH still works:
+`swaymsg input '*' events enabled`.
 
 Two other things happen on first boot without any input:
 
