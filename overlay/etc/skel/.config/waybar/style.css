@@ -52,3 +52,13 @@ window#waybar {
 #custom-modem.searching  { color: #ffff00; }
 #custom-modem.registered { color: #00aa00; }
 #custom-modem.connected  { color: #00ff00; }
+
+#temperature,
+#memory {
+    padding: 0 8px;
+    background: #000000;
+    color: #00ff00;
+}
+#temperature.critical { color: #ff5555; }
+#memory.warning       { color: #ffff00; }
+#memory.critical      { color: #ff5555; }

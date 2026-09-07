@@ -5,7 +5,7 @@ A reproducible build system that produces a bootable **Arch Linux ARM** image wi
 fitted with a **Raspberry Pi Compute Module 5**.
 
 The kernel is compiled from source; the image is assembled and then checked by an
-automated verification suite — currently **217 checks**, all passing.
+automated verification suite — currently **228 checks**, all passing.
 
 > **Read [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) before your first boot.**
 > A CM5 Lite will very likely *not* boot from SD until its bootloader EEPROM is
@@ -92,7 +92,7 @@ different question from "packages installed during the build" and caught two rea
 that structural checks alone had missed.
 
 ```
-RESULT: 217 passed, 0 failed
+RESULT: 228 passed, 0 failed
 ```
 
 Structural verification is not a boot test. Nothing here has been validated by an

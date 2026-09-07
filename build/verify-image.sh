@@ -19,6 +19,12 @@ ok()   { printf '  [PASS] %s\n' "$*"; PASSES=$((PASSES+1)); }
 bad()  { printf '  [FAIL] %s\n' "$*"; FAILS=$((FAILS+1)); }
 check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
 
+# Search a binary for an exact string WITHOUT `grep -q`. `grep -q` exits on the
+# first match, SIGPIPEs the upstream process, and `set -o pipefail` then reports
+# the whole pipeline as failed -- a false negative that has bitten this suite
+# three times now. `grep -c` drains its input, so nothing gets SIGPIPEd.
+has_string() { [[ $(strings "$1" 2>/dev/null | grep -cx -- "$2" || true) -gt 0 ]]; }
+
 echo "############ VERIFYING $IMG ############"
 echo
 echo "### 1. image file"
@@ -241,6 +247,20 @@ check "foot uses colors-dark section"  "grep -qx '\[colors-dark\]' $MNT/etc/skel
 check "foot has no stale [colors]"     "! grep -qx '\[colors\]' $MNT/etc/skel/.config/foot/foot.ini"
 check "waybar background is black"     "grep -q 'background: #000000' $MNT/etc/skel/.config/waybar/style.css"
 check "waybar text is green"           "grep -q 'color: #00ff00' $MNT/etc/skel/.config/waybar/style.css"
+echo "-- waybar system monitors --"
+# The CM5 is BCM2712, but its device tree declares brcm,bcm2711-thermal for the
+# AVS block, so bcm2711_thermal binds and cpu-thermal is the only zone (0).
+check "waybar shows CPU temperature"   "grep -q '\"temperature\"' $MNT/etc/skel/.config/waybar/config"
+check "temperature reads thermal zone 0" "grep -q '\"thermal-zone\": 0' $MNT/etc/skel/.config/waybar/config"
+check "temperature has a critical threshold" "grep -q 'critical-threshold' $MNT/etc/skel/.config/waybar/config"
+check "waybar shows RAM usage"         "grep -q '\"memory\"' $MNT/etc/skel/.config/waybar/config"
+check "memory has warning states"      "grep -q '\"warning\": 80' $MNT/etc/skel/.config/waybar/config"
+check "both are in modules-right"      "grep -q '\"temperature\",' $MNT/etc/skel/.config/waybar/config && grep -q '\"memory\",' $MNT/etc/skel/.config/waybar/config"
+check "waybar has temperature compiled in" "has_string $MNT/usr/bin/waybar temperature"
+check "waybar has memory compiled in"  "has_string $MNT/usr/bin/waybar memory"
+check "thermal driver present in kernel" "grep -q 'bcm2711_thermal' $MNT/usr/lib/modules/$KVER/modules.builtin"
+check "waybar config is valid JSON"    "python3 -c \"import json;json.load(open('$MNT/etc/skel/.config/waybar/config'))\""
+check "temperature styled in css"      "grep -q '#temperature' $MNT/etc/skel/.config/waybar/style.css"
 
 echo
 echo "### 14. pacman usability after boot"

@@ -2,17 +2,40 @@
   "layer": "top",
   "position": "top",
   "height": 22,
-  "modules-left": ["sway/workspaces", "sway/mode"],
-  "modules-center": ["clock"],
-  "modules-right": ["pulseaudio", "backlight", "network", "custom/modem", "battery"],
-  "sway/workspaces": { "disable-scroll": true, "all-outputs": true },
-  "clock": { "format": "{:%a %d %b  %H:%M}" },
+  "modules-left": [
+    "sway/workspaces",
+    "sway/mode"
+  ],
+  "modules-center": [
+    "clock"
+  ],
+  "modules-right": [
+    "temperature",
+    "memory",
+    "pulseaudio",
+    "backlight",
+    "network",
+    "custom/modem",
+    "battery"
+  ],
+  "sway/workspaces": {
+    "disable-scroll": true,
+    "all-outputs": true
+  },
+  "clock": {
+    "format": "{:%a %d %b  %H:%M}"
+  },
   "battery": {
     "format": "BAT {capacity}%",
     "format-charging": "CHR {capacity}%",
-    "states": { "warning": 25, "critical": 10 }
+    "states": {
+      "warning": 25,
+      "critical": 10
+    }
   },
-  "backlight": { "format": "LCD {percent}%" },
+  "backlight": {
+    "format": "LCD {percent}%"
+  },
   "network": {
     "format-wifi": "WIFI {signalStrength}%",
     "format-ethernet": "ETH",
@@ -27,5 +50,23 @@
     "return-type": "json",
     "interval": 10,
     "tooltip": true
+  },
+  "temperature": {
+    "thermal-zone": 0,
+    "interval": 10,
+    "format": "TMP {temperatureC}°C",
+    "critical-threshold": 80,
+    "format-critical": "TMP {temperatureC}°C!",
+    "tooltip-format": "CPU {temperatureC}°C ({temperatureF}°F)"
+  },
+  "memory": {
+    "interval": 10,
+    "format": "RAM {percentage}%",
+    "format-alt": "RAM {used:0.1f}G",
+    "states": {
+      "warning": 80,
+      "critical": 92
+    },
+    "tooltip-format": "{used:0.1f}G of {total:0.1f}G used, {avail:0.1f}G available"
   }
 }
