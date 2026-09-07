@@ -1,0 +1,1 @@
+root=LABEL=uconsole-root rw rootwait console=tty1 loglevel=3 fsck.repair=yes fbcon=rotate:1 lsm=landlock,apparmor

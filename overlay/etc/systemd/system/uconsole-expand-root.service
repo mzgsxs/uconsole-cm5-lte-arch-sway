@@ -1,0 +1,14 @@
+[Unit]
+Description=Expand root filesystem to fill the storage device
+ConditionPathExists=!/var/lib/uconsole-resize-done
+After=local-fs.target
+Wants=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/uconsole-expand-root
+RemainAfterExit=yes
+StandardOutput=journal+console
+
+[Install]
+WantedBy=multi-user.target

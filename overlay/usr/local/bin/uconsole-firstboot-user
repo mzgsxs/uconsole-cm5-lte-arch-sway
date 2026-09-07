@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# First-boot account setup for the uConsole image.
+#
+# Prompts for a username and password, creates that account as the primary
+# administrator, and gives root and the stock 'alarm' account the same
+# password. Then points tty1 autologin at the new user and disables itself.
+#
+# Deliberately not 'set -e': every failure path here re-prompts rather than
+# aborting, because aborting would leave a machine nobody can log into.
+set -uo pipefail
+
+STAMP=/var/lib/uconsole-firstboot-done
+NEWGROUPS=wheel,video,audio,input,render,storage,network
+DROPIN=/etc/systemd/system/getty@tty1.service.d/autologin.conf
+
+[[ -e $STAMP ]] && exit 0
+[[ -t 0 ]] || { echo "firstboot: no terminal, skipping"; exit 0; }
+
+printf '\n'
+printf '  ==========================================\n'
+printf '   uConsole  -  Arch Linux + Sway\n'
+printf '   First boot: create your account\n'
+printf '  ==========================================\n\n'
+printf '  This account will have sudo access.\n'
+printf '  The same password is also applied to root\n'
+printf '  and to the stock "alarm" account.\n\n'
+
+USERNAME=""
+while [[ -z $USERNAME ]]; do
+    read -r -p '  Username: ' USERNAME
+    if [[ ! $USERNAME =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
+        printf '  ! Use lowercase letters, digits, - and _ (must not start with a digit).\n\n'
+        USERNAME=""; continue
+    fi
+    if id "$USERNAME" &>/dev/null; then
+        printf '  ! That account already exists. Pick another name.\n\n'
+        USERNAME=""; continue
+    fi
+done
+
+PASSWORD=""
+while [[ -z $PASSWORD ]]; do
+    read -r -s -p '  Password: ' PASSWORD; printf '\n'
+    if [[ -z $PASSWORD ]]; then
+        printf '  ! Password cannot be empty.\n\n'; continue
+    fi
+    read -r -s -p '  Repeat password: ' PASSWORD2; printf '\n'
+    if [[ $PASSWORD != "$PASSWORD2" ]]; then
+        printf '  ! Passwords do not match.\n\n'; PASSWORD=""; continue
+    fi
+done
+printf '\n'
+
+printf '  Creating %s ... ' "$USERNAME"
+if ! useradd -m -G "$NEWGROUPS" -s /bin/bash "$USERNAME"; then
+    printf 'FAILED\n  ! Could not create the account. Dropping to the stock login.\n'
+    exit 1
+fi
+printf 'done\n'
+
+# chpasswd splits on the FIRST colon, so a password containing ':' is safe.
+set_pw() {
+    local acct="$1"
+    id "$acct" &>/dev/null || return 0
+    if printf '%s:%s\n' "$acct" "$PASSWORD" | chpasswd 2>/tmp/firstboot-pw.err; then
+        printf '  Password set for %s\n' "$acct"
+    else
+        printf '  ! Could not set password for %s: %s\n' "$acct" "$(cat /tmp/firstboot-pw.err)"
+    fi
+}
+set_pw "$USERNAME"
+set_pw root
+set_pw alarm
+rm -f /tmp/firstboot-pw.err
+
+# Autologin this user on tty1; ~/.bash_profile then starts sway.
+install -d "$(dirname "$DROPIN")"
+cat > "$DROPIN" <<EOF
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin ${USERNAME} --noclear %I \$TERM
+EOF
+systemctl daemon-reload
+
+install -d "$(dirname "$STAMP")"
+printf 'user=%s\ndate=%s\n' "$USERNAME" "$(date -Iseconds)" > "$STAMP"
+
+printf '\n  Account ready. Starting the desktop as %s ...\n\n' "$USERNAME"
+sleep 2

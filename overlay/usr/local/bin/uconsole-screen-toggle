@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Toggle the panel backlight. Bound to a short power-key press.
+#
+# Deliberately uses the backlight, NOT 'output dpms off': on this cwu50 DSI
+# panel a dpms power-down has been observed not to come back (report S3.8),
+# which presents as a hung machine. The backlight is safe and instant.
+set -uo pipefail
+STATE=/run/user/$(id -u)/uconsole-backlight.save
+
+cur=$(brightnessctl get 2>/dev/null || echo 0)
+max=$(brightnessctl max 2>/dev/null || echo 0)
+
+if [[ ${cur:-0} -gt 0 ]]; then
+    echo "$cur" > "$STATE" 2>/dev/null || true
+    brightnessctl set 0 >/dev/null 2>&1
+else
+    # Restore the saved level; fall back to 40% if we have no record.
+    if [[ -r $STATE ]]; then
+        brightnessctl set "$(cat "$STATE")" >/dev/null 2>&1
+    else
+        brightnessctl set "$(( max * 40 / 100 ))" >/dev/null 2>&1
+    fi
+fi

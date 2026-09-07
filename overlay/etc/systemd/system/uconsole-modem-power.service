@@ -1,0 +1,19 @@
+[Unit]
+Description=Power on the uConsole 4G/LTE module (SIM7600, CM5)
+Documentation=https://github.com/clockworkpi/uConsole
+DefaultDependencies=no
+After=systemd-udev-settle.service local-fs.target
+Before=ModemManager.service
+Wants=ModemManager.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# No leading '-': a failure here must be visible. The vendor unit masked a
+# hard failure for weeks by using 'ExecStart=-'.
+ExecStart=/usr/local/bin/uconsole-modem-power enable
+ExecStop=/usr/local/bin/uconsole-modem-power disable
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

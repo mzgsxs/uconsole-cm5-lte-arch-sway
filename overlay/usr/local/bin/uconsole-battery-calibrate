@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+# uconsole-battery-calibrate {status|run|report|apply|abort}
+#
+# On-demand fuel-gauge calibration for the uConsole's AXP223 PMIC.
+#
+# Why this exists (report S3.5): the gauge ships uncalibrated -- 'calibrate'
+# reads 0 -- and its percentage is badly wrong. Measured on this hardware it
+# read 49% at 3.402 V, and 71% roughly an hour before an undervoltage cut.
+# Percentages from this gauge cannot be trusted for anything.
+#
+# What this does: measures the pack by integrating current over a controlled
+# discharge, so you get a real Wh figure and a voltage->state-of-charge table
+# derived from your actual cell rather than the driver's defaults. Where the
+# driver exposes writable calibration attributes, 'apply' writes them.
+#
+# Safety: discharge STOPS at a floor safely above the PMU cutoff (default
+# 3.50 V, while uconsole-battery-guard shuts down at 3.40 V). It never runs the
+# pack flat, because on this board an LTE transmit burst at low voltage crosses
+# the cutoff instantly.
+set -uo pipefail
+
+B=${B:-/sys/class/power_supply/axp20x-battery}
+AC=${AC:-/sys/class/power_supply/axp22x-ac/online}
+DIR=/var/lib/uconsole/battery-calibration
+CSV="$DIR/discharge.csv"
+META="$DIR/run.meta"
+FLOOR_UV=${FLOOR_UV:-3500000}     # stop discharging here (guard cuts at 3.40 V)
+SAMPLE_SEC=${SAMPLE_SEC:-10}
+
+say()  { printf '\n\033[1m%s\033[0m\n' "$*"; }
+inf()  { printf '      %s\n' "$*"; }
+ok()   { printf '  \033[32mOK\033[0m  %s\n' "$*"; }
+warn() { printf '  \033[33m!!\033[0m  %s\n' "$*"; }
+err()  { printf '  \033[31mXX\033[0m  %s\n' "$*" >&2; }
+
+need_root(){ [[ $EUID -eq 0 ]] || { err "'$1' needs root -- use sudo"; exit 1; }; }
+rd(){ cat "$B/$1" 2>/dev/null || echo ""; }
+on_ac(){ [[ $(cat "$AC" 2>/dev/null || echo 0) == 1 ]]; }
+uv2v(){ awk -v x="$1" 'BEGIN{printf "%.3f", x/1000000}'; }
+
+[[ -d $B ]] || { err "no battery at $B -- is this a uConsole?"; exit 1; }
+
+modem_is_on(){ grep -qs 1e0e /sys/bus/usb/devices/*/idVendor 2>/dev/null; }
+
+show_status(){
+    say "Fuel gauge state"
+    printf '      %-22s %s\n' "voltage" "$(uv2v "$(rd voltage_now)") V"
+    printf '      %-22s %s\n' "current" "$(uv2v "$(rd current_now)") A"
+    printf '      %-22s %s\n' "gauge says" "$(rd capacity)%"
+    printf '      %-22s %s\n' "status" "$(rd status)"
+    printf '      %-22s %s\n' "on AC" "$(on_ac && echo yes || echo no)"
+    say "Calibration-relevant attributes"
+    local a
+    for a in calibrate charge_full charge_full_design charge_now energy_full \
+             energy_full_design constant_charge_current voltage_min_design voltage_max_design; do
+        if [[ -e $B/$a ]]; then
+            printf '      %-26s %-12s %s\n' "$a" "$(rd "$a")" \
+                "$([[ -w $B/$a ]] && echo '(writable)' || echo '(read-only)')"
+        else
+            printf '      %-26s %s\n' "$a" "absent"
+        fi
+    done
+    if [[ $(rd calibrate) == 0 ]]; then
+        warn "calibrate reads 0 -- the gauge has never been calibrated"
+    fi
+    say "Cross-check: does the voltage agree with the percentage?"
+    local v pct approx
+    v=$(rd voltage_now); pct=$(rd capacity)
+    # Rough Li-ion resting curve, only used to flag gross disagreement.
+    approx=$(awk -v v="$v" 'BEGIN{
+        split("3400000 3600000 3700000 3800000 3900000 4000000 4100000 4200000", bp, " ");
+        split("0 15 35 55 70 85 95 100", sc, " ");
+        if (v<=bp[1]) {print 0; exit} if (v>=bp[8]) {print 100; exit}
+        for(i=1;i<8;i++) if (v>=bp[i] && v<bp[i+1]) {
+            printf "%d", sc[i] + (sc[i+1]-sc[i])*(v-bp[i])/(bp[i+1]-bp[i]); exit}}')
+    inf "voltage implies roughly ${approx}%, gauge reports ${pct}%"
+    if [[ -n $pct && -n $approx ]] && (( pct - approx > 20 || approx - pct > 20 )); then
+        warn "these disagree by more than 20 points -- do not trust the percentage"
+    fi
+    [[ -f $CSV ]] && { say "Last run"; inf "$(wc -l < "$CSV") samples in $CSV"; [[ -f $META ]] && sed 's/^/      /' "$META"; }
+}
+
+do_run(){
+    need_root run
+    say "Battery calibration"
+    inf "This measures real pack capacity by integrating current during a"
+    inf "controlled discharge. It stops at $(uv2v $FLOOR_UV) V and never runs the pack flat."
+    echo
+    if modem_is_on; then
+        warn "The LTE modem is powered. Its transmit bursts draw ~4.4 A peaks,"
+        warn "which distort the measurement and risk an undervoltage cut."
+        inf  "Strongly recommended:  sudo uconsole-modem-power disable"
+        read -r -p '      Continue anyway? [y/N] ' a; [[ ${a,,} == y ]] || exit 1
+    fi
+    mkdir -p "$DIR"
+
+    # --- phase 1: full charge ---
+    say "Phase 1 of 3 - charge to full"
+    if ! on_ac; then
+        inf "Plug in the charger now."
+        while ! on_ac; do sleep 5; done
+    fi
+    inf "Charging. This can take a couple of hours; leave it plugged in."
+    while [[ $(rd status) != "Full" ]]; do
+        printf '\r      %s V   %s%%   %s        ' "$(uv2v "$(rd voltage_now)")" "$(rd capacity)" "$(rd status)"
+        sleep 30
+        on_ac || { echo; err "AC removed during charge -- aborting"; exit 1; }
+    done
+    echo; ok "battery reports Full at $(uv2v "$(rd voltage_now)") V"
+
+    # --- phase 2: measured discharge ---
+    say "Phase 2 of 3 - discharge and measure"
+    inf "UNPLUG the charger now. Leave the machine on and idle."
+    while on_ac; do sleep 5; done
+    ok "on battery; sampling every ${SAMPLE_SEC}s until $(uv2v $FLOOR_UV) V"
+    echo "epoch,voltage_uv,current_ua,capacity_pct,status" > "$CSV"
+    local start now v i mah=0 mwh=0 prev_t
+    start=$(date +%s); prev_t=$start
+    while :; do
+        v=$(rd voltage_now); i=$(rd current_now); now=$(date +%s)
+        printf '%s,%s,%s,%s,%s\n' "$now" "$v" "$i" "$(rd capacity)" "$(rd status)" >> "$CSV"
+        # Integrate: |current| in uA over elapsed seconds -> mAh and mWh.
+        local dt=$(( now - prev_t )); prev_t=$now
+        if (( dt > 0 )) && [[ -n $i && -n $v ]]; then
+            read -r mah mwh < <(awk -v mah="$mah" -v mwh="$mwh" -v i="$i" -v v="$v" -v dt="$dt" \
+                'BEGIN{a=(i<0?-i:i)/1000; mah+=a*dt/3600; mwh+=a*(v/1000000)*dt/3600; printf "%.4f %.4f", mah, mwh}')
+        fi
+        printf '\r      %s V   gauge %s%%   measured %.0f mAh / %.1f Wh   %s elapsed     ' \
+            "$(uv2v "$v")" "$(rd capacity)" "$mah" "$(awk -v x="$mwh" 'BEGIN{printf "%.2f", x/1000}')" \
+            "$(printf '%dm' $(( (now-start)/60 )))"
+        on_ac && { echo; warn "AC reconnected -- discharge measurement ended early"; break; }
+        [[ -n $v ]] && (( v <= FLOOR_UV )) && { echo; ok "reached the $(uv2v $FLOOR_UV) V floor"; break; }
+        sleep "$SAMPLE_SEC"
+    done
+    {
+        echo "measured_mah=$(printf '%.0f' "$mah")"
+        echo "measured_wh=$(awk -v x="$mwh" 'BEGIN{printf "%.2f", x/1000}')"
+        echo "floor_uv=$FLOOR_UV"
+        echo "gauge_pct_at_floor=$(rd capacity)"
+        echo "date=$(date -Iseconds)"
+    } > "$META"
+
+    # --- phase 3: recharge ---
+    say "Phase 3 of 3 - recharge"
+    inf "Plug the charger back in; the pack should not be left near the floor."
+    do_report
+}
+
+do_report(){
+    [[ -f $META ]] || { err "no completed run -- run 'sudo uconsole-battery-calibrate run' first"; exit 1; }
+    say "Calibration result"
+    sed 's/^/      /' "$META"
+    local mwh design
+    mwh=$(awk -F= '/measured_wh/{print $2}' "$META")
+    design=$(rd charge_full_design)
+    inf ""
+    inf "Measured between 'Full' and $(uv2v $FLOOR_UV) V. True total capacity is"
+    inf "somewhat higher, since the floor is above the real cutoff."
+    [[ -n $design && $design != 0 ]] && inf "driver charge_full_design: $design"
+    say "Voltage -> state of charge, from your own discharge"
+    [[ -f $CSV ]] && awk -F, 'NR>1 && $2!="" {
+        v=$2/1000000; if (v>=4.0) b="4.0V+"; else if (v>=3.9) b="3.9-4.0";
+        else if (v>=3.8) b="3.8-3.9"; else if (v>=3.7) b="3.7-3.8";
+        else if (v>=3.6) b="3.6-3.7"; else if (v>=3.5) b="3.5-3.6"; else b="3.4-3.5";
+        n[b]++; g[b]+=$4 }
+      END{ for (k in n) printf "      %-9s  gauge averaged %5.1f%%  (%d samples)\n", k, g[k]/n[k], n[k] }' \
+      "$CSV" | sort -r
+    inf ""
+    inf "Full sample log: $CSV"
+    inf "If the gauge percentage disagrees wildly with voltage above, keep"
+    inf "trusting voltage -- that is what uconsole-battery-guard uses."
+}
+
+do_apply(){
+    need_root apply
+    say "Applying calibration where the driver allows it"
+    local wrote=0
+    if [[ -w $B/calibrate ]]; then
+        if echo 1 > "$B/calibrate" 2>/dev/null; then ok "triggered PMIC gauge calibration (calibrate=1)"; wrote=1
+        else warn "calibrate is writable but the write was rejected"; fi
+    else
+        warn "calibrate is not writable on this kernel -- nothing to trigger"
+    fi
+    if [[ -f $META && -w $B/charge_full_design ]]; then
+        local mah; mah=$(awk -F= '/measured_mah/{print $2}' "$META")
+        if [[ -n $mah && $mah -gt 0 ]]; then
+            if echo $(( mah * 1000 )) > "$B/charge_full_design" 2>/dev/null; then
+                ok "wrote charge_full_design=$(( mah * 1000 )) uAh from the measured run"; wrote=1
+            else warn "could not write charge_full_design"; fi
+        fi
+    fi
+    (( wrote )) || {
+        inf "This kernel exposes no writable calibration attributes."
+        inf "The measurement in 'report' is still the useful output: use it to"
+        inf "judge real runtime, and rely on voltage rather than percentage."
+    }
+}
+
+case "${1-status}" in
+    status)  show_status ;;
+    run)     do_run ;;
+    report)  do_report ;;
+    apply)   do_apply ;;
+    abort)   need_root abort; rm -f "$CSV" "$META"; ok "cleared saved calibration data" ;;
+    *) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

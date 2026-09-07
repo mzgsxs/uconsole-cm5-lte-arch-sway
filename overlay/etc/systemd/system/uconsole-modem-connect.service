@@ -1,0 +1,18 @@
+[Unit]
+Description=Connect the uConsole LTE bearer (hot standby, no default route)
+After=ModemManager.service uconsole-modem-power.service
+Requires=uconsole-modem-power.service
+Wants=ModemManager.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/uconsole-modem-connect
+# Registration on a roaming network can be slow; retry rather than give up.
+Restart=on-failure
+RestartSec=30
+StartLimitBurst=5
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target

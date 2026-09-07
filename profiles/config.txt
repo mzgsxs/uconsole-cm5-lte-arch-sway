@@ -1,0 +1,47 @@
+# Boot configuration for ClockworkPi uConsole with Raspberry Pi CM5.
+#
+# Display settings here were reconciled against ak-rex's known-working Debian
+# image after an earlier build of this project produced a dark panel.
+
+arm_64bit=1
+disable_overscan=1
+
+[cm5]
+# Kernel. The 4K-page package deliberately installs into this same boot slot,
+# so the filename says cm5-git even though it is the 4k variant.
+kernel=vmlinuz-linux-uconsole-cm5-git
+initramfs initramfs-linux-uconsole-cm5-git.img followkernel
+
+# uConsole hardware: DSI panel (cw,cwu50), OCP8178 backlight, AXP228 PMIC
+dtoverlay=clockworkpi-uconsole-cm5
+
+# Pi 5 / CM5 KMS display driver
+dtoverlay=vc4-kms-v3d-pi5,cma-384
+
+# PCIe enabled to match the working reference configuration. The mini-PCIe
+# slot carries the 4G module; gen=3 mirrors ak-rex's image.
+dtparam=pciex1
+dtparam=pciex1_gen=3
+
+# USB port current limit increase for Pi 5 / CM5
+usb_max_current_enable=1
+
+# Audio
+dtparam=audio=on
+dtoverlay=audremap-pi5,pins_12_13
+
+[all]
+# Stop the firmware bringing up its own default DSI display so that the
+# clockworkpi overlay owns the panel. Omitting this leaves the screen dark.
+ignore_lcd=1
+max_framebuffers=2
+
+# USB host mode for the uConsole internal/external USB path
+dtoverlay=dwc2,dr_mode=host
+
+# External antenna on the Raspberry Pi CM U.FL connector
+dtparam=ant2
+
+# GPIO 10 senses headphone insertion; GPIO 11 enables the speaker amplifier.
+gpio=10=ip,np
+gpio=11=op,dh

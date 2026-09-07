@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# uconsole-wan -- switch the uConsole's WAN path between Wi-Fi and LTE.
+#
+#   uconsole-wan status     show which path is live, and both candidates
+#   uconsole-wan lte        route everything over LTE   (metric 100, wins over Wi-Fi)
+#   uconsole-wan wifi       drop the LTE default route  (Wi-Fi only)
+#   uconsole-wan auto       LTE as automatic failover   (metric 700, below Wi-Fi)
+#   uconsole-wan test       verify the live path (ping, HTTPS, DNS, public exit IP)
+#
+# The LTE bearer stays connected in every mode; only routing changes. Standby
+# costs ~4 MiB/month and ~0.1 W (measured), so leaving it up is nearly free.
+set -uo pipefail
+
+ENV_FILE=/run/uconsole/lte.env
+WIFI_METRIC_ASSUMED=600
+LTE_METRIC_PREFER=100
+LTE_METRIC_AUTO=700
+
+c_ok=$'\033[32m'; c_no=$'\033[31m'; c_b=$'\033[1m'; c_z=$'\033[0m'
+ok(){ printf "  ${c_ok}OK${c_z}  %s\n" "$*"; }
+no(){ printf "  ${c_no}NO${c_z}  %s\n" "$*"; }
+inf(){ printf '      %s\n' "$*"; }
+say(){ printf "\n${c_b}== %s${c_z}\n" "$*"; }
+need_root(){ [[ $EUID -eq 0 ]] || { echo "uconsole-wan: '$1' needs root -- use sudo" >&2; exit 1; }; }
+
+load_lte() {
+    if [[ -r $ENV_FILE ]]; then . "$ENV_FILE"; return 0; fi
+    # Fall back to querying ModemManager if the boot service never ran.
+    local idx b
+    idx=$(mmcli -L 2>/dev/null | grep -oE '/Modem/[0-9]+' | grep -oE '[0-9]+$' | head -1)
+    [[ -z $idx ]] && return 1
+    b=$(mmcli -m "$idx" -J 2>/dev/null | python3 -c 'import sys,json;print(json.load(sys.stdin)["modem"]["generic"]["bearers"][0].rsplit("/",1)[-1])' 2>/dev/null) || return 1
+    read -r IP PREFIX GATEWAY MTU DNS1 DNS2 <<<"$(mmcli -b "$b" -J 2>/dev/null | python3 -c '
+import sys,json
+c=json.load(sys.stdin)["bearer"]["ipv4-config"]
+d=((c.get("dns") or [])+["",""])[:2]
+print(c.get("address",""),c.get("prefix",30),c.get("gateway",""),c.get("mtu",1280),d[0],d[1])')" || return 1
+    IFACE=$(ls /sys/class/net | grep -E '^(wwu|wwan)' | head -1)
+    [[ -n ${IP:-} && -n ${IFACE:-} ]]
+}
+
+lte_route_add() {
+    local metric=$1
+    load_lte || { no "no LTE bearer -- is the modem connected? (systemctl status uconsole-modem-connect)"; exit 2; }
+    ip link set dev "$IFACE" mtu "${MTU:-1280}" 2>/dev/null
+    ip link set "$IFACE" up 2>/dev/null
+    ip addr replace "$IP/${PREFIX:-30}" dev "$IFACE" 2>/dev/null
+    [[ -n ${GATEWAY:-} && $GATEWAY != "--" ]] && ip route replace "$GATEWAY/32" dev "$IFACE" 2>/dev/null
+    ip route replace default via "$GATEWAY" dev "$IFACE" metric "$metric"
+}
+
+lte_dns_on() {
+    command -v resolvectl >/dev/null || return 0
+    resolvectl dns "$IFACE" ${DNS1:-} ${DNS2:-} 2>/dev/null
+    resolvectl default-route "$IFACE" yes 2>/dev/null
+    resolvectl domain "$IFACE" '~.' 2>/dev/null      # authoritative for all lookups
+}
+lte_dns_off() {
+    local i="${1-}"; [[ -z $i ]] && i=$(ls /sys/class/net | grep -E '^(wwu|wwan)' | head -1)
+    [[ -z $i ]] && return 0
+    command -v resolvectl >/dev/null || return 0
+    resolvectl domain "$i" '' 2>/dev/null            # clears '~.'; without this DNS keeps leaving via LTE
+    resolvectl default-route "$i" no 2>/dev/null
+}
+
+show_status() {
+    say "WAN status"
+    local live
+    live=$(ip route get 1.1.1.1 2>/dev/null | head -1)
+    if echo "$live" | grep -qE 'wwu|wwan'; then printf "  live path: ${c_b}LTE${c_z}\n"
+    elif echo "$live" | grep -q 'wld\|wlan'; then printf "  live path: ${c_b}Wi-Fi${c_z}\n"
+    elif [[ -z $live ]]; then printf "  live path: ${c_no}NONE (no route)${c_z}\n"
+    else printf "  live path: %s\n" "$live"; fi
+    inf "$live"
+    echo
+    inf "default routes (lowest metric wins):"
+    ip route show default | sed 's/^/        /'
+    echo
+    local w m
+    w=$(nmcli -t -f DEVICE,STATE,CONNECTION device 2>/dev/null | awk -F: '/^wl/{print $2" ("$3")"; exit}')
+    inf "wifi  : ${w:-unavailable}"
+    if load_lte; then
+        m=$(mmcli -m 0 2>/dev/null | grep -iE 'signal quality' | head -1 | grep -oE '[0-9]+%')
+        inf "lte   : bearer $IP/${PREFIX} gw ${GATEWAY} mtu ${MTU} signal ${m:-?}"
+    else
+        inf "lte   : not connected"
+    fi
+    command -v resolvectl >/dev/null && { echo; inf "dns default-route flags:"; resolvectl default-route 2>/dev/null | sed 's/^/        /'; }
+}
+
+case "${1-status}" in
+lte)
+    need_root lte
+    lte_route_add "$LTE_METRIC_PREFER"
+    lte_dns_on
+    ok "LTE is now the default route (metric $LTE_METRIC_PREFER)"
+    inf "Wi-Fi remains configured at metric $WIFI_METRIC_ASSUMED but is unused."
+    inf "roaming data is now being consumed."
+    ;;
+wifi)
+    need_root wifi
+    IFACE=$(ls /sys/class/net | grep -E '^(wwu|wwan)' | head -1)
+    [[ -n $IFACE ]] && ip route del default dev "$IFACE" 2>/dev/null
+    lte_dns_off "$IFACE"
+    ok "LTE default route removed; Wi-Fi carries traffic"
+    inf "bearer left connected for instant switch-back (~4 MiB/month)"
+    ;;
+auto)
+    need_root auto
+    lte_route_add "$LTE_METRIC_AUTO"
+    lte_dns_off "$IFACE"
+    ok "LTE armed as failover (metric $LTE_METRIC_AUTO, below Wi-Fi)"
+    inf "kernel switches to LTE only if the Wi-Fi route disappears."
+    inf "note: a Wi-Fi that stays associated with a dead uplink will NOT fail over."
+    ;;
+test)
+    say "Testing the live path"
+    ip route show default | sed 's/^/      /'
+    inf "path: $(ip route get 1.1.1.1 2>/dev/null | head -1)"
+    ping -c2 -W5 1.1.1.1 >/dev/null 2>&1 && ok "ICMP" || no "ICMP failed"
+    C=$(curl -s --max-time 20 -o /dev/null -w '%{http_code}' https://archlinux.org 2>/dev/null)
+    [[ $C != 000 && -n $C ]] && ok "HTTPS ($C)" || no "HTTPS failed"
+    getent hosts github.com >/dev/null 2>&1 && ok "DNS" || no "DNS failed"
+    R=$(ping -c3 -W5 1.1.1.1 2>/dev/null | tail -1 | cut -d= -f2)
+    inf "rtt: ${R:-?}   (Wi-Fi is typically ~10ms; roamed LTE can be 200ms+)"
+    E=$(curl -s --max-time 20 https://api.ipify.org 2>/dev/null)
+    [[ -n $E ]] && ok "public exit IP: $E" || no "could not fetch exit IP"
+    ;;
+status) show_status ;;
+*) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

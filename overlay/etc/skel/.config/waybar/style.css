@@ -1,0 +1,54 @@
+* {
+    font-family: monospace;
+    font-size: 12px;
+    border: none;
+    border-radius: 0;
+    min-height: 0;
+}
+
+window#waybar {
+    background: #000000;
+    color: #00ff00;
+}
+
+#workspaces button {
+    padding: 0 6px;
+    background: transparent;
+    color: #007700;
+}
+
+#workspaces button.focused,
+#workspaces button.visible {
+    background: #002200;
+    color: #00ff00;
+}
+
+#workspaces button.urgent {
+    background: #000000;
+    color: #ff5555;
+}
+
+#mode,
+#clock,
+#battery,
+#network,
+#backlight,
+#pulseaudio {
+    padding: 0 8px;
+    background: #000000;
+    color: #00ff00;
+}
+
+#battery.warning { color: #ffff00; }
+#battery.critical { color: #ff5555; }
+#network.disconnected { color: #ff5555; }
+
+#custom-modem {
+    padding: 0 8px;
+    background: #000000;
+    color: #00ff00;
+}
+#custom-modem.off        { color: #005500; }
+#custom-modem.searching  { color: #ffff00; }
+#custom-modem.registered { color: #00aa00; }
+#custom-modem.connected  { color: #00ff00; }

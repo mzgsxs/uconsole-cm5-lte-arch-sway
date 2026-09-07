@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# uconsole-modem-connect
+#
+# Brings the SIM7600 bearer up and configures the WWAN interface, but installs
+# NO default route. The link is left "hot standby": addressed, correct MTU,
+# ready to carry traffic the instant `uconsole-wan lte` adds a default route.
+#
+# Deliberately does not touch routing, so booting with the modem connected can
+# never hijack the Wi-Fi path or start billing roaming data on its own.
+set -uo pipefail
+
+APN="${UCONSOLE_APN:-globaldata}"
+ALLOW_ROAMING="${UCONSOLE_ALLOW_ROAMING:-yes}"
+log() { printf '[uconsole-modem-connect] %s\n' "$*"; }
+py() { python3 -c "$@"; }
+
+mm() { mmcli "$@" -J 2>/dev/null; }
+
+IDX=""
+for _ in $(seq 1 30); do
+    IDX=$(mmcli -L 2>/dev/null | grep -oE '/Modem/[0-9]+' | grep -oE '[0-9]+$' | head -1)
+    [[ -n $IDX ]] && break
+    sleep 2
+done
+[[ -n $IDX ]] || { log "ERROR: ModemManager never saw a modem"; exit 1; }
+log "modem index $IDX"
+
+# Wait for network registration before attempting a bearer.
+ST=""
+for _ in $(seq 1 45); do
+    ST=$(mm -m "$IDX" | py 'import sys,json;print(json.load(sys.stdin)["modem"]["generic"]["state"])' 2>/dev/null)
+    [[ $ST =~ registered|connected ]] && break
+    sleep 2
+done
+[[ $ST =~ registered|connected ]] || { log "ERROR: not registered (state=$ST)"; exit 2; }
+
+if [[ $ST != connected ]]; then
+    log "connecting: apn=$APN allow-roaming=$ALLOW_ROAMING"
+    mmcli -m "$IDX" --simple-connect="apn=${APN},allow-roaming=${ALLOW_ROAMING}" >/dev/null 2>&1 \
+        || { log "ERROR: bearer failed to connect"; exit 3; }
+fi
+
+B=$(mm -m "$IDX" | py 'import sys,json;print(json.load(sys.stdin)["modem"]["generic"]["bearers"][0].rsplit("/",1)[-1])')
+read -r IP PFX GW MTU D1 D2 <<<"$(mm -b "$B" | py '
+import sys,json
+c=json.load(sys.stdin)["bearer"]["ipv4-config"]
+d=((c.get("dns") or [])+["",""])[:2]
+print(c.get("address",""), c.get("prefix",30), c.get("gateway",""), c.get("mtu",1280), d[0], d[1])')"
+[[ -n $IP ]] || { log "ERROR: bearer returned no IPv4"; exit 4; }
+
+IFACE=$(ls /sys/class/net | grep -E '^(wwu|wwan)' | head -1)
+[[ -n $IFACE ]] || { log "ERROR: no WWAN netdev"; exit 5; }
+
+# SIM7600 in QMI mode passes raw IP frames only; without this the link is dead.
+echo Y > "/sys/class/net/$IFACE/qmi/raw_ip" 2>/dev/null
+
+ip link set "$IFACE" down 2>/dev/null
+# Carrier-advertised MTU is authoritative. This APN advertises 1280; at the
+# default 1500 the TCP handshake succeeds but TLS stalls, because large frames
+# are silently dropped. ICMP path-MTU probing does NOT reveal this.
+ip link set dev "$IFACE" mtu "${MTU:-1280}"
+ip link set "$IFACE" up
+ip addr replace "$IP/$PFX" dev "$IFACE"
+[[ -n $GW && $GW != "--" ]] && ip route replace "$GW/32" dev "$IFACE"
+
+# Per-link DNS only. No '~.' routing domain and no default-route flag, so these
+# servers are not used while another link provides the default route.
+if command -v resolvectl >/dev/null; then
+    resolvectl dns "$IFACE" $D1 $D2 2>/dev/null || true
+    resolvectl default-route "$IFACE" no 2>/dev/null || true
+fi
+
+# Persist for `uconsole-wan`, so switching needs no mmcli round-trip.
+mkdir -p /run/uconsole
+cat > /run/uconsole/lte.env <<EOV
+IFACE=$IFACE
+IP=$IP
+PREFIX=$PFX
+GATEWAY=$GW
+MTU=${MTU:-1280}
+DNS1=$D1
+DNS2=$D2
+APN=$APN
+EOV
+
+log "standby ready: $IFACE $IP/$PFX gw=$GW mtu=${MTU:-1280} (no default route)"

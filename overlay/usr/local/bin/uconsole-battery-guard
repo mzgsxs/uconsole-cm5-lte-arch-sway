@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Shut down cleanly before the PMU cuts power.
+#
+# The AXP223 fuel gauge on this board is uncalibrated ('calibrate' reads 0) and
+# reports percentages that are badly wrong -- it showed 71% roughly an hour
+# before an undervoltage cut. Voltage is the only trustworthy signal, so this
+# guard is voltage-based by design. Do NOT rewrite it against 'capacity'.
+set -uo pipefail
+
+B=/sys/class/power_supply/axp20x-battery
+AC=/sys/class/power_supply/axp22x-ac/online
+WARN_UV=3500000     # 3.50 V -- warn
+CRIT_UV=3400000     # 3.40 V -- shut down
+STATE=/run/uconsole/battery-guard.state
+
+[[ -r $B/voltage_now ]] || exit 0
+[[ $(cat $AC 2>/dev/null || echo 0) == 1 ]] && exit 0   # on AC, nothing to do
+
+V=$(cat $B/voltage_now)
+mkdir -p /run/uconsole
+
+if (( V <= CRIT_UV )); then
+    logger -t uconsole-battery-guard "CRITICAL: ${V}uV <= ${CRIT_UV}uV, shutting down cleanly"
+    wall "Battery critically low ($(awk "BEGIN{printf \"%.2f\", $V/1000000}")V). Shutting down in 30s to avoid an unclean power cut."
+    sleep 30
+    # Re-check: the user may have plugged in during the grace period.
+    [[ $(cat $AC 2>/dev/null || echo 0) == 1 ]] && { logger -t uconsole-battery-guard "AC restored, aborting"; exit 0; }
+    systemctl poweroff
+elif (( V <= WARN_UV )); then
+    if [[ ! -f $STATE ]]; then
+        logger -t uconsole-battery-guard "WARNING: ${V}uV low; LTE TX bursts can trigger an undervoltage cut"
+        wall "Battery low ($(awk "BEGIN{printf \"%.2f\", $V/1000000}")V). Plug in, or disable LTE: sudo uconsole-wan wifi && sudo uconsole-modem-power disable"
+        touch $STATE
+    fi
+else
+    rm -f $STATE 2>/dev/null
+fi

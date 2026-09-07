@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+"""Waybar custom module: uConsole SIM7600 LTE status.
+
+Prints one JSON line for waybar. Never raises and never blocks the bar:
+every mmcli call is timeout-bounded and any failure degrades to "LTE --".
+"""
+import json
+import subprocess
+import sys
+
+TIMEOUT = 4
+
+
+def mmcli(*args):
+    """Run mmcli with JSON output; return parsed dict or None."""
+    try:
+        out = subprocess.run(
+            ("mmcli",) + args + ("-J",),
+            capture_output=True, text=True, timeout=TIMEOUT,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+    if out.returncode != 0:
+        return None
+    try:
+        return json.loads(out.stdout)
+    except ValueError:
+        return None
+
+
+def emit(text, cls, tooltip, percentage=None):
+    o = {"text": text, "class": cls, "tooltip": tooltip}
+    if percentage is not None:
+        o["percentage"] = percentage
+    print(json.dumps(o))
+    sys.exit(0)
+
+
+def dig(d, path, default=""):
+    for k in path.split("."):
+        if not isinstance(d, dict):
+            return default
+        d = d.get(k)
+        if d is None:
+            return default
+    return d
+
+
+modems = dig(mmcli("-L") or {}, "modem-list", [])
+if not modems:
+    # ModemManager down, or the module is unpowered (GPIO 24 low).
+    emit("LTE --", "off", "No modem\nModemManager down or module unpowered")
+
+m = mmcli("-m", modems[0].rsplit("/", 1)[-1])
+if not m:
+    emit("LTE --", "off", "Modem present but not readable")
+
+state = dig(m, "modem.generic.state") or "unknown"
+sig = dig(m, "modem.generic.signal-quality.value")
+tech = dig(m, "modem.generic.access-technologies", [])
+tech = (tech[0].upper() if isinstance(tech, list) and tech else "LTE") or "LTE"
+oper = dig(m, "modem.3gpp.operator-name") or "--"
+reg = dig(m, "modem.3gpp.registration-state") or ""
+roaming = "roaming" in reg.lower()
+
+try:
+    pct = int(sig)
+except (TypeError, ValueError):
+    pct = None
+
+tip = [f"{dig(m, 'modem.generic.model') or 'modem'}",
+       f"state: {state}",
+       f"operator: {oper}{'  (roaming)' if roaming else ''}",
+       f"signal: {pct}%" if pct is not None else "signal: --"]
+
+if state in ("failed", "disabled", "locked"):
+    emit(f"{tech} OFF", "off", "\n".join(tip + [f"reason: {state}"]))
+
+if state in ("searching", "enabled", "registered", "connecting", "connected"):
+    if state in ("searching", "enabled"):
+        emit(f"{tech} ~", "searching", "\n".join(tip + ["searching for network"]), pct)
+
+    label = f"{tech} {pct}%" if pct is not None else tech
+    if roaming:
+        label += " R"
+
+    if state == "connected":
+        bearers = dig(m, "modem.generic.bearers", [])
+        if bearers:
+            b = mmcli("-b", bearers[0].rsplit("/", 1)[-1])
+            ip = dig(b or {}, "bearer.ipv4-config.address") or "--"
+            apn = dig(b or {}, "bearer.properties.apn") or "--"
+            mtu = dig(b or {}, "bearer.ipv4-config.mtu") or "--"
+            tip += [f"apn: {apn}", f"ip: {ip}", f"mtu: {mtu}"]
+        emit(label, "connected", "\n".join(tip), pct)
+
+    emit(label, "registered", "\n".join(tip + ["registered, not connected"]), pct)
+
+emit(f"{tech} --", "off", "\n".join(tip))

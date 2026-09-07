@@ -1,0 +1,31 @@
+{
+  "layer": "top",
+  "position": "top",
+  "height": 22,
+  "modules-left": ["sway/workspaces", "sway/mode"],
+  "modules-center": ["clock"],
+  "modules-right": ["pulseaudio", "backlight", "network", "custom/modem", "battery"],
+  "sway/workspaces": { "disable-scroll": true, "all-outputs": true },
+  "clock": { "format": "{:%a %d %b  %H:%M}" },
+  "battery": {
+    "format": "BAT {capacity}%",
+    "format-charging": "CHR {capacity}%",
+    "states": { "warning": 25, "critical": 10 }
+  },
+  "backlight": { "format": "LCD {percent}%" },
+  "network": {
+    "format-wifi": "WIFI {signalStrength}%",
+    "format-ethernet": "ETH",
+    "format-disconnected": "OFFLINE"
+  },
+  "pulseaudio": {
+    "format": "VOL {volume}%",
+    "format-muted": "MUTE"
+  },
+  "custom/modem": {
+    "exec": "/usr/local/bin/uconsole-waybar-modem",
+    "return-type": "json",
+    "interval": 10,
+    "tooltip": true
+  }
+}

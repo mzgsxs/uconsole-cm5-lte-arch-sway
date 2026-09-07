@@ -1,0 +1,13 @@
+[Unit]
+Description=tmux server (tmux-continuum restores the previous session)
+Documentation=man:tmux(1)
+
+[Service]
+Type=forking
+# Starting the server fires tmux-continuum's restore hook, which is what brings
+# the previous sessions back after a reboot.
+ExecStart=/usr/bin/tmux new-session -d -s main
+ExecStop=/usr/bin/tmux kill-server
+
+[Install]
+WantedBy=default.target

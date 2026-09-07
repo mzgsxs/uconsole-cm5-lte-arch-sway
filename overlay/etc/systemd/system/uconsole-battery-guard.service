@@ -1,0 +1,6 @@
+[Unit]
+Description=uConsole low-voltage shutdown guard
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/uconsole-battery-guard

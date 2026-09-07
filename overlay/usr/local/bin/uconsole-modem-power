@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# uconsole-modem-power {enable|disable|status}
+#
+# Powers the uConsole 4G module (SIMCOM SIM7600G-H) on Raspberry Pi CM5.
+#
+# Replaces the GPIO handling in the vendor uconsole-4g-cm5.sh, which is broken
+# on CM5 + libgpiod v2 for two independent reasons:
+#   1. it hardcodes GPIO_CHIP="gpiochip0", which does not exist on CM5 -- the
+#      header pins live on the RP1 controller, which enumerates over PCIe and
+#      appears as gpiochip15 (label pinctrl-rp1).
+#   2. it uses libgpiod v1 CLI syntax ("gpioset gpiochip0 24=1"); v2 requires
+#      the chip to be passed with -c, and parses a bare first argument as a
+#      line=value pair -> "gpioset: invalid line value: 'gpiochip0'".
+#
+# It also holds the power line with 'gpioset -z' (daemonize). In libgpiod v2 a
+# line's output state is only guaranteed while the requesting process lives, so
+# a plain gpioset would set the pin, exit, release it, and drop modem power.
+set -euo pipefail
+
+PWR_LINE=24          # POWER_MCU
+PWRKEY_LINE=15       # RESET_MCU / PWRKEY
+MODEM_VID=1e0e       # SimTech
+CONSUMER=uconsole-modem
+
+log() { printf '[uconsole-modem-power] %s\n' "$*"; }
+
+find_chip() {
+    # Prefer the SoC/RP1 pin controller by label; fall back sanely.
+    local c
+    c=$(gpiodetect 2>/dev/null | awk '/pinctrl-rp1/    {print $1; exit}')
+    [[ -z $c ]] && c=$(gpiodetect 2>/dev/null | awk '/pinctrl-bcm/ {print $1; exit}')
+    # Otherwise take the chip with the most lines (the header controller).
+    [[ -z $c ]] && c=$(gpiodetect 2>/dev/null \
+        | sed 's/[][()]//g' | awk '{print $1, $(NF-1)}' | sort -k2 -n | tail -1 | awk '{print $1}')
+    echo "$c"
+}
+
+modem_present() {
+    grep -qs "$MODEM_VID" /sys/bus/usb/devices/*/idVendor 2>/dev/null
+}
+
+holder_pid() { pgrep -f "gpioset.*${CONSUMER}" || true; }
+
+case "${1-status}" in
+enable)
+    if modem_present; then log "modem already enumerated"; exit 0; fi
+    CHIP=$(find_chip)
+    [[ -n $CHIP ]] || { log "ERROR: no usable gpiochip found"; exit 1; }
+    log "using $CHIP, line $PWR_LINE"
+    if [[ -z $(holder_pid) ]]; then
+        # -z detaches and holds the line for the life of the daemon.
+        gpioset -z -C "$CONSUMER" -c "$CHIP" "${PWR_LINE}=1" \
+            || { log "ERROR: gpioset failed"; exit 1; }
+    fi
+    log "power asserted; waiting for USB enumeration"
+    for _ in $(seq 1 30); do modem_present && break; sleep 2; done
+    if modem_present; then
+        log "SIM7600 enumerated"
+    else
+        # Some units need an explicit PWRKEY pulse in addition to the rail.
+        log "no enumeration yet; pulsing PWRKEY (line $PWRKEY_LINE)"
+        # One process for the whole pulse: high, hold 1s, low, exit. Splitting
+        # this into two gpioset calls would release the line in between and let
+        # the pin float.
+        gpioset -c "$CHIP" -t 1000,0 "${PWRKEY_LINE}=1" 2>/dev/null || true
+        for _ in $(seq 1 20); do modem_present && break; sleep 2; done
+        modem_present || { log "ERROR: modem never appeared on USB"; exit 1; }
+        log "SIM7600 enumerated after PWRKEY pulse"
+    fi
+    ;;
+disable)
+    p=$(holder_pid); [[ -n $p ]] && { kill $p; log "released power line (pid $p)"; }
+    ;;
+status)
+    modem_present && echo "modem: enumerated" || echo "modem: absent"
+    p=$(holder_pid); [[ -n $p ]] && echo "power hold: pid $p" || echo "power hold: none"
+    echo "gpiochip: $(find_chip)"
+    ;;
+*)
+    echo "usage: $0 {enable|disable|status}" >&2; exit 2 ;;
+esac

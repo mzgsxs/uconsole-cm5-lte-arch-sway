@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Grow the root partition and filesystem to fill the storage device.
+#
+# Runs once on first boot. Rewritten after report S3.1: the previous version
+# used `parted -s resizepart`, which answers *No* to parted's interactive
+# "partition is in use" prompt and therefore did nothing -- while the script
+# swallowed the failure, ran resize2fs (which found nothing to do) and stamped
+# itself complete, stranding 52 GB of a 64 GB card permanently.
+#
+# Three changes: use growpart, which handles an in-use partition; verify the
+# result instead of trusting an exit status; and only stamp on real success.
+set -Eeuo pipefail
+
+STAMP=/var/lib/uconsole-resize-done
+
+if [[ -e $STAMP ]]; then
+    echo "root already expanded; nothing to do"
+    exit 0
+fi
+
+root_src="$(findmnt -no SOURCE /)"
+[[ $root_src == /dev/* ]] || root_src="$(blkid -l -o device -t "$root_src")"
+part_num="$(basename "$root_src" | grep -oE '[0-9]+$')"
+disk="/dev/$(lsblk -no PKNAME "$root_src")"
+echo "root=${root_src} disk=${disk} partition=${part_num}"
+
+before_bytes="$(blockdev --getsize64 "$root_src")"
+disk_bytes="$(blockdev --getsize64 "$disk")"
+echo "partition is ${before_bytes} bytes on a ${disk_bytes} byte device"
+
+# Already filling the device (within 64 MiB)? Then there is nothing to do.
+if (( disk_bytes - before_bytes < 67108864 )); then
+    echo "partition already fills the device"
+    install -d "$(dirname "$STAMP")"
+    printf 'already-full\n%s\n' "$(date -Iseconds)" > "$STAMP"
+    exit 0
+fi
+
+if command -v growpart >/dev/null 2>&1; then
+    echo "growing with growpart"
+    growpart "$disk" "$part_num"
+else
+    # parted needs -a opt AND must not be given -s, or it silently declines to
+    # resize a mounted partition. Feed it an explicit Yes instead.
+    echo "growpart unavailable; falling back to parted"
+    printf 'Yes\n' | parted -a opt ---pretend-input-tty "$disk" resizepart "$part_num" 100%
+fi
+
+partx -u "$disk" 2>/dev/null || partprobe "$disk" 2>/dev/null || true
+sleep 1
+
+after_bytes="$(blockdev --getsize64 "$root_src")"
+echo "partition is now ${after_bytes} bytes"
+if (( after_bytes <= before_bytes )); then
+    echo "ERROR: partition did not grow -- not stamping, will retry next boot" >&2
+    exit 1
+fi
+
+resize2fs "$root_src"
+
+# Verify the filesystem actually took the new space before declaring success.
+fs_bytes=$(( $(stat -f -c '%b * %S' / | tr -d '\n' | awk '{print $1*$3}') ))
+echo "filesystem now reports ${fs_bytes} bytes"
+
+install -d "$(dirname "$STAMP")"
+printf 'expanded\nfrom=%s\nto=%s\ndate=%s\n' "$before_bytes" "$after_bytes" "$(date -Iseconds)" > "$STAMP"
+echo "root filesystem expanded successfully"

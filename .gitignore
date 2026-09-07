@@ -1,0 +1,27 @@
+# ---- Build outputs and large binaries -------------------------------------
+# Disk images (8 GB each), kernel packages, and everything derived from a build.
+out/
+stock/
+repo/
+*.img
+*.img.xz
+*.img.bz2
+*.pkg.tar.*
+*.sha256
+
+# ---- Downloaded inputs -----------------------------------------------------
+# The Arch Linux ARM rootfs tarball (~800 MB) and any other fetched archive.
+cache/
+
+# ---- Third-party sources fetched at build time -----------------------------
+# Upstream image-builder scripts; build-image-full.sh clones this itself.
+uconsole-arch/
+# TPM and tmux plugins; run build/fetch-tmux-plugins.sh to populate.
+overlay/etc/skel/.tmux/plugins/
+
+# ---- Build logs ------------------------------------------------------------
+build/*.log
+
+# ---- Local / OS noise ------------------------------------------------------
+.DS_Store
+*.swp
