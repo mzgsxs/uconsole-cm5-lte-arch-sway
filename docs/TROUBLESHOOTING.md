@@ -224,10 +224,19 @@ unclean shutdown.
 
 Several checks are written in a non-obvious way because the obvious version was wrong.
 
-**`grep -q` under `set -o pipefail` produces false failures.** `grep -q` exits as soon as
-it matches, sending SIGPIPE upstream; `pipefail` then reports the whole pipeline as failed.
-This produced a false "kernel lacks Landlock" result on a kernel that had it. Checks that
-scan large output now decompress to a file first and use `grep -c … || true`.
+**`grep -q` under `set -o pipefail` produces false failures, and the bug is
+size-dependent.** `grep -q` exits as soon as it matches, sending SIGPIPE upstream;
+`pipefail` then reports the whole pipeline as failed. This produced a false "kernel lacks
+Landlock" result on a kernel that had it, and later two false "waybar lacks this module"
+results on a binary that had them.
+
+The size dependence is why it keeps recurring: on a small input the upstream process
+finishes before `grep -q` exits, so the pipeline succeeds and the mistake stays invisible.
+It only shows up once the input is large enough — a multi-megabyte binary — that `grep`
+exits first. It has caught this suite out three times.
+
+Checks that scan large output now decompress to a file first and use `grep -c … || true`,
+and binary string searches go through the `has_string` helper, which drains its input.
 
 **Greps that match comments are false results in both directions.** A check for "no
 hardcoded `gpiochip0`" matched the *comment* explaining the bug being fixed. A check

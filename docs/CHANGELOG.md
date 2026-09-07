@@ -36,7 +36,10 @@ the reasoning rather than the final file contents.
 - Panel scale **1.25** rather than 1.2, so 1280×720 divides evenly into 1024×576 — a
   fractional scale leaves a partial pixel column at the right edge.
 - `WLR_NO_HARDWARE_CURSORS=1` to force software cursors.
-- waybar in black and green, with an LTE status module.
+- waybar in black and green, with an LTE status module, CPU temperature and RAM usage.
+  The CM5 is a BCM2712, but its device tree declares the AVS block as
+  `brcm,bcm2711-thermal`, so `bcm2711_thermal` binds and `cpu-thermal` is thermal zone 0 --
+  confirmed by decompiling the CM5 DTB rather than inferring from the SoC name.
 - foot with a black background and a full 16-colour palette. The section is `[colors-dark]`
   — foot 1.28 rejects the older `[colors]` outright.
 - vim with soft tabs and syntax colour; Makefiles keep hard tabs.
@@ -105,7 +108,7 @@ the reasoning rather than the final file contents.
   because macOS writes Spotlight metadata to the card between `dd` and verification,
   making it fail on every good write.
 - `verify-card.sh` verifies correctly instead — raw compare on ext4, file-level on FAT.
-- `verify-image.sh` grew from 64 to 217 checks, including config parsing and a post-build
+- `verify-image.sh` grew from 64 to 228 checks, including config parsing and a post-build
   proof that the image can install packages.
 
 ### Fixed along the way
