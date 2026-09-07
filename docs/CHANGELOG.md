@@ -138,6 +138,10 @@ the reasoning rather than the final file contents.
 
 - tmux with TPM, resurrect and continuum pre-installed, and a user service that starts the
   server at login so sessions return after a reboot.
+- tmux keeps its **own** appearance: a green status bar with black text at the bottom. An
+  earlier version restyled it to black-and-green at the top to match the desktop, which was
+  a mistake -- waybar already owns the top of a 576px-tall screen, so that stacked two bars
+  together and wasted vertical space.
 
 ### Tooling
 
@@ -145,7 +149,7 @@ the reasoning rather than the final file contents.
   because macOS writes Spotlight metadata to the card between `dd` and verification,
   making it fail on every good write.
 - `verify-card.sh` verifies correctly instead — raw compare on ext4, file-level on FAT.
-- `verify-image.sh` grew from 64 to 258 checks, including config parsing and a post-build
+- `verify-image.sh` grew from 64 to 261 checks, including config parsing and a post-build
   proof that the image can install packages.
 
 ### Fixed along the way

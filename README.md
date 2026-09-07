@@ -5,7 +5,7 @@ A build system that produces a bootable **Arch Linux ARM** image with a
 fitted with a **Raspberry Pi Compute Module 5**.
 
 The kernel is compiled from source; the image is assembled and then checked by an
-automated verification suite — currently **258 checks**, all passing.
+automated verification suite — currently **261 checks**, all passing.
 
 Inputs are pinned where upstream allows it: the kernel commit, the upstream builder, and
 the tmux plugins. Arch Linux ARM publishes only a rolling `latest` rootfs tarball, so
@@ -100,7 +100,7 @@ different question from "packages installed during the build" and caught two rea
 that structural checks alone had missed.
 
 ```
-RESULT: 258 passed, 0 failed
+RESULT: 261 passed, 0 failed
 ```
 
 Structural verification is not a boot test. Nothing here has been validated by an

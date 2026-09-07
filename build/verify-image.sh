@@ -343,6 +343,12 @@ check "continuum auto-restore enabled" "grep -q \"@continuum-restore 'on'\" $MNT
 check "continuum save interval set"    "grep -q '@continuum-save-interval' $MNT/etc/skel/.tmux.conf"
 check "resurrect captures pane contents" "grep -q '@resurrect-capture-pane-contents' $MNT/etc/skel/.tmux.conf"
 check "tpm run line present"           "grep -q \"run '~/.tmux/plugins/tpm/tpm'\" $MNT/etc/skel/.tmux.conf"
+# tmux keeps its own look: a green status bar with black text at the BOTTOM.
+# waybar already owns the top of a 576px-tall screen, so a second bar there was
+# a worse layout than leaving tmux alone.
+check "tmux does not override status position" "! grep -q 'status-position' $MNT/etc/skel/.tmux.conf"
+check "tmux does not override status colours"  "! grep -q 'status-style' $MNT/etc/skel/.tmux.conf"
+check "tmux does not restyle windows or panes" "! grep -qE 'window-status-style|pane-border-style|message-style' $MNT/etc/skel/.tmux.conf"
 check "tmux user service present"      "[[ -s $MNT/etc/systemd/user/tmux.service ]]"
 check "tmux user service enabled globally" "[[ -L $MNT/etc/systemd/user/default.target.wants/tmux.service ]]"
 check "ta alias present"               "grep -q \"alias ta=\" $MNT/etc/skel/.bashrc"

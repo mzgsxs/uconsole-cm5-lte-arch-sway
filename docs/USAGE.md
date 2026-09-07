@@ -59,6 +59,9 @@ TPM, tmux-resurrect and tmux-continuum are pre-installed; no `prefix + I` needed
 ta          # attach to the restored session, or start one
 ```
 
+tmux keeps its stock appearance — green status bar at the bottom — deliberately, so it sits
+opposite waybar rather than stacking a second bar at the top.
+
 Continuum saves every 15 minutes and restores when the tmux server starts. A `tmux.service`
 user unit starts that server at login, so after a reboot your session is already back —
 `ta` just attaches to it. Pane contents and vim sessions are restored, not just the layout.
