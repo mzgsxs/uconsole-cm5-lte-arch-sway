@@ -87,6 +87,7 @@ PKGS=(
   python              # the waybar modem module is a python3 script
   tmux                # TPM + resurrect + continuum are pre-installed in /etc/skel
   tailscale           # daemon enabled but unauthenticated; no key is baked in
+  evtest              # inspect raw input events (power key, keyboard, trackball)
 )
 EXTRA_ARGS=()
 for p in "${PKGS[@]}"; do EXTRA_ARGS+=(--extra-package "$p"); done

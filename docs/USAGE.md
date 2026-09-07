@@ -23,9 +23,10 @@ Alt is the modifier throughout — the uConsole keyboard has no Super key.
 | `Alt`+`d` | Launcher (fuzzel) |
 | `Alt`+`q` | Close window |
 | `Alt`+`f` | Toggle fullscreen |
-| `Alt`+`1`…`5` | Switch workspace |
+| `Alt`+`1`…`9`, `Alt`+`0` | Switch to workspace 1–10 |
 | `Alt`+`h/j/k/l` or arrows | Move focus |
-| `Alt`+`Shift`+ same | Move window |
+| `Alt`+`Shift`+ number | Move window to that workspace |
+| `Alt`+`Shift`+`h/j/k/l` | Move window within the layout |
 | `Alt`+`Shift`+`c` | Reload sway config |
 | `Print` | Region screenshot |
 | Power button (short) | Blank the backlight; press again to restore |
