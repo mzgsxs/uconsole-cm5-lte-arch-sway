@@ -127,13 +127,14 @@ bindsym --locked XF86AudioRaiseVolume exec wpctl set-volume @DEFAULT_AUDIO_SINK@
 bindsym --locked XF86AudioLowerVolume exec wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-
 bindsym --locked XF86AudioMute exec wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle
 
-# Power key. Tap to blank and lock; hold about 3 seconds and let go for a clean
-# poweroff. logind is set to ignore the key so the compositor sees it at all.
+# Power key. Tap to blank and lock; hold ~2s for a clean poweroff, which fires
+# WHILE the key is still down so you feel it start. logind is set to ignore the
+# key so the compositor sees it at all.
 #
 # THREE poweroff paths exist, shortest first, and the shorter ones do not remove
 # the longer ones:
 #
-#   ~3s  here, measured by sway on key RELEASE          -> clean poweroff
+#   ~2s  here, a sway timer that re-checks the key state -> clean poweroff
 #    5s  logind's HandlePowerKeyLongPress                -> clean poweroff
 #   10s  the AXP223 cutting power in hardware            -> UNCLEAN, last resort
 #
@@ -143,10 +144,12 @@ bindsym --locked XF86AudioMute exec wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle
 # from the press and anything shorter would cut power mid-unmount. Measuring the
 # hold here is the only way to get 3s.
 #
-# The press binding records a timestamp and schedules NOTHING; every decision is
-# made on release. A missed release therefore does nothing at all, and logind's
-# 5s applies exactly as before -- rather than a pending timer powering the
-# machine off after an ordinary tap.
+# The press binding arms a timer. That is only safe because the timer does not
+# trust the release event: when it expires it asks the KERNEL whether the key is
+# still physically held (evtest --query), so a tap cannot power the machine off
+# even if the release binding is missed entirely. Every failure -- no device,
+# evtest missing, query fails, key already up -- lands on doing nothing, leaving
+# logind's 5s exactly as it was.
 #
 # --no-repeat: without it sway fires the binding at the 30/s repeat rate while
 # the key is held, which strobed the backlight through a long press.

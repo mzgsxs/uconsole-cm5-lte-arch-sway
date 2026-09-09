@@ -1,66 +1,106 @@
 #!/usr/bin/env bash
 # uconsole-powerkey-hold {press|release}
 #
-# Give the power key a SHORTER long-press than logind can offer.
+# Give the power key a SHORTER long-press than logind can offer, and fire it
+# WHILE THE KEY IS STILL DOWN so you feel it happen.
 #
 # logind's long-press is a hardcoded 5 seconds -- LONG_PRESS_DURATION in its
 # source, with no setting for it in any systemd version (systemd#28100 is the
-# open request). The AXP223's own forced-off cannot help either: it only offers
+# open request). The AXP223's own forced-off cannot help either: it offers only
 # 4/6/8/10s and is deliberately parked at 10s so it always loses the race to a
-# clean shutdown. So a 3s clean poweroff has to come from whoever else already
-# sees the key, and sway does.
+# clean shutdown. So a sub-5s clean poweroff has to come from whoever else
+# already sees the key, and sway does.
 #
-# WHY THE DECISION HAPPENS ON RELEASE, NOT ON A TIMER
+# WHY IT FIRES ON A TIMER, AND WHY THAT IS SAFE HERE
 #
-# The obvious build is: on press, start a 3s timer; on release, cancel it. That
-# has a failure mode this machine cannot afford -- if the release binding is ever
-# missed, the timer fires and the machine powers off after an ordinary short
-# press, with no way to intervene.
+# An earlier version decided on RELEASE instead: no timer, so nothing could ever
+# fire unexpectedly. Safe, but unusable -- you cannot feel the interval elapse
+# when nothing happens until you let go, so you are guessing at the duration
+# every time.
 #
-# Measuring at release inverts the risk. Nothing is ever scheduled, so nothing
-# can fire unexpectedly: if the release never arrives, this does nothing at all
-# and logind's 5s still applies underneath. The worst case is that you fall back
-# to today's behaviour, which is exactly what a fallback should be.
+# The danger of a timer is that it is armed at press and cancelled at release: if
+# a release event is ever missed, it fires after an ordinary tap and the machine
+# powers off in your hands.
 #
-# So: hold ~3s and let go -> clean poweroff. Keep holding past 5s and logind gets
-# there first, which is the same outcome by a different route. A quick tap still
-# blanks the screen.
+# That is closed by not trusting the release event at all. When the timer expires
+# it asks the KERNEL whether the key is still physically down, via evtest
+# --query, which reports live state rather than replaying events. A tap cannot
+# power the machine off, because by the time the timer expires the hardware says
+# the key is up -- regardless of whether the release binding ran, was dropped,
+# or never existed.
+#
+# Every failure mode therefore lands on "do nothing":
+#   evtest missing, device unreadable, query fails, key already up,
+#   press stamp gone  ->  no poweroff, and logind's 5s still applies underneath.
 set -uo pipefail
 
 CONF=/etc/uconsole/lowpower.conf
-POWERKEY_HOLD_MS=3000
+POWERKEY_HOLD_MS=2000
 # shellcheck source=/dev/null
 [[ -r $CONF ]] && . "$CONF"
 
-STAMP="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/uconsole-powerkey.down"
+RUNTIME="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+STAMP="$RUNTIME/uconsole-powerkey.down"
+TIMER="$RUNTIME/uconsole-powerkey.timer"
 TOGGLE=/usr/local/bin/uconsole-screen-toggle
 
-now_ms() { echo $(( $(date +%s%N) / 1000000 )); }
+# Find the PMIC power key by name rather than hardcoding an event number: the
+# numbering depends on USB enumeration order and is not stable across boots.
+power_key_device() {
+    local dev
+    dev=$(awk '
+        /^N: Name=/ { name = $0 }
+        # Matched on "-pek" alone. The platform device is axp221-pek but the
+        # INPUT device is named axp20x-pek, so a pattern like axp[0-9]*-pek
+        # silently matches nothing -- and this function returning empty makes
+        # press() a no-op, which looks exactly like a safety pass.
+        /^H: Handlers=/ && name ~ /-pek"/ {
+            match($0, /event[0-9]+/); print substr($0, RSTART, RLENGTH); exit
+        }' /proc/bus/input/devices 2>/dev/null)
+    [[ -n $dev ]] && printf '/dev/input/%s' "$dev"
+}
 
 case "${1:-}" in
 press)
-    # Record only. Deliberately schedules nothing.
-    now_ms > "$STAMP" 2>/dev/null || true
+    DEV="$(power_key_device)"
+    # No device means no way to confirm the key is still down later, so do not
+    # arm anything at all -- logind's 5s remains.
+    [[ -n $DEV ]] || exit 0
+
+    date +%s%N > "$STAMP" 2>/dev/null || true
+
+    # setsid so the timer is not tied to the lifetime of the transient shell sway
+    # spawns for this binding.
+    setsid bash -c '
+        sleep "$1"
+        # Cancelled by a release?
+        [[ -e "$2" ]] || exit 0
+        # Still physically held? This is the check that makes a timer safe.
+        evtest --query "$3" EV_KEY KEY_POWER
+        [[ $? -eq 10 ]] || exit 0
+        rm -f "$2"
+        logger -t uconsole-powerkey-hold "held $4ms with the key still down; clean poweroff"
+        # Nothing to flush first: the session snapshot is written continuously and
+        # tmux.service ExecStop forces a tmux-resurrect save on the way down.
+        systemctl poweroff
+    ' _ "$(awk "BEGIN{printf \"%.3f\", ${POWERKEY_HOLD_MS:-2000}/1000}")" \
+        "$STAMP" "$DEV" "${POWERKEY_HOLD_MS:-2000}" >/dev/null 2>&1 &
+    echo $! > "$TIMER" 2>/dev/null || true
     ;;
 
 release)
-    down=$(cat "$STAMP" 2>/dev/null || echo 0)
-    rm -f "$STAMP" 2>/dev/null || true
+    # Cancel first, so a release that beats the timer always wins.
+    [[ -r $TIMER ]] && kill "$(cat "$TIMER")" 2>/dev/null
+    rm -f "$TIMER"
 
-    held=0
-    [[ $down =~ ^[0-9]+$ ]] && (( down > 0 )) && held=$(( $(now_ms) - down ))
+    fired=0
+    [[ -e $STAMP ]] || fired=1     # the timer removed it, so it already acted
+    rm -f "$STAMP"
 
-    # A hold of 0 means we never saw the press -- sway restarted, or the binding
-    # was added mid-session. Treat that as a tap: blanking is recoverable, an
-    # unexpected poweroff is not.
-    if (( held >= ${POWERKEY_HOLD_MS:-3000} )); then
-        logger -t uconsole-powerkey-hold "held ${held}ms >= ${POWERKEY_HOLD_MS:-3000}ms; clean poweroff"
-        # No session state to flush first: the snapshot is written continuously,
-        # and tmux.service's ExecStop forces a tmux-resurrect save on the way down.
-        systemctl poweroff
-    else
-        exec "$TOGGLE"
-    fi
+    # If the timer already started a poweroff there is nothing useful left to do,
+    # and blanking the screen mid-shutdown would only be confusing.
+    (( fired )) && exit 0
+    exec "$TOGGLE"
     ;;
 
 *)
