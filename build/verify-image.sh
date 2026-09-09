@@ -504,10 +504,15 @@ check "wan mode saved for all 3 modes" "[[ \$(grep -c '^    save_mode ' $MNT/usr
 echo "-- session restore (Stage 2) --"
 check "session snapshot present"       "[[ -x $MNT/usr/local/bin/uconsole-session-snapshot ]]"
 check "session restore present"        "[[ -x $MNT/usr/local/bin/uconsole-session-restore ]]"
-# Compiled with the IMAGE's python3, not the host's -- the base container has no
+# Parsed with the IMAGE's python3, not the host's -- the base container has no
 # python at all, so a host-side check reports "command not found" as a failure.
-check "session snapshot compiles"      "chroot $MNT /usr/bin/python3 -m py_compile /usr/local/bin/uconsole-session-snapshot"
-check "session restore compiles"       "chroot $MNT /usr/bin/python3 -m py_compile /usr/local/bin/uconsole-session-restore"
+#
+# ast.parse, NOT py_compile: py_compile WRITES __pycache__ next to the source, so
+# verifying the image would leave build artifacts inside /usr/local/bin on the
+# card it is meant to be checking. Verification must not modify what it verifies.
+check "session snapshot parses"        "chroot $MNT /usr/bin/python3 -c \"import ast;ast.parse(open('/usr/local/bin/uconsole-session-snapshot').read())\""
+check "session restore parses"         "chroot $MNT /usr/bin/python3 -c \"import ast;ast.parse(open('/usr/local/bin/uconsole-session-restore').read())\""
+check "no python bytecode in the image" "[[ -z \$(find $MNT/usr/local/bin $MNT/etc -name '__pycache__' -o -name '*.pyc' 2>/dev/null | head -1) ]]"
 check "sway starts the restore"        "grep -q 'exec /usr/local/bin/uconsole-session-restore' $MNT/etc/skel/.config/sway/config"
 check "sway starts the snapshotter"    "grep -q 'exec /usr/local/bin/uconsole-session-snapshot' $MNT/etc/skel/.config/sway/config"
 # Order matters: the restore takes a lock the snapshotter honours. Reversed, the
