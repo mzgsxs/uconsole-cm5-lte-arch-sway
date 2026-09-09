@@ -54,6 +54,7 @@ DONE = os.path.join(STATE_DIR, "session.restored")
 LOCK = os.path.join(RUNTIME, "uconsole-session.lock")
 
 WINDOW_TIMEOUT_S = 25.0     # first window of a launched process
+EXTRA_TIMEOUT_S = 10.0      # each further window the same process opens
 POLL_S = 0.25
 
 
@@ -188,18 +189,33 @@ def launch_command(proc):
 
 
 def place(con_id, want):
-    """Apply the recorded geometry to one restored window."""
+    """Put one restored window on its workspace, with its recorded geometry.
+
+    Order matters. Fullscreen comes OFF first, because moving a fullscreen
+    container to another workspace leaves two of them competing for fullscreen on
+    the destination. Then move, then geometry, then fullscreen back on if it had
+    it. Every window goes through the same sequence, so a process's second window
+    is not a special case.
+    """
     sel = f'[con_id={con_id}]'
+    sway_cmd(f"{sel} fullscreen disable")
+
+    ws = want.get("workspace") or {}
+    ws_num = ws.get("num")
+    if isinstance(ws_num, int) and ws_num > 0:
+        sway_cmd(f"{sel} move container to workspace number {ws_num}")
+    elif ws.get("name"):
+        sway_cmd(f"{sel} move container to workspace {ws['name']}")
+
     if want.get("floating"):
         sway_cmd(f"{sel} floating enable")
         r = want.get("rect") or {}
         if all(k in r for k in ("x", "y", "width", "height")):
             sway_cmd(f"{sel} resize set {int(r['width'])} {int(r['height'])}")
             sway_cmd(f"{sel} move absolute position {int(r['x'])} {int(r['y'])}")
-    # The blanket rule already made it fullscreen; the work is taking that away
-    # from windows that were not fullscreen when the snapshot was taken.
-    if not want.get("fullscreen"):
-        sway_cmd(f"{sel} fullscreen disable")
+
+    if want.get("fullscreen"):
+        sway_cmd(f"{sel} fullscreen enable")
 
 
 def take_lock():
@@ -258,14 +274,24 @@ def main():
     except OSError:
         pass
 
-    allow = (cfg.get("SESSION_RESTORE_ALLOW") or "foot firefox").split()
+    # A DENYLIST, not an allowlist. An allowlist defaulting to "foot firefox"
+    # meant every other application the user ever installs is dropped silently,
+    # which is the wrong default for a general-purpose machine: you install
+    # something, use it, power off, and it does not come back with no
+    # explanation anywhere. Restore everything with a usable command line, and
+    # let the user name the exceptions.
+    skip = (cfg.get("SESSION_RESTORE_SKIP") or "").split()
     limit = int(cfg.get("SESSION_RESTORE_MAX") or 10)
 
-    procs = [p for p in snap.get("processes", []) if p.get("app_id") in allow]
+    procs = [p for p in snap.get("processes", []) if p.get("app_id") not in skip]
+    dropped = [p.get("app_id") for p in snap.get("processes", []) if p.get("app_id") in skip]
+    if dropped:
+        log(f"skipping by policy: {' '.join(sorted(set(dropped)))}")
     if not procs:
-        log("nothing in the snapshot is on the restore allowlist")
         return 0
-    procs = procs[:limit]
+    if len(procs) > limit:
+        log(f"snapshot has {len(procs)} applications; restoring the first {limit}")
+        procs = procs[:limit]
 
     # Hold the lock for the whole restore. The snapshotter skips writing while it
     # exists, so it cannot capture the half-restored desktop we are building and
@@ -289,9 +315,14 @@ def main():
             # Skip an application that has since been uninstalled, rather than
             # spending the full window timeout waiting for a window that cannot
             # appear -- 25s of a login, per missing app.
-            exe = proc.get("app_id") or (proc.get("cmdline") or [""])[0]
-            if not shutil.which(exe) and not os.path.exists(exe):
-                log(f"{proc.get('app_id')}: not installed any more; skipping")
+            #
+            # Checked against the recorded COMMAND, never the app_id: sway reports
+            # XWayland windows by WM_CLASS, which is conventionally capitalised
+            # ("Gimp", "Zoom"), and no such name resolves in PATH. Using app_id
+            # here would skip every X11 application as though it were missing.
+            exe = (proc.get("cmdline") or [""])[0]
+            if not exe or (not os.path.exists(exe) and not shutil.which(exe)):
+                log(f"{proc.get('app_id')}: {exe or 'no command'} is gone; skipping")
                 continue
             wins = proc.get("windows") or []
             first = wins[0] if wins else {}
@@ -335,25 +366,25 @@ def main():
                 log(f"{proc.get('app_id')}: no window appeared; skipping")
                 continue
 
-            # Place the FIRST window only.
+            # Wait for the rest of this process's windows, then place each on
+            # its own recorded workspace.
             #
-            # An earlier version waited for the remaining windows of a
-            # multi-window process and zip()ped them against the snapshot. That
-            # was wrong twice over: the workspace is switched once, BEFORE the
-            # launch, so windows 2..N were all born on window 1's workspace; and
-            # `got` is in arrival order while `wins` is in snapshot order, so the
-            # pairing was arbitrary. It looked correct and placed windows at
-            # random -- and was untestable here, since Firefox is not installed.
-            #
-            # Doing it properly needs placeholder containers that real windows are
-            # swallowed into -- sway's `append_layout`, closed unmerged as
-            # swaywm/sway#3022. Firefox reopens its own windows regardless, so the
-            # honest behaviour is: first window placed, the rest left to the app.
-            place(got[0]["id"], wins[0])
-            if wins[0].get("focused"):
-                focus_target = got[0]["id"]
-            extra = "" if len(wins) < 2 else f", {len(wins) - 1} more left to the app"
-            log(f"{proc.get('app_id')}: restored on workspace {ws_num}{extra}")
+            # Pairing is by ARRIVAL order against SNAPSHOT order, which is
+            # arbitrary for two windows of the same application -- there is no
+            # way to tell which browser window is which after a restart, and
+            # swayrst's README says as much. Arbitrary but deterministic beats
+            # the previous behaviour, where windows 2..N silently piled onto
+            # window 1's workspace.
+            if len(wins) > 1:
+                got += wait_for_new(before | {g["id"] for g in got},
+                                    len(wins) - 1, EXTRA_TIMEOUT_S)
+
+            for window, want in zip(got, wins):
+                place(window["id"], want)
+                if want.get("focused"):
+                    focus_target = window["id"]
+            log(f"{proc.get('app_id')}: {len(got)} of {len(wins)} window(s) on "
+                f"workspace(s) {[w.get('workspace', {}).get('num') for w in wins[:len(got)]]}")
 
         if focus_target is not None:
             sway_cmd(f"[con_id={focus_target}] focus")

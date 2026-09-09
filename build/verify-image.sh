@@ -552,7 +552,12 @@ check "snapshot records no window titles" \
 check "snapshot is written 0600"       "grep -q '0o600' $MNT/usr/local/bin/uconsole-session-snapshot"
 check "snapshot never ships in skel"   "[[ ! -e $MNT/etc/skel/.local/state/uconsole/session.json ]]"
 check "restore policy is configurable" "grep -qE '^SESSION_RESTORE=[01]$' $MNT/etc/uconsole/lowpower.conf"
-check "restore allowlist ships"        "grep -q '^SESSION_RESTORE_ALLOW=' $MNT/etc/uconsole/lowpower.conf"
+# A denylist, so an application installed later comes back without editing config.
+check "restore skiplist ships"         "grep -q '^SESSION_RESTORE_SKIP=' $MNT/etc/uconsole/lowpower.conf"
+check "restore has no allowlist"       "[[ \$(grep -c 'SESSION_RESTORE_ALLOW' $MNT/etc/uconsole/lowpower.conf $MNT/usr/local/bin/uconsole-session-restore | awk -F: '{s+=\$2} END{print s+0}') -eq 0 ]]"
+# sway reports XWayland windows by WM_CLASS ("Gimp"), which never resolves in
+# PATH -- checking app_id here would skip every X11 app as uninstalled.
+check "missing-app check uses cmdline" "grep -q 'exe = (proc.get(\"cmdline\") or' $MNT/usr/local/bin/uconsole-session-restore"
 check "restore launch cap ships"       "grep -qE '^SESSION_RESTORE_MAX=[0-9]+$' $MNT/etc/uconsole/lowpower.conf"
 # Firefox exits CLEANLY at poweroff, so it will not restore tabs unless told to.
 check "firefox session policy ships"   "[[ -f $MNT/etc/firefox/policies/policies.json ]]"
