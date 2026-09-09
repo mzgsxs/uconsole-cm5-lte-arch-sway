@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# uconsole-powerkey-hold {press|release}
+#
+# Give the power key a SHORTER long-press than logind can offer.
+#
+# logind's long-press is a hardcoded 5 seconds -- LONG_PRESS_DURATION in its
+# source, with no setting for it in any systemd version (systemd#28100 is the
+# open request). The AXP223's own forced-off cannot help either: it only offers
+# 4/6/8/10s and is deliberately parked at 10s so it always loses the race to a
+# clean shutdown. So a 3s clean poweroff has to come from whoever else already
+# sees the key, and sway does.
+#
+# WHY THE DECISION HAPPENS ON RELEASE, NOT ON A TIMER
+#
+# The obvious build is: on press, start a 3s timer; on release, cancel it. That
+# has a failure mode this machine cannot afford -- if the release binding is ever
+# missed, the timer fires and the machine powers off after an ordinary short
+# press, with no way to intervene.
+#
+# Measuring at release inverts the risk. Nothing is ever scheduled, so nothing
+# can fire unexpectedly: if the release never arrives, this does nothing at all
+# and logind's 5s still applies underneath. The worst case is that you fall back
+# to today's behaviour, which is exactly what a fallback should be.
+#
+# So: hold ~3s and let go -> clean poweroff. Keep holding past 5s and logind gets
+# there first, which is the same outcome by a different route. A quick tap still
+# blanks the screen.
+set -uo pipefail
+
+CONF=/etc/uconsole/lowpower.conf
+POWERKEY_HOLD_MS=3000
+# shellcheck source=/dev/null
+[[ -r $CONF ]] && . "$CONF"
+
+STAMP="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/uconsole-powerkey.down"
+TOGGLE=/usr/local/bin/uconsole-screen-toggle
+
+now_ms() { echo $(( $(date +%s%N) / 1000000 )); }
+
+case "${1:-}" in
+press)
+    # Record only. Deliberately schedules nothing.
+    now_ms > "$STAMP" 2>/dev/null || true
+    ;;
+
+release)
+    down=$(cat "$STAMP" 2>/dev/null || echo 0)
+    rm -f "$STAMP" 2>/dev/null || true
+
+    held=0
+    [[ $down =~ ^[0-9]+$ ]] && (( down > 0 )) && held=$(( $(now_ms) - down ))
+
+    # A hold of 0 means we never saw the press -- sway restarted, or the binding
+    # was added mid-session. Treat that as a tap: blanking is recoverable, an
+    # unexpected poweroff is not.
+    if (( held >= ${POWERKEY_HOLD_MS:-3000} )); then
+        logger -t uconsole-powerkey-hold "held ${held}ms >= ${POWERKEY_HOLD_MS:-3000}ms; clean poweroff"
+        # No session state to flush first: the snapshot is written continuously,
+        # and tmux.service's ExecStop forces a tmux-resurrect save on the way down.
+        systemctl poweroff
+    else
+        exec "$TOGGLE"
+    fi
+    ;;
+
+*)
+    echo "usage: uconsole-powerkey-hold {press|release}" >&2
+    exit 2 ;;
+esac

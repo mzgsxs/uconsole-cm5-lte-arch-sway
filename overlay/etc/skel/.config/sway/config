@@ -127,14 +127,36 @@ bindsym --locked XF86AudioRaiseVolume exec wpctl set-volume @DEFAULT_AUDIO_SINK@
 bindsym --locked XF86AudioLowerVolume exec wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-
 bindsym --locked XF86AudioMute exec wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle
 
-# Power key: short press blanks the backlight (logind is set to ignore it so the
-# compositor sees it); a ~5s long press is a clean poweroff, handled by logind.
+# Power key. Tap to blank and lock; hold about 3 seconds and let go for a clean
+# poweroff. logind is set to ignore the key so the compositor sees it at all.
 #
-# Suspend is deliberately NOT used, and the reason is NOT the one an earlier
-# version of this comment gave. That version claimed the kernel had none of
-# these states at all; on this build it has two. /sys/power/mem_sleep reads
-# "s2idle [deep]" and /sys/power/state reads "freeze mem", so a reader who
-# checks sysfs will conclude this warning is obsolete. It is not:
+# THREE poweroff paths exist, shortest first, and the shorter ones do not remove
+# the longer ones:
+#
+#   ~3s  here, measured by sway on key RELEASE          -> clean poweroff
+#    5s  logind's HandlePowerKeyLongPress                -> clean poweroff
+#   10s  the AXP223 cutting power in hardware            -> UNCLEAN, last resort
+#
+# 5s is a compile-time constant in logind with no setting in any systemd version
+# (systemd#28100 is the open request), and the AXP223's register offers only
+# 4/6/8/10s -- parked at 10s deliberately, since a clean shutdown takes about 8s
+# from the press and anything shorter would cut power mid-unmount. Measuring the
+# hold here is the only way to get 3s.
+#
+# The press binding records a timestamp and schedules NOTHING; every decision is
+# made on release. A missed release therefore does nothing at all, and logind's
+# 5s applies exactly as before -- rather than a pending timer powering the
+# machine off after an ordinary tap.
+#
+# --no-repeat: without it sway fires the binding at the 30/s repeat rate while
+# the key is held, which strobed the backlight through a long press.
+# --locked: without it sway refuses to run a binding while swaylock is up, and
+# the power key stopped working the moment the screen locked -- no way back.
+#
+# Suspend is deliberately NOT used, and not for the reason an earlier version of
+# this comment gave. That version claimed the kernel had no sleep states at all;
+# on this build it has two. /sys/power/mem_sleep reads "s2idle [deep]", so a
+# reader who checks sysfs will conclude this warning is obsolete. It is not:
 #
 #   deep    is not suspend-to-RAM on BCM2712. Broadcom never shipped the DDR
 #           self-refresh sequences, so what PSCI advertises is a firmware test
@@ -147,15 +169,8 @@ bindsym --locked XF86AudioMute exec wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle
 # masked in this image and mem_sleep_default=s2idle is pinned on the kernel
 # command line so a bare `echo mem` cannot reach the firmware stub. See
 # docs/HARDWARE.md S3.9.
-# --no-repeat and --release both matter here. Without --no-repeat sway fires this
-# binding at the keyboard repeat rate (30/s) for as long as the key is held, so a
-# long press toggles the backlight dozens of times and the screen strobes.
-# --release means a long press never toggles at all: logind powers off while the
-# key is still down, so the release event never arrives.
-# --locked is essential: without it sway refuses to run a binding while a screen
-# locker is active, so the moment swaylock started the power key stopped working
-# and there was no way back from a blanked screen.
-bindsym --no-repeat --release --locked XF86PowerOff exec /usr/local/bin/uconsole-screen-toggle
+bindsym --no-repeat --locked XF86PowerOff exec /usr/local/bin/uconsole-powerkey-hold press
+bindsym --no-repeat --release --locked XF86PowerOff exec /usr/local/bin/uconsole-powerkey-hold release
 
 ### Idle behaviour
 # Dim the BACKLIGHT rather than powering the panel down.
