@@ -1,0 +1,286 @@
+#!/usr/bin/env python3
+"""Record which applications are open, and where, so a poweroff can be undone.
+
+There is no suspend on this hardware (docs/HARDWARE.md S3.9) and the blanked
+machine still draws ~3.2W, almost all of it SoC, DSI panel and RP1/USB that
+userspace cannot switch off. The only state that reaches zero is "off". So the
+plan is not to sleep: it is to power off and come back to where you were.
+
+WHY THIS RUNS CONTINUOUSLY INSTEAD OF SAVING AT SHUTDOWN
+
+The obvious design saves on the way down, from a shutdown hook. It does not work
+here. sway is started by `exec sway` from .bash_profile, not as a systemd user
+unit, so the user manager cannot order anything against it; at poweroff logind
+SIGTERMs the session scope and sway dies in a race with any hook you write.
+
+Snapshotting continuously removes the race entirely, and gets three things the
+shutdown hook could never have had: it survives a crash, it survives a battery
+pull, and it survives the low-voltage guard's shutdown -- all of which this
+project has produced repeatedly while chasing the suspend bug.
+
+WHAT IT RECORDS, AND WHAT IT DELIBERATELY DOES NOT
+
+Keyed on PROCESSES, not windows. Firefox is one process with N windows, so a
+window-keyed snapshot would try to launch it N times. Each process therefore
+carries the list of its windows and where they were.
+
+Window titles are NOT recorded. They are the most sensitive thing on screen and
+nothing in the restore path needs them.
+
+Application state -- open tabs, shell history, editor buffers -- is not this
+program's business. Firefox restores its own session and tmux-resurrect restores
+tmux; this only records the window geometry that neither of them knows about.
+"""
+
+import json
+import os
+import pwd
+import select
+import subprocess
+import sys
+import time
+
+DEBOUNCE_S = 2.0        # quiet period after activity before writing
+PERIODIC_S = 300.0      # write anyway this often, as a safety net
+SCHEMA = 1
+
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+STATE_DIR = os.path.join(
+    os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+    "uconsole")
+SNAPSHOT = os.path.join(STATE_DIR, "session.json")
+LOCK = os.path.join(RUNTIME, "uconsole-session.lock")
+
+
+def log(msg):
+    subprocess.run(["logger", "-t", "uconsole-session-snapshot", msg], check=False)
+
+
+def sway(*args):
+    """Run swaymsg and return parsed JSON, or None."""
+    try:
+        out = subprocess.run(["swaymsg", "-r", *args],
+                             capture_output=True, text=True, timeout=10)
+        if out.returncode != 0:
+            return None
+        return json.loads(out.stdout)
+    except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
+        return None
+
+
+def boot_id():
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def proc_cmdline(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            parts = [p.decode("utf-8", "replace")
+                     for p in f.read().split(b"\0") if p]
+        return parts
+    except OSError:
+        return []
+
+
+def proc_cwd(pid):
+    try:
+        return os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        return ""
+
+
+def tmux_clients():
+    """Map client pid -> session name.
+
+    A terminal that was sitting in tmux should come back attached to the same
+    session, not at a bare prompt. tmux knows which client pid belongs to which
+    session; walking /proc to guess would be far less reliable.
+    """
+    try:
+        out = subprocess.run(
+            ["tmux", "list-clients", "-F", "#{client_pid} #{session_name}"],
+            capture_output=True, text=True, timeout=5)
+        if out.returncode != 0:
+            return {}
+        m = {}
+        for line in out.stdout.splitlines():
+            bits = line.split(None, 1)
+            if len(bits) == 2 and bits[0].isdigit():
+                m[int(bits[0])] = bits[1]
+        return m
+    except (subprocess.SubprocessError, OSError):
+        return {}
+
+
+def descendants(pid):
+    """PIDs below `pid`, so a terminal can be matched to its tmux client."""
+    try:
+        children = {}
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/stat") as f:
+                    # comm can contain spaces and parens; everything after the
+                    # final ')' is positional, and ppid is the second field there.
+                    stat = f.read()
+                ppid = int(stat[stat.rindex(")") + 2:].split()[1])
+            except (OSError, ValueError, IndexError):
+                continue
+            children.setdefault(ppid, []).append(int(entry))
+        out, stack = [], [pid]
+        while stack:
+            for child in children.get(stack.pop(), []):
+                out.append(child)
+                stack.append(child)
+        return out
+    except OSError:
+        return []
+
+
+def walk(node, workspace, acc):
+    """Collect leaf windows, remembering which workspace contains them."""
+    if node.get("type") == "workspace":
+        workspace = {"num": node.get("num"), "name": node.get("name")}
+    for child in node.get("nodes", []) + node.get("floating_nodes", []):
+        app_id = child.get("app_id")
+        cls = (child.get("window_properties") or {}).get("class")
+        pid = child.get("pid")
+        if (app_id or cls) and pid:
+            acc.append({
+                "pid": pid,
+                "app_id": app_id or cls,
+                "xwayland": app_id is None,
+                "con_id": child.get("id"),
+                "workspace": workspace,
+                # 0 none, 1 fullscreen, 2 global fullscreen
+                "fullscreen": child.get("fullscreen_mode", 0),
+                "floating": child.get("type") == "floating_con",
+                "rect": child.get("rect", {}),
+                "focused": bool(child.get("focused")),
+            })
+        walk(child, workspace, acc)
+
+
+def build():
+    tree = sway("-t", "get_tree")
+    if not tree:
+        return None
+    windows = []
+    walk(tree, None, windows)
+    if not windows:
+        return None
+
+    clients = tmux_clients()
+    processes, order = {}, []
+    for w in windows:
+        pid = w["pid"]
+        if pid not in processes:
+            cmdline = proc_cmdline(pid)
+            if not cmdline:
+                continue          # process already gone; nothing to relaunch
+            tmux_session = None
+            if clients:
+                for d in [pid] + descendants(pid):
+                    if d in clients:
+                        tmux_session = clients[d]
+                        break
+            processes[pid] = {
+                "pid": pid,
+                "app_id": w["app_id"],
+                "cmdline": cmdline,
+                "cwd": proc_cwd(pid),
+                "tmux_session": tmux_session,
+                "windows": [],
+            }
+            order.append(pid)
+        processes[pid]["windows"].append({
+            "workspace": w["workspace"],
+            "fullscreen": w["fullscreen"],
+            "floating": w["floating"],
+            "rect": w["rect"],
+            "focused": w["focused"],
+        })
+
+    return {
+        "schema": SCHEMA,
+        # The stamp that decides whether a restore is a RESUME or just another
+        # login. Compared against /proc/sys/kernel/random/boot_id: same boot
+        # means these windows are already on screen, so restoring would
+        # duplicate them. This replaces a shutdown hook entirely.
+        "boot_id": boot_id(),
+        "saved_at": int(time.time()),
+        "user": pwd.getpwuid(os.getuid()).pw_name,
+        "processes": [processes[p] for p in order],
+    }
+
+
+def write(snap):
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    tmp = SNAPSHOT + ".tmp"
+    # Keep one generation. If a restore is interrupted halfway it will have
+    # rewritten the live snapshot with a partial desktop, and .prev is then the
+    # only thing that still describes the session as it was.
+    try:
+        if os.path.exists(SNAPSHOT):
+            os.replace(SNAPSHOT, SNAPSHOT + ".prev")
+    except OSError:
+        pass
+    with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        json.dump(snap, f, indent=1)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, SNAPSHOT)
+
+
+def snapshot():
+    # The restorer holds this while it is launching things. Without the check we
+    # would watch it work and overwrite the snapshot with a half-restored
+    # desktop -- destroying the very thing being restored from.
+    if os.path.exists(LOCK):
+        return
+    snap = build()
+    if snap:
+        try:
+            write(snap)
+        except OSError as e:
+            log(f"could not write snapshot: {e}")
+
+
+def main():
+    if not os.environ.get("SWAYSOCK"):
+        print("uconsole-session-snapshot: no SWAYSOCK; run this inside sway",
+              file=sys.stderr)
+        return 1
+
+    try:
+        proc = subprocess.Popen(
+            ["swaymsg", "-t", "subscribe", "-m", "-r",
+             '["window","workspace"]'],
+            stdout=subprocess.PIPE)
+    except OSError as e:
+        print(f"uconsole-session-snapshot: {e}", file=sys.stderr)
+        return 1
+
+    log("watching sway for window and workspace changes")
+    pending = False
+    while True:
+        timeout = DEBOUNCE_S if pending else PERIODIC_S
+        ready, _, _ = select.select([proc.stdout], [], [], timeout)
+        if ready:
+            if not proc.stdout.readline():
+                break                      # sway went away
+            pending = True                 # debounce: wait for quiet
+        else:
+            snapshot()                     # quiet, or the periodic safety net
+            pending = False
+    log("sway exited; stopping")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

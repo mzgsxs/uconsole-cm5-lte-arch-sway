@@ -172,6 +172,18 @@ exec swayidle -w \
     timeout 300 'brightnessctl -s set 0' \
     resume    'brightnessctl -r'
 
+### Session restore
+# There is no suspend on this hardware, so the way back from a poweroff is to
+# relaunch what was open. The restore runs FIRST and takes a lock; the snapshot
+# daemon skips writing while that lock is held, so it cannot capture the
+# half-restored desktop and overwrite the very file it is being restored from.
+#
+# Plain `exec`, not a systemd user unit: these need SWAYSOCK and WAYLAND_DISPLAY,
+# and nothing in this image runs dbus-update-activation-environment to put them
+# in the user manager's environment. An exec inherits them and dies with sway.
+exec /usr/local/bin/uconsole-session-restore
+exec /usr/local/bin/uconsole-session-snapshot
+
 ### Bar
 bar {
     swaybar_command waybar

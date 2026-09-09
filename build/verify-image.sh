@@ -501,6 +501,56 @@ check "unstick uses the transient unit" "grep -q 'systemd-run --unit=uconsole-mo
 check "uconsole-wan persists its mode" "grep -q 'MODE_FILE=/var/lib/uconsole/wan-mode' $MNT/usr/local/bin/uconsole-wan"
 check "wan mode saved for all 3 modes" "[[ \$(grep -c '^    save_mode ' $MNT/usr/local/bin/uconsole-wan) -eq 3 ]]"
 
+echo "-- session restore (Stage 2) --"
+check "session snapshot present"       "[[ -x $MNT/usr/local/bin/uconsole-session-snapshot ]]"
+check "session restore present"        "[[ -x $MNT/usr/local/bin/uconsole-session-restore ]]"
+# Compiled with the IMAGE's python3, not the host's -- the base container has no
+# python at all, so a host-side check reports "command not found" as a failure.
+check "session snapshot compiles"      "chroot $MNT /usr/bin/python3 -m py_compile /usr/local/bin/uconsole-session-snapshot"
+check "session restore compiles"       "chroot $MNT /usr/bin/python3 -m py_compile /usr/local/bin/uconsole-session-restore"
+check "sway starts the restore"        "grep -q 'exec /usr/local/bin/uconsole-session-restore' $MNT/etc/skel/.config/sway/config"
+check "sway starts the snapshotter"    "grep -q 'exec /usr/local/bin/uconsole-session-snapshot' $MNT/etc/skel/.config/sway/config"
+# Order matters: the restore takes a lock the snapshotter honours. Reversed, the
+# snapshotter can capture the half-restored desktop and overwrite the file being
+# restored from -- destroying the session while appearing to work.
+check "restore is exec'd before snapshot" \
+      "[[ \$(grep -n 'uconsole-session-restore' $MNT/etc/skel/.config/sway/config | head -1 | cut -d: -f1) -lt \$(grep -n 'uconsole-session-snapshot' $MNT/etc/skel/.config/sway/config | head -1 | cut -d: -f1) ]]"
+check "snapshotter honours the lock"   "grep -q 'os.path.exists(LOCK)' $MNT/usr/local/bin/uconsole-session-snapshot"
+check "restore takes the lock"         "grep -q 'O_CREAT | os.O_EXCL' $MNT/usr/local/bin/uconsole-session-restore"
+# The boot id is what distinguishes a resume from an ordinary re-login. Without
+# it a logout and login would duplicate every window.
+check "restore is gated on boot id"    "grep -q 'snap.get(\"boot_id\") == now_boot' $MNT/usr/local/bin/uconsole-session-restore"
+check "snapshot stamps the boot id"    "grep -q '\"boot_id\": boot_id()' $MNT/usr/local/bin/uconsole-session-snapshot"
+# for_window makes EVERY window fullscreen, so the work is removing it from the
+# ones that were not. Applying it would be a no-op and leave the rest wrong.
+check "restore clears unwanted fullscreen" "grep -q 'fullscreen disable' $MNT/usr/local/bin/uconsole-session-restore"
+# Switch workspace, then launch. Moving an already-fullscreen container between
+# workspaces leaves two competing on the destination.
+check "restore switches workspace first" "grep -q 'Switch workspace BEFORE launching' $MNT/usr/local/bin/uconsole-session-restore"
+# Firefox is one process with N windows; launching per window starts N browsers.
+check "restore launches per process"   "grep -q 'One launch per PROCESS' $MNT/usr/local/bin/uconsole-session-restore"
+check "snapshot keyed on processes"    "grep -q '\"processes\":' $MNT/usr/local/bin/uconsole-session-snapshot"
+# Window titles are the most sensitive thing on screen and nothing in the restore
+# path needs them. Matched precisely: sway puts a window's title in the CHILD
+# node's "name", while a WORKSPACE's "name" is read from the workspace node and
+# is both needed and harmless. A looser pattern matches the docstring saying
+# titles are not recorded -- the same comment-matching trap as the gpiochip0 and
+# "no sleep states" checks.
+check "snapshot records no window titles" \
+      "[[ \$(grep -c 'child.get(\"name\")\|\"title\"' $MNT/usr/local/bin/uconsole-session-snapshot) -eq 0 ]]"
+check "snapshot is written 0600"       "grep -q '0o600' $MNT/usr/local/bin/uconsole-session-snapshot"
+check "snapshot never ships in skel"   "[[ ! -e $MNT/etc/skel/.local/state/uconsole/session.json ]]"
+check "restore policy is configurable" "grep -qE '^SESSION_RESTORE=[01]$' $MNT/etc/uconsole/lowpower.conf"
+check "restore allowlist ships"        "grep -q '^SESSION_RESTORE_ALLOW=' $MNT/etc/uconsole/lowpower.conf"
+check "restore launch cap ships"       "grep -qE '^SESSION_RESTORE_MAX=[0-9]+$' $MNT/etc/uconsole/lowpower.conf"
+# Firefox exits CLEANLY at poweroff, so it will not restore tabs unless told to.
+check "firefox session policy ships"   "[[ -f $MNT/etc/firefox/policies/policies.json ]]"
+check "firefox policy is valid JSON"   "chroot $MNT /usr/bin/python3 -c \"import json;json.load(open('/etc/firefox/policies/policies.json'))\""
+check "firefox policy restores session" "grep -q 'browser.startup.page' $MNT/etc/firefox/policies/policies.json"
+# tmux-continuum restores into the server; attaching before it is up lands you
+# in an empty session instead of the one you left.
+check "restore waits for tmux"         "grep -q 'def tmux_ready' $MNT/usr/local/bin/uconsole-session-restore"
+
 echo "-- power measurement --"
 check "power probe present"            "[[ -x $MNT/usr/local/bin/uconsole-power-probe ]]"
 check "power probe parses"             "bash -n $MNT/usr/local/bin/uconsole-power-probe"

@@ -1,0 +1,10 @@
+{
+  "policies": {
+    "Preferences": {
+      "browser.startup.page": {
+        "Value": 3,
+        "Status": "default"
+      }
+    }
+  }
+}
