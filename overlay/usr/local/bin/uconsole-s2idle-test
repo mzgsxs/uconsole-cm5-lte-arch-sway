@@ -1,0 +1,352 @@
+#!/usr/bin/env bash
+# uconsole-s2idle-test {check|bisect|run} -- is s2idle usable, and is it worth it?
+#
+#   check    report readiness and change nothing
+#   bisect   pm_test ladder: exercise the failing phase WITHOUT calling firmware
+#   run      measure blanked-awake vs actually-suspended drain, and compare
+#
+# READ THIS BEFORE USING `run`
+#
+# On this hardware suspend has hard-hung the machine five times out of five,
+# needing four battery pulls, and left the FAT boot partition dirty twice. The
+# sleep targets are masked in this image for that reason; this script writes
+# /sys/power/state directly, which is a deliberate experiment, not an accident.
+#
+# The hypothesis being tested is specific and has never been tried: every
+# previous attempt used `rfkill block`, which does NOT unload brcmfmac, so the
+# driver's broken ->suspend() callback still ran and still wedged the SDIO
+# backplane with -110 timeouts. Unloading the module removes that callback
+# entirely -- the standard fix for this bug on every other platform it appears
+# on. If you only use the LTE modem for connectivity, losing Wi-Fi across a
+# suspend costs you nothing, which is what makes this worth testing at all.
+#
+# WHAT TO EXPECT EVEN IF IT WORKS
+#
+# Pi 5 has no cpuidle driver at all (`cpuidle/current_driver` reads `none`), so
+# there are no C-states for s2idle to enter -- it mostly just stops the
+# scheduler. The only published Raspberry Pi s2idle figure is 0.34 W, measured
+# on a Pi 1. Set expectations accordingly: this is a measurement to settle the
+# question, not a fix that will transform battery life.
+#
+# `deep` is never used and never will be: it is a PSCI firmware stub with no DDR
+# self-refresh behind it. This script forces s2idle and verifies it took, because
+# /sys/power/mem_sleep resets to `deep` on EVERY boot.
+set -uo pipefail
+
+B=/sys/class/power_supply/axp20x-battery
+AC=/sys/class/power_supply/axp22x-ac/online
+BREADCRUMB=/var/lib/uconsole/s2idle-attempt
+# Results are appended and SYNCED as each number is known, never held in memory
+# until the end. The first run of this script lost everything it measured: the
+# machine wedged while printing the summary, so the report existed only on a
+# stdout nobody could read any more. Anything learned before the hang must be on
+# disk before the hang.
+RESULTS=/var/lib/uconsole/s2idle-results
+MINUTES=20
+ALLOW_WIFI=0
+MODEM_LOW=0
+CONFIRM=0
+PRINT_TIMES=0
+
+die()  { echo "uconsole-s2idle-test: $*" >&2; exit 1; }
+say()  { printf '  %s\n' "$*"; }
+ok()   { printf '  ok    %s\n' "$*"; }
+no()   { printf '  NO    %s\n' "$*"; }
+
+need_root() { [[ $EUID -eq 0 ]] || die "must run as root"; }
+
+### readiness ---------------------------------------------------------------
+wifi_loaded() { lsmod 2>/dev/null | grep -qc '^brcmfmac' >/dev/null 2>&1 && \
+                [[ $(lsmod | grep -c '^brcmfmac') -gt 0 ]]; }
+
+gauge_mode() {
+    # Prefer a coulomb counter: over a 20-minute window a voltage delta is mostly
+    # noise, while charge/energy integrate the actual draw.
+    [[ -r $B/energy_now ]] && { echo energy; return; }
+    [[ -r $B/charge_now ]] && { echo charge; return; }
+    echo voltage
+}
+
+read_gauge() {   # prints a single integer in the unit implied by gauge_mode
+    case "$(gauge_mode)" in
+        energy)  cat "$B/energy_now" ;;      # uWh
+        charge)  cat "$B/charge_now" ;;      # uAh
+        voltage) cat "$B/voltage_now" ;;     # uV
+    esac
+}
+
+do_check() {
+    echo "== power source"
+    if [[ $(cat "$AC" 2>/dev/null || echo 0) == 1 ]]; then
+        no "on AC -- drain cannot be measured; unplug before running"
+    else
+        ok "on battery"
+    fi
+
+    echo "== gauge"
+    local m; m=$(gauge_mode)
+    case "$m" in
+        energy|charge) ok "coulomb counter available ($m); drain will be accurate" ;;
+        voltage)       no "no charge/energy counter -- falling back to voltage delta," ;;
+    esac
+    [[ $m == voltage ]] && say "which is noisy. Use a longer --minutes to compensate."
+    say "voltage now: $(awk "BEGIN{printf \"%.3f\", $(cat $B/voltage_now 2>/dev/null || echo 0)/1000000}") V"
+
+    echo "== sleep states"
+    say "state:     $(cat /sys/power/state 2>/dev/null)"
+    say "mem_sleep: $(cat /sys/power/mem_sleep 2>/dev/null)   <- resets to [deep] every boot"
+    [[ -r /sys/power/pm_test ]] && ok "pm_test available -- 'bisect' can test without calling firmware" \
+                                || no "pm_test unavailable (CONFIG_PM_DEBUG off); 'bisect' cannot run"
+
+    echo "== the thing being tested"
+    if [[ $(lsmod 2>/dev/null | grep -c '^brcmfmac') -gt 0 ]]; then
+        no "brcmfmac is LOADED -- its broken ->suspend() will run and is expected to hang"
+        say "unload with: sudo uconsole-s2idle-test unload-wifi"
+    else
+        ok "brcmfmac not loaded -- the suspect callback cannot run"
+    fi
+
+    echo "== modem"
+    if [[ $(lsmod 2>/dev/null | grep -c 'qmi_wwan\|option\|cdc_') -gt 0 ]]; then
+        say "USB modem drivers loaded; they have suspend callbacks too and are the"
+        say "next most likely culprit if a wifi-free suspend still hangs."
+    fi
+
+    echo "== rtc"
+    [[ -e /dev/rtc0 ]] && ok "/dev/rtc0 present (rtcwake can schedule the wake)" \
+                       || no "no /dev/rtc0 -- there would be no timed wake"
+
+    echo "== previous attempts"
+    if [[ -f $BREADCRUMB ]]; then
+        no "an earlier attempt did not complete:"
+        sed 's/^/        /' "$BREADCRUMB"
+        say "if that boot ended in a hang, check /boot before testing again:"
+        say "  sudo umount /boot && sudo fsck.vfat -a /dev/mmcblk0p1 && sudo mount /boot"
+    else
+        ok "no unfinished attempt recorded"
+    fi
+}
+
+### wifi --------------------------------------------------------------------
+do_unload_wifi() {
+    need_root
+    nmcli radio wifi off >/dev/null 2>&1
+    # Order matters: the bus-specific shims hold references on the core module.
+    modprobe -r brcmfmac_wcc brcmfmac_cyw brcmfmac_bca 2>/dev/null
+    modprobe -r brcmfmac 2>/dev/null
+    modprobe -r brcmutil 2>/dev/null
+    if [[ $(lsmod | grep -c '^brcmfmac') -eq 0 ]]; then
+        echo "brcmfmac unloaded."
+        echo "NOTE: after a failed suspend the chip may need a full REBOOT, not a"
+        echo "      modprobe -- reprobing all three SDIO functions fails with -110."
+    else
+        die "brcmfmac would not unload; something still holds it (lsmod | grep brcmfmac)"
+    fi
+}
+
+### force s2idle ------------------------------------------------------------
+force_s2idle() {
+    [[ -w /sys/power/mem_sleep ]] || die "cannot write /sys/power/mem_sleep"
+    echo s2idle > /sys/power/mem_sleep 2>/dev/null
+    # Verify. mem_sleep resets to `deep` on every boot, and `deep` is the PSCI
+    # stub -- taking it by accident is exactly how this hardware got wedged.
+    local sel
+    sel=$(sed 's/.*\[\(.*\)\].*/\1/' /sys/power/mem_sleep 2>/dev/null)
+    [[ $sel == s2idle ]] || die "mem_sleep is '$sel', refusing to continue (would call the firmware stub)"
+    echo "$sel"
+}
+
+### breadcrumbs -------------------------------------------------------------
+# Written and SYNCED before every suspend, so that if the machine hangs and you
+# have to pull the battery, the next boot can still say how far it got. Nothing
+# in the journal survives that; this does.
+rec() {   # append one key=value to the results file and force it to disk
+    mkdir -p /var/lib/uconsole
+    printf '%s\t%s\n' "$(date -Is)" "$*" >> "$RESULTS"
+    sync
+}
+
+crumb() {
+    mkdir -p /var/lib/uconsole
+    { echo "when:      $(date -Is)"; echo "phase:     $1"
+      echo "mem_sleep: $(cat /sys/power/mem_sleep 2>/dev/null)"
+      echo "brcmfmac:  $(lsmod | grep -c '^brcmfmac') module(s) loaded"
+      echo "gauge:     $(read_gauge) ($(gauge_mode))"; } > "$BREADCRUMB"
+    sync
+}
+
+### bisect ------------------------------------------------------------------
+do_bisect() {
+    need_root
+    [[ -w /sys/power/pm_test ]] || die "no /sys/power/pm_test (CONFIG_PM_DEBUG is off)"
+    echo "pm_test runs every driver's real ->suspend() but stops before calling"
+    echo "firmware, so a failure here costs you the Wi-Fi chip at worst, not the"
+    echo "machine. Levels are cumulative; the printed order is NOT severity order."
+    echo
+    force_s2idle >/dev/null
+    for level in freezer devices; do
+        echo "-- pm_test=$level"
+        crumb "bisect:$level"
+        echo "$level" > /sys/power/pm_test
+        echo 1 > /sys/power/pm_print_times 2>/dev/null
+        if rtcwake -m mem -s 5 >/dev/null 2>&1; then
+            ok "$level completed and returned control"
+        else
+            no "$level returned an error -- a device callback failed:"
+            dmesg 2>/dev/null | tail -120 | grep -iE "failed to suspend|dpm_run_callback|PM: Device" \
+                | tail -8 | sed 's/^/          /'
+        fi
+        echo 0 > /sys/power/pm_print_times 2>/dev/null
+        say "wifi netdev: $(ip -br link show 2>/dev/null | awk '/^wl/{print $1" "$2}' || echo 'none')"
+    done
+    echo none > /sys/power/pm_test
+    rm -f "$BREADCRUMB"
+    echo
+    echo "pm_test reset to none. If the Wi-Fi interface disappeared above, the"
+    echo "brcmfmac wedge reproduced -- reboot to recover it, a reload will not."
+}
+
+### run ---------------------------------------------------------------------
+do_run() {
+    need_root
+    (( CONFIRM )) || die "refusing without --yes-i-may-lose-this-boot (read the header)"
+    [[ $(cat "$AC" 2>/dev/null || echo 0) == 1 ]] && die "on AC -- unplug; charging current makes drain meaningless"
+    [[ -e /dev/rtc0 ]] || die "no /dev/rtc0 -- there would be no way back from suspend"
+    if [[ $(lsmod | grep -c '^brcmfmac') -gt 0 ]] && (( ! ALLOW_WIFI )); then
+        die "brcmfmac is loaded; that is the known hang. Run 'unload-wifi' first, or --allow-wifi to insist."
+    fi
+
+    local secs=$(( MINUTES * 60 )) mode; mode=$(gauge_mode)
+    # Cache the voltage NOW. Reading the PMIC over I2C after a failed suspend can
+    # block, and the summary must never be the thing that hangs.
+    local vnow; vnow=$(cat "$B/voltage_now" 2>/dev/null || echo 0)
+    : > "$RESULTS"
+    rec "start minutes=$MINUTES gauge=$mode voltage_uv=$vnow"
+    rec "brcmfmac_loaded=$(lsmod | grep -c '^brcmfmac')"
+    echo "Two phases of ${MINUTES} min each, measured with the ${mode} gauge."
+    echo "Results are written to $RESULTS as they are taken, so a hang loses nothing."
+    echo
+
+    # Phase 1: the machine as it already behaves -- blanked but awake. This is
+    # the control, and the only figure s2idle has to beat.
+    echo "== phase 1/2: blanked, awake (the current low-power blank)"
+    /usr/local/bin/uconsole-lowpower down >/dev/null 2>&1
+    local a1 a2
+    a1=$(read_gauge); rec "awake_before=$a1"
+    sleep "$secs"
+    a2=$(read_gauge); rec "awake_after=$a2"
+    /usr/local/bin/uconsole-lowpower up >/dev/null 2>&1
+    say "gauge $a1 -> $a2"
+
+    # Phase 2: actually suspended.
+    echo
+    echo "== phase 2/2: s2idle"
+    (( MODEM_LOW )) && { mmcli -m 0 --set-power-state-low >/dev/null 2>&1; say "modem radio set low"; }
+    /usr/local/bin/uconsole-lowpower down >/dev/null 2>&1
+    say "mem_sleep forced to: $(force_s2idle)"
+
+    if (( PRINT_TIMES )); then
+        # Makes the kernel print every device's suspend/resume timing. The LAST
+        # device named before a hang is the culprit -- the only way to identify it
+        # without a serial console, since the journal does not survive.
+        echo 0 > /sys/power/pm_async 2>/dev/null
+        echo 1 > /sys/power/pm_print_times 2>/dev/null
+        say "pm_print_times on, async suspend off -- watch the console for the last device"
+    fi
+
+    local b1 b2
+    b1=$(read_gauge); rec "s2idle_before=$b1"
+    crumb "run:s2idle"
+    # Flush everything reachable before handing control to the kernel: if this
+    # hangs, the battery comes out, and anything unwritten is lost.
+    systemctl kill --signal=SIGUSR1 systemd-journald 2>/dev/null
+    sync; sleep 2
+    say "suspending for ${MINUTES} min at $(date +%H:%M:%S) -- do not touch the machine"
+
+    rtcwake -m mem -s "$secs" >/dev/null 2>&1
+    local rc=$?
+
+    # RECORD FIRST, restore second. Everything below this line can hang; nothing
+    # above it may be lost. The previous version called `lowpower up` before
+    # writing anything down and the machine died with the numbers still in RAM.
+    b2=$(read_gauge)
+    rec "s2idle_after=$b2"
+    rec "rtcwake_rc=$rc"
+    rec "survived_wake=yes"
+
+    /usr/local/bin/uconsole-lowpower up >/dev/null 2>&1
+    say "woke at $(date +%H:%M:%S), rtcwake rc=$rc"
+    say "gauge $b1 -> $b2"
+    (( rc == 0 )) || say "NOTE: rtcwake reported an error -- the suspend core began unwinding."
+    rec "restored=yes"
+    rm -f "$BREADCRUMB"
+
+    echo
+    do_report_file "$secs" "$mode" "$vnow"
+}
+
+# Print the summary from the RESULTS file, so it can be recovered after a reboot.
+do_report_file() {
+    local secs="${1:-}" mode="${2:-}" vnow="${3:-}"
+    [[ -r $RESULTS ]] || die "no results at $RESULTS"
+    local v
+    # One key per record, and take only the first whitespace-delimited token
+    # after the '=': a stray second key on the same line ends up inside an
+    # arithmetic expansion later and dies with "unbound variable".
+    v() { awk -F'\t' -v k="$1" '$2 ~ "^"k"=" {split($2,a,"="); split(a[2],b," "); print b[1]}' "$RESULTS" | tail -1; }
+    [[ -n $secs ]] || secs=$(( $(awk -F'minutes=' '/minutes=/{split($2,a," "); print a[1]; exit}' "$RESULTS") * 60 ))
+    [[ -n $mode ]] || mode=$(awk -F'gauge=' '/gauge=/{split($2,a," "); print a[1]; exit}' "$RESULTS")
+    [[ -n $vnow ]] || vnow=$(awk -F'voltage_uv=' '/voltage_uv=/{split($2,a," "); print a[1]; exit}' "$RESULTS")
+
+    printf '  %-22s %12s %12s\n' phase delta "drain"
+    printf '  %s\n' "----------------------------------------------"
+    local a1 a2 b1 b2
+    a1=$(v awake_before); a2=$(v awake_after)
+    b1=$(v s2idle_before); b2=$(v s2idle_after)
+    [[ -n $a1 && -n $a2 ]] && report_phase "blanked, awake" "$a1" "$a2" "$secs" "$mode" "$vnow"
+    if [[ -n $b1 && -n $b2 ]]; then
+        report_phase "s2idle" "$b1" "$b2" "$secs" "$mode" "$vnow"
+    else
+        printf '  %-22s %s\n' "s2idle" "NO RESULT -- the machine did not survive the suspend"
+    fi
+    echo
+    echo "  Only the DIFFERENCE is meaningful. Expect it to be small: Pi 5 has no"
+    echo "  cpuidle driver, so there are no C-states for s2idle to enter."
+}
+
+report_phase() {  # label before after secs mode voltage_uv
+    local label="$1" before="$2" after="$3" secs="$4" mode="$5" vnow="${6:-0}"
+    local d=$(( before - after ))
+    case "$mode" in
+        energy)  printf '  %-22s %9s uWh %8.3f W\n' "$label" "$d" \
+                     "$(awk "BEGIN{print $d*3600/$secs/1000000}")" ;;
+        charge)  printf '  %-22s %9s uAh %8.3f W\n' "$label" "$d" \
+                     "$(awk "BEGIN{v=$vnow/1000000; print $d*3600/$secs*v/1000000}")" ;;
+        voltage) printf '  %-22s %9s uV  %8s\n' "$label" "$d" "(noisy)" ;;
+    esac
+}
+
+### dispatch ----------------------------------------------------------------
+CMD="${1:-}"; shift 2>/dev/null || true
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --minutes) MINUTES="${2:?}"; shift ;;
+        --allow-wifi) ALLOW_WIFI=1 ;;
+        --modem-low) MODEM_LOW=1 ;;
+        --print-times) PRINT_TIMES=1 ;;
+        --yes-i-may-lose-this-boot) CONFIRM=1 ;;
+        *) die "unknown option: $1" ;;
+    esac
+    shift
+done
+
+case "$CMD" in
+    check)       do_check ;;
+    report)      do_report_file ;;
+    unload-wifi) do_unload_wifi ;;
+    bisect)      do_bisect ;;
+    run)         do_run ;;
+    *) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'
+       echo; echo "Options: --minutes N  --allow-wifi  --modem-low  --print-times  --yes-i-may-lose-this-boot"
+       exit 2 ;;
+esac
