@@ -43,6 +43,28 @@ only zone in the tree, which is why `thermal-zone: 0` is the right waybar settin
 from the part number rather than the DTB leads you to look for a 2712 driver that does not
 exist.
 
+**The DSI panel often fails to initialise on a COLD boot.** Powering on from fully off is
+markedly less reliable than a warm restart, and the failure is silent: the panel reports
+`status=connected enabled=enabled`, `fb0` exists, the backlight sits at its normal level —
+and nothing is on screen. Only dmesg tells you, and the tell is `[drm] Receive failed`, a
+DSI command read-back failure during panel init. Measured on this board 2026-09-09:
+
+```
+cold boot (black)          warm reboot (fine)
+  6x "regulator isn't ready"   1x
+  [drm] Receive failed         absent
+```
+
+**A warm reboot fixes it; another power cycle often does not**, which makes the instinctive
+recovery — hold the power button, then power back on — the wrong move, since that is
+another cold boot. From a black screen press `Ctrl`+`Alt`+`F2` then `Ctrl`+`Alt`+`Del`,
+which is a clean warm reboot and needs no login. (With sway running, switch VT first: a
+compositor holds the seat, so `Ctrl`+`Alt`+`Del` never reaches the kernel's VT layer.)
+
+This matters more than it looks, because the session-restore feature deliberately
+encourages powering off and back on — which is exactly the operation this panel is worst
+at. The ClockworkPi community documents the same cold-boot fragility.
+
 **CPU offlining is one-way — the firmware can park a core but cannot restart it.**
 Offlining succeeds; bringing the core back fails, and only a reboot recovers it. Measured
 on this board 2026-09-08 on all of cpu1–cpu3:

@@ -1,5 +1,107 @@
 # Changelog
 
+## Session restore, and a power key you can actually use
+
+Suspend is unreachable on this hardware and a blanked machine still draws ~3.2 W that
+userspace cannot switch off, so the only state that reaches zero is **off**. This release
+makes "off" tolerable: power down, come back to where you were.
+
+### The machine remembers what was open
+
+`uconsole-session-snapshot` runs under sway and records which applications are open and
+where; `uconsole-session-restore` replays it at the next login. Workspace, fullscreen
+state, floating geometry and focus.
+
+It snapshots **continuously** rather than saving at shutdown. sway is started by `exec
+sway` from `.bash_profile`, not as a systemd user unit, so the user manager cannot order a
+hook against it — at poweroff logind SIGTERMs the session scope and sway dies in a race
+with anything you write. Recording continuously removes the race, and covers a crash, a
+battery pull and the low-voltage guard for free.
+
+What decides a restore is the **boot id** stamped in the snapshot. Nothing is written at
+poweroff, so there is no marker to lose and nothing to race.
+
+Out of scope deliberately: the split/tabbed/stacked container tree. Sway has no layout
+save/restore — `append_layout` was closed unmerged as swaywm/sway#3022 — so the mechanism
+i3-resurrect relies on does not exist here. swayrst, the only sway-native tool in this
+space, moves already-running windows rather than relaunching and says outright it knows no
+way to identify the same windows after a reboot.
+
+### A 2-second power key
+
+logind's long-press is a hardcoded 5 s: not a kernel setting and not a logind setting,
+just `LONG_PRESS_DURATION` in its source, with systemd#28100 the open request to change
+that. The AXP223's forced-off offers only 4/6/8/10 s and is parked at 10 s deliberately,
+because a clean shutdown takes ~8 s from the press and anything shorter cuts power
+mid-unmount.
+
+So the hold is measured by sway, which already sees the key. Three paths now exist and the
+shorter ones do not remove the longer:
+
+| | | |
+|---|---|---|
+| ~2 s | sway | clean |
+| 5 s | logind | clean |
+| 10 s | AXP223 hardware | unclean, for a wedged kernel |
+
+It fires **while the key is still down**, on a timer — but the timer does not trust the
+release event. When it expires it asks the kernel whether the key is still physically
+held, so a tap cannot power the machine off even if the release binding is missed
+entirely. Every failure lands on doing nothing.
+
+### tmux state survives a poweroff
+
+`tmux.service` now forces a tmux-resurrect save in `ExecStop` before killing the server,
+and the continuum interval drops 15 → 5 minutes as the safety net for unclean stops.
+
+This was a real loss, not a theoretical one: a `vim` started after the last 15-minute tick
+was gone after a power-button poweroff, and the saved state still showed the pane at a
+shell.
+
+### Defects found by testing, not by reading
+
+- **The device lookup matched nothing.** `/axp[0-9]*-pek/` cannot match `axp20x-pek` — the
+  `x` in `20x` defeats it. `press()` returned early, no timer was ever armed, and both
+  safety tests "passed" because there was nothing to fire.
+- **Multi-window placement was wrong and looked right.** The workspace is switched once,
+  before the launch, so windows 2..N were born on window 1's workspace; and arrival order
+  was zipped blindly against snapshot order. Fixed by giving `place()` the workspace move,
+  in the order that works: fullscreen off, move, geometry, fullscreen on.
+- **Window pairing worked by luck.** The snapshot recorded tree order (workspace order)
+  while Firefox reopens in creation order. Now sorted by `con_id`, which is creation order.
+- **A stale lock silently disabled snapshotting** for the whole session. The holder pid was
+  already in the file; nothing read it.
+- **An allowlist was the wrong default.** `"foot firefox"` meant anything installed later
+  silently failed to come back. Inverted to a denylist, empty by default.
+- **The uninstalled-app guard would have skipped every XWayland app**, since it checked
+  `app_id` and sway reports X11 windows by capitalised WM_CLASS, which never resolves in
+  PATH. It now checks the recorded command.
+- **Verification wrote into the image it was verifying.** `py_compile` leaves `__pycache__`
+  next to the source; now `ast.parse`, plus a check that no bytecode ships.
+
+### Verification
+
+344 → **385 checks**. The new ones cover the session snapshot and restore (boot-id gating,
+the lock, workspace placement, no window titles recorded, 0600 permissions), the power key
+(both bindings, the kernel key-state guard, device lookup by name), and each specific
+defect above so it cannot return.
+
+Two of those checks caught real regressions during this work: the "no sleep states" one
+matched a corrected comment that quoted the old claim, and the missing-app check still
+grepped for a message that had been reworded. Both are the comment-matching trap this
+suite exists to catch.
+
+### Hardware findings
+
+**The DSI panel often fails to initialise on a cold boot** and lies about it —
+`enabled=enabled`, `fb0` present, backlight normal, nothing on screen. The tell is
+`[drm] Receive failed` in dmesg. A warm reboot fixes it; another power cycle often does
+not, which makes the instinctive recovery the wrong move. `Ctrl`+`Alt`+`F2` then
+`Ctrl`+`Alt`+`Del`.
+
+That matters here specifically, because session restore encourages powering off and back
+on — exactly the operation this panel is worst at.
+
 ## Power management: suspend closed off, a real low-power blank, and measurement
 
 Everything in this entry was driven by measuring the machine rather than reasoning about

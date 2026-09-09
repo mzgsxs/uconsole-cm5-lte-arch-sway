@@ -37,8 +37,8 @@ been left disabled, **and when the network is off** — which matters because th
 blank is itself capable of switching the radios off. SSH works too when there is a
 network, and `uconsole-unstick` behaves identically over it.
 
-A long power press also still shuts down cleanly, since logind sees the power key directly
-rather than through sway.
+Holding the power key still shuts down cleanly from here too. The ~2 s path needs sway, but
+logind's 5 s and the AXP223's 10 s hardware cut do not — see [The power button](#the-power-button).
 
 Two other things happen on first boot without any input:
 
@@ -63,8 +63,8 @@ Alt is the modifier throughout — the uConsole keyboard has no Super key.
 | `Alt`+`Shift`+`h/j/k/l` | Move window within the layout |
 | `Alt`+`Shift`+`c` | Reload sway config |
 | `Print` | Region screenshot |
-| Power button (short) | Blank, lock and enter low power; press again to restore |
-| Power button (~5 s) | Clean poweroff |
+| Power button (tap) | Blank, lock and enter low power; press again to restore |
+| Power button (~2 s) | Clean poweroff — fires while you are still holding |
 
 The trackball has no scroll wheel: **hold the right button and roll** to scroll.
 
@@ -86,12 +86,20 @@ ta          # attach to the restored session, or start one
 tmux keeps its stock appearance — green status bar at the bottom — deliberately, so it sits
 opposite waybar rather than stacking a second bar at the top.
 
-Continuum saves every 15 minutes and restores when the tmux server starts. A `tmux.service`
-user unit starts that server at login, so after a reboot your session is already back —
-`ta` just attaches to it. Pane contents and vim sessions are restored, not just the layout.
+A `tmux.service` user unit starts the server at login, and continuum restores into it — so
+after a reboot your session is already back and `ta` just attaches. Pane contents and
+running programs come back, not merely the layout.
 
-To save immediately rather than waiting for the interval: `prefix + Ctrl-s`.
-To restore by hand: `prefix + Ctrl-r`.
+**Saving happens on the way down, not only on a timer.** `tmux.service` forces a
+tmux-resurrect save in `ExecStop` before the server is killed, so a poweroff — by power
+button, `systemctl poweroff`, or the low-voltage guard — keeps what you had. Continuum's
+own interval is 5 minutes and exists as the safety net for *unclean* stops that `ExecStop`
+cannot help with: a crash, a battery pull, a forced power cut.
+
+That distinction is not academic. With the timer alone, a `vim` started after the last tick
+was simply gone after a poweroff, and the saved state still showed the pane at a shell.
+
+To save immediately: `prefix + Ctrl-s`. To restore by hand: `prefix + Ctrl-r`.
 
 ## LTE
 
@@ -258,6 +266,78 @@ alive.
 **Wi-Fi off means no SSH while blanked.** That is why the recovery path is
 `Ctrl`+`Alt`+`F2` rather than SSH — see above. Set `RADIO_OFF_ON_BLANK=0` to keep the
 machine reachable.
+
+## Coming back where you left off
+
+There is no suspend on this hardware, and a blanked machine still draws ~3.2 W of SoC,
+DSI panel and RP1 that userspace cannot switch off. The only state that reaches zero is
+**off** — so instead of sleeping, this image powers off and puts your desktop back.
+
+Nothing to run and nothing to remember. `uconsole-session-snapshot` records what is open
+while sway runs; `uconsole-session-restore` replays it at the next login.
+
+```bash
+journalctl -t uconsole-session-restore -b     # what came back, and where
+```
+
+**What decides a restore is the boot id.** The snapshot carries the one it was written
+under; a differing one means the machine went down and came back. Nothing is written at
+shutdown, so a crash, a battery pull and the low-voltage guard all restore identically to
+a deliberate poweroff.
+
+**It restores at login, not at boot.** There is no autologin, so the sequence is power on
+→ log in → desktop returns.
+
+| Restored | Not restored |
+|---|---|
+| Which applications were open | The split/tabbed/stacked container tree |
+| Which workspace each window was on | Anything *inside* an application |
+| Fullscreen, floating, geometry, focus | Programs started in a **bare** terminal |
+| tmux terminals, reattached to their session | |
+
+That last exclusion is the one to know: the snapshot records the *terminal's* command
+line, so a plain `foot` comes back as a shell and whatever you were running inside it is
+gone. Running things inside **tmux** is what makes them survive, which is why tmux ships
+pre-configured. Firefox restores its own tabs and windows; a `policies.json` sets
+`browser.startup.page=3` so it will.
+
+Sway has no layout save/restore of its own — `append_layout` was
+[closed unmerged](https://github.com/swaywm/sway/pull/3022) — which is why the container
+tree is out of scope rather than merely unimplemented.
+
+Policy lives in `/etc/uconsole/lowpower.conf`:
+
+```bash
+SESSION_RESTORE=1          # 0 disables it entirely
+SESSION_RESTORE_SKIP=""    # app_ids NOT to relaunch; empty restores everything
+SESSION_RESTORE_MAX=10     # cap on how many applications a restore will launch
+```
+
+`SESSION_RESTORE_SKIP` is a **denylist** on purpose. An allowlist has to be edited every
+time you install something, and until you do, that application silently fails to come
+back with nothing said anywhere.
+
+## The power button
+
+```
+tap        blank, lock, radios and CPU down
+~2 s       clean poweroff, while you are still holding
+5 s        clean poweroff (logind, if the 2 s path is unavailable)
+10 s       hardware power cut (AXP223) — unclean, for a wedged kernel only
+```
+
+The 2 s threshold is `POWERKEY_HOLD_MS` in `/etc/uconsole/lowpower.conf`.
+
+The shorter paths do not remove the longer ones. logind's 5 s is a compile-time constant
+with no setting in any systemd version ([systemd#28100](https://github.com/systemd/systemd/issues/28100)),
+and the AXP223 register offers only 4/6/8/10 s — parked at 10 s deliberately, because a
+clean shutdown takes about 8 s from the press and anything shorter would cut power
+mid-unmount. So the 2 s path is measured by sway, which already sees the key.
+
+It fires on a **timer**, but the timer does not trust the release event: when it expires
+it asks the kernel whether the key is still physically held. A tap therefore cannot power
+the machine off even if the release binding is missed entirely, and every failure — no
+device, `evtest` missing, key already up — lands on doing nothing.
 
 ## Measuring power draw
 

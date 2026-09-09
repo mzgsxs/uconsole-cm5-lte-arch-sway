@@ -348,7 +348,27 @@ check "screen toggle script present"   "[[ -x $MNT/usr/local/bin/uconsole-screen
 check "screen toggle uses backlight"   "grep -q 'brightnessctl' $MNT/usr/local/bin/uconsole-screen-toggle"
 check "logind ignores short power press" "grep -q 'HandlePowerKey=ignore' $MNT/etc/systemd/logind.conf.d/uconsole-powerkey.conf"
 check "long press powers off"          "grep -q 'HandlePowerKeyLongPress=poweroff' $MNT/etc/systemd/logind.conf.d/uconsole-powerkey.conf"
-check "sway binds the power key"       "grep -q 'XF86PowerOff exec /usr/local/bin/uconsole-screen-toggle' $MNT/etc/skel/.config/sway/config"
+check "sway binds the power key"       "grep -q 'XF86PowerOff exec /usr/local/bin/uconsole-powerkey-hold' $MNT/etc/skel/.config/sway/config"
+# Two bindings, press and release, so the hold can be timed. logind's long-press
+# is a hardcoded 5s with no setting in any systemd version (systemd#28100), and
+# the AXP223 offers only 4/6/8/10s and is parked at 10s so it never beats a clean
+# shutdown -- so measuring here is the only way to get a shorter one.
+check "power key press binding"        "grep -q 'XF86PowerOff exec /usr/local/bin/uconsole-powerkey-hold press' $MNT/etc/skel/.config/sway/config"
+check "power key release binding"      "grep -q 'XF86PowerOff exec /usr/local/bin/uconsole-powerkey-hold release' $MNT/etc/skel/.config/sway/config"
+check "powerkey hold script present"   "[[ -x $MNT/usr/local/bin/uconsole-powerkey-hold ]]"
+check "powerkey hold script parses"    "bash -n $MNT/usr/local/bin/uconsole-powerkey-hold"
+# THE safety property. The timer must not trust the release event: when it fires
+# it asks the kernel whether the key is still physically held, so a tap cannot
+# power the machine off even if the release binding is missed entirely.
+check "hold timer re-checks the key"   "grep -q 'evtest --query' $MNT/usr/local/bin/uconsole-powerkey-hold"
+check "hold fires only when still down" "grep -q 'eq 10 \]\] || exit 0' $MNT/usr/local/bin/uconsole-powerkey-hold"
+# The INPUT device is axp20x-pek while the platform device is axp221-pek, so a
+# pattern like axp[0-9]*-pek matches nothing -- and an empty result makes press()
+# a no-op that looks exactly like a safety pass. It did, until testing caught it.
+check "power key found by name"        "grep -q 'name ~ /-pek\"/' $MNT/usr/local/bin/uconsole-powerkey-hold"
+check "hold threshold is configurable" "grep -qE '^POWERKEY_HOLD_MS=[0-9]+$' $MNT/etc/uconsole/lowpower.conf"
+# evtest is what makes the timer safe; without it the guard cannot run at all.
+check "evtest installed for the guard" "[[ -x $MNT/usr/bin/evtest ]]"
 # Without --locked sway refuses to run a binding while a locker is active, so the
 # power key would stop working the instant swaylock started -- no way back from
 # a blanked screen.
@@ -527,7 +547,7 @@ check "restore takes the lock"         "grep -q 'O_CREAT | os.O_EXCL' $MNT/usr/l
 # stopped recording, and a next boot with nothing to restore from.
 check "restore reclaims a stale lock"  "grep -q 'clearing a stale restore lock' $MNT/usr/local/bin/uconsole-session-restore"
 # Otherwise an uninstalled app costs the full window timeout, per app, at login.
-check "restore skips missing apps"     "grep -q 'not installed any more' $MNT/usr/local/bin/uconsole-session-restore"
+check "restore skips missing apps"     "grep -q 'is gone; skipping' $MNT/usr/local/bin/uconsole-session-restore"
 # The boot id is what distinguishes a resume from an ordinary re-login. Without
 # it a logout and login would duplicate every window.
 check "restore is gated on boot id"    "grep -q 'snap.get(\"boot_id\") == now_boot' $MNT/usr/local/bin/uconsole-session-restore"

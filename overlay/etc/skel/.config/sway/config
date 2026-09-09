@@ -142,7 +142,7 @@ bindsym --locked XF86AudioMute exec wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle
 # (systemd#28100 is the open request), and the AXP223's register offers only
 # 4/6/8/10s -- parked at 10s deliberately, since a clean shutdown takes about 8s
 # from the press and anything shorter would cut power mid-unmount. Measuring the
-# hold here is the only way to get 3s.
+# hold here is the only way to get anything shorter.
 #
 # The press binding arms a timer. That is only safe because the timer does not
 # trust the release event: when it expires it asks the KERNEL whether the key is
@@ -157,8 +157,8 @@ bindsym --locked XF86AudioMute exec wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle
 # the power key stopped working the moment the screen locked -- no way back.
 #
 # Suspend is deliberately NOT used, and not for the reason an earlier version of
-# this comment gave. That version claimed the kernel had no sleep states at all;
-# on this build it has two. /sys/power/mem_sleep reads "s2idle [deep]", so a
+# this comment gave. That version claimed the kernel registered nothing of the
+# sort; on this build it registers two. /sys/power/mem_sleep reads "s2idle [deep]", so a
 # reader who checks sysfs will conclude this warning is obsolete. It is not:
 #
 #   deep    is not suspend-to-RAM on BCM2712. Broadcom never shipped the DDR
