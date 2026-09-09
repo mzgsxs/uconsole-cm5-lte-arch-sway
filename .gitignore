@@ -25,3 +25,7 @@ build/*.log
 # ---- Local / OS noise ------------------------------------------------------
 .DS_Store
 *.swp
+
+# python bytecode from local syntax checks; must never reach the image
+__pycache__/
+*.pyc

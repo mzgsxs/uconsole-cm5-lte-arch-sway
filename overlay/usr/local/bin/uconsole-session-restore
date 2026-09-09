@@ -1,0 +1,404 @@
+#!/usr/bin/env python3
+"""Put back the applications that were open before the machine powered off.
+
+Runs once, from sway's config, at login. Reads the snapshot written by
+uconsole-session-snapshot and relaunches what was there, on the workspace it was
+on, fullscreen or not as it was.
+
+WHAT DECIDES WHETHER TO RESTORE
+
+The boot id. The snapshot carries the boot_id it was written under; if that
+matches the running kernel's, these windows are from THIS boot and are either
+already on screen or were deliberately closed -- restoring would duplicate them.
+A differing boot id means the machine went down and came back, which is the only
+case that is a resume. No shutdown hook, no marker file written at poweroff,
+nothing to race: the fact we need is already in the snapshot.
+
+WHAT IS AND IS NOT RESTORED
+
+Restored: which application, which workspace, fullscreen state, floating state
+and geometry, and which window had focus.
+
+NOT restored: the split/tabbed/stacked container tree. Reconstructing an i3 tree
+is a much larger job and this machine is overwhelmingly one window per workspace
+-- `default_border none` plus the blanket `for_window fullscreen enable` see to
+that. Attempting it halfway would produce layouts subtly unlike what you left.
+
+NOT restored, on purpose: anything inside an application. Firefox restores its
+own tabs and tmux-resurrect restores tmux. This only knows about window
+geometry, which is exactly what neither of them tracks.
+
+THE FULLSCREEN RULE INVERTS THE WORK
+
+`for_window [app_id=".*"] fullscreen enable` means every window arrives
+fullscreen already. So the work is not applying fullscreen to the ones that had
+it -- it is REMOVING it from the ones that did not. Getting this backwards
+produces a desktop where nothing is where you left it.
+"""
+
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+
+CONF = "/etc/uconsole/lowpower.conf"
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+STATE_DIR = os.path.join(
+    os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+    "uconsole")
+SNAPSHOT = os.path.join(STATE_DIR, "session.json")
+DONE = os.path.join(STATE_DIR, "session.restored")
+LOCK = os.path.join(RUNTIME, "uconsole-session.lock")
+
+WINDOW_TIMEOUT_S = 25.0     # first window of a launched process
+EXTRA_TIMEOUT_S = 10.0      # each further window the same process opens
+POLL_S = 0.25
+
+
+def log(msg):
+    subprocess.run(["logger", "-t", "uconsole-session-restore", msg], check=False)
+    if sys.stdout.isatty():
+        print(f"[uconsole-session-restore] {msg}")
+
+
+def conf():
+    """Read the shell-syntax policy file without sourcing it."""
+    values = {}
+    try:
+        with open(CONF) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                if k.strip().isidentifier():
+                    values[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return values
+
+
+def sway_json(*args):
+    try:
+        out = subprocess.run(["swaymsg", "-r", *args],
+                             capture_output=True, text=True, timeout=10)
+        return json.loads(out.stdout) if out.returncode == 0 else None
+    except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
+        return None
+
+
+def sway_cmd(command):
+    try:
+        subprocess.run(["swaymsg", "-q", "-t", "command", command],
+                       capture_output=True, timeout=10)
+    except (subprocess.SubprocessError, OSError):
+        pass
+
+
+def boot_id():
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def leaves(node, acc):
+    for child in node.get("nodes", []) + node.get("floating_nodes", []):
+        if (child.get("app_id") or (child.get("window_properties") or {}).get("class")):
+            acc.append(child)
+        leaves(child, acc)
+    return acc
+
+
+def current_windows():
+    tree = sway_json("-t", "get_tree")
+    return leaves(tree, []) if tree else []
+
+
+def wait_for_new(before_ids, want, timeout):
+    """Wait for `want` windows that did not exist before, newest last."""
+    found, deadline = [], time.time() + timeout
+    while time.time() < deadline and len(found) < want:
+        for w in current_windows():
+            if w["id"] not in before_ids and w["id"] not in [f["id"] for f in found]:
+                found.append(w)
+                if len(found) >= want:
+                    break
+        if len(found) < want:
+            time.sleep(POLL_S)
+    return found
+
+
+def tmux_ready(timeout=20.0):
+    """Wait for the tmux server, which continuum restores sessions into.
+
+    Launching `tmux attach` before the server has finished restoring lands you
+    in an empty session instead of the one you left.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            r = subprocess.run(["tmux", "has-session"],
+                               capture_output=True, timeout=5)
+            if r.returncode == 0:
+                return True
+        except (subprocess.SubprocessError, OSError):
+            pass
+        time.sleep(0.5)
+    return False
+
+
+def launch_command(proc):
+    """Build the shell command that recreates this process."""
+    cmd = list(proc.get("cmdline") or [])
+    if not cmd:
+        return None
+
+    # Prefer the name the desktop knows the app by over the binary /proc
+    # reported. Firefox records as /usr/lib/firefox/firefox, and launching that
+    # directly bypasses whatever /usr/bin/firefox does -- on Arch a wrapper that
+    # sets up the environment, not necessarily a bare symlink.
+    #
+    # Only when argv[0] is an ABSOLUTE path and the app_id resolves in PATH: a
+    # command already recorded by name is left exactly as it was.
+    app_id = proc.get("app_id") or ""
+    if cmd[0].startswith("/") and app_id and shutil.which(app_id):
+        cmd[0] = app_id
+
+    session = proc.get("tmux_session")
+    if session:
+        # Come back attached to the same tmux session rather than a bare prompt.
+        # new-session -A attaches if it exists and creates it if it does not, so
+        # this is safe even when continuum restored nothing.
+        cmd = [cmd[0], "-e", "tmux", "new-session", "-A", "-s", session]
+
+    line = " ".join(shlex.quote(c) for c in cmd)
+
+    # A terminal launched from sway inherits sway's cwd, which is "/". Restoring
+    # that faithfully would drop you in the root directory instead of at home,
+    # which is worse than not restoring the directory at all. Only honour a cwd
+    # that someone plausibly chose.
+    cwd = proc.get("cwd") or ""
+    if cwd and cwd not in ("/", os.sep) and os.path.isdir(cwd):
+        line = f"cd {shlex.quote(cwd)} && exec {line}"
+    return line
+
+
+def place(con_id, want):
+    """Put one restored window on its workspace, with its recorded geometry.
+
+    Order matters. Fullscreen comes OFF first, because moving a fullscreen
+    container to another workspace leaves two of them competing for fullscreen on
+    the destination. Then move, then geometry, then fullscreen back on if it had
+    it. Every window goes through the same sequence, so a process's second window
+    is not a special case.
+    """
+    sel = f'[con_id={con_id}]'
+    sway_cmd(f"{sel} fullscreen disable")
+
+    ws = want.get("workspace") or {}
+    ws_num = ws.get("num")
+    if isinstance(ws_num, int) and ws_num > 0:
+        sway_cmd(f"{sel} move container to workspace number {ws_num}")
+    elif ws.get("name"):
+        sway_cmd(f"{sel} move container to workspace {ws['name']}")
+
+    if want.get("floating"):
+        sway_cmd(f"{sel} floating enable")
+        r = want.get("rect") or {}
+        if all(k in r for k in ("x", "y", "width", "height")):
+            sway_cmd(f"{sel} resize set {int(r['width'])} {int(r['height'])}")
+            sway_cmd(f"{sel} move absolute position {int(r['x'])} {int(r['y'])}")
+
+    if want.get("fullscreen"):
+        sway_cmd(f"{sel} fullscreen enable")
+
+
+def take_lock():
+    """Claim the restore lock, reclaiming it if the holder is gone.
+
+    The pid inside the lock is not decoration. A restore killed before its
+    `finally` runs -- SIGKILL, or sway dying mid-restore -- used to leave the file
+    behind forever, and the snapshotter skips writing whenever it exists. The
+    result was a session that silently stopped recording, and a next boot with
+    nothing to restore from. Check the holder rather than trusting the file.
+    """
+    for attempt in (1, 2):
+        try:
+            fd = os.open(LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            return True
+        except OSError:
+            if attempt == 2:
+                return False
+            try:
+                holder = int(open(LOCK).read().strip() or 0)
+                os.kill(holder, 0)      # raises if the holder is gone
+                return False            # a real restore is running
+            except (OSError, ValueError):
+                log("clearing a stale restore lock")
+                try:
+                    os.unlink(LOCK)
+                except OSError:
+                    return False
+    return False
+
+
+def main():
+    if not os.environ.get("SWAYSOCK"):
+        return 0
+
+    cfg = conf()
+    if cfg.get("SESSION_RESTORE", "1") != "1":
+        return 0
+
+    try:
+        with open(SNAPSHOT) as f:
+            snap = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return 0
+
+    now_boot = boot_id()
+    if not now_boot or snap.get("boot_id") == now_boot:
+        # Same boot: these windows are already on screen. Not a resume.
+        return 0
+    try:
+        with open(DONE) as f:
+            if f.read().strip() == now_boot:
+                return 0        # already restored once this boot
+    except OSError:
+        pass
+
+    # A DENYLIST, not an allowlist. An allowlist defaulting to "foot firefox"
+    # meant every other application the user ever installs is dropped silently,
+    # which is the wrong default for a general-purpose machine: you install
+    # something, use it, power off, and it does not come back with no
+    # explanation anywhere. Restore everything with a usable command line, and
+    # let the user name the exceptions.
+    skip = (cfg.get("SESSION_RESTORE_SKIP") or "").split()
+    limit = int(cfg.get("SESSION_RESTORE_MAX") or 10)
+
+    procs = [p for p in snap.get("processes", []) if p.get("app_id") not in skip]
+    dropped = [p.get("app_id") for p in snap.get("processes", []) if p.get("app_id") in skip]
+    if dropped:
+        log(f"skipping by policy: {' '.join(sorted(set(dropped)))}")
+    if not procs:
+        return 0
+    if len(procs) > limit:
+        log(f"snapshot has {len(procs)} applications; restoring the first {limit}")
+        procs = procs[:limit]
+
+    # Hold the lock for the whole restore. The snapshotter skips writing while it
+    # exists, so it cannot capture the half-restored desktop we are building and
+    # overwrite the thing we are reading from.
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    if not take_lock():
+        log("another restore holds the lock; doing nothing")
+        return 0
+
+    try:
+        log(f"restoring {len(procs)} application(s) from "
+            f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(snap.get('saved_at', 0)))}")
+        if any(p.get("tmux_session") for p in procs):
+            tmux_ready()
+
+        focus_target = None
+        for proc in procs:
+            cmd = launch_command(proc)
+            if not cmd:
+                continue
+            # Skip an application that has since been uninstalled, rather than
+            # spending the full window timeout waiting for a window that cannot
+            # appear -- 25s of a login, per missing app.
+            #
+            # Checked against the recorded COMMAND, never the app_id: sway reports
+            # XWayland windows by WM_CLASS, which is conventionally capitalised
+            # ("Gimp", "Zoom"), and no such name resolves in PATH. Using app_id
+            # here would skip every X11 application as though it were missing.
+            exe = (proc.get("cmdline") or [""])[0]
+            if not exe or (not os.path.exists(exe) and not shutil.which(exe)):
+                log(f"{proc.get('app_id')}: {exe or 'no command'} is gone; skipping")
+                continue
+            wins = proc.get("windows") or []
+            first = wins[0] if wins else {}
+            ws = (first.get("workspace") or {})
+            ws_num = ws.get("num")
+
+            # Switch workspace BEFORE launching, never move afterwards. The
+            # blanket fullscreen rule fires on the workspace the window is born
+            # on, and moving an already-fullscreen container between workspaces
+            # leaves two of them competing on the destination.
+            if isinstance(ws_num, int) and ws_num > 0:
+                sway_cmd(f"workspace number {ws_num}")
+            elif ws.get("name"):
+                sway_cmd(f"workspace {ws['name']}")
+
+            before = {w["id"] for w in current_windows()}
+            # Launch via a throwaway script rather than inlining the command.
+            # sway's parser splits command lists on ";" and ",", so any captured
+            # command line containing a comma would be torn in half -- and the
+            # shell "cd ... && exec ..." wrapper makes that more likely, not less.
+            # A script path contains neither character by construction.
+            runner = os.path.join(RUNTIME, f"uconsole-restore-{os.getpid()}.sh")
+            try:
+                with open(os.open(runner, os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                                  0o700), "w") as f:
+                    f.write("#!/bin/sh\n" + cmd + "\n")
+            except OSError as e:
+                log(f"could not write launcher: {e}")
+                continue
+            sway_cmd(f"exec /bin/sh {runner}")
+
+            # One launch per PROCESS. Firefox is a single process with N windows
+            # and reopens them all itself; launching once per window would start
+            # N browsers.
+            got = wait_for_new(before, 1, WINDOW_TIMEOUT_S)
+            try:
+                os.unlink(runner)          # sh has read it by now
+            except OSError:
+                pass
+            if not got:
+                log(f"{proc.get('app_id')}: no window appeared; skipping")
+                continue
+
+            # Wait for the rest of this process's windows, then place each on
+            # its own recorded workspace.
+            #
+            # Pairing is by ARRIVAL order against SNAPSHOT order, which is
+            # arbitrary for two windows of the same application -- there is no
+            # way to tell which browser window is which after a restart, and
+            # swayrst's README says as much. Arbitrary but deterministic beats
+            # the previous behaviour, where windows 2..N silently piled onto
+            # window 1's workspace.
+            if len(wins) > 1:
+                got += wait_for_new(before | {g["id"] for g in got},
+                                    len(wins) - 1, EXTRA_TIMEOUT_S)
+
+            for window, want in zip(got, wins):
+                place(window["id"], want)
+                if want.get("focused"):
+                    focus_target = window["id"]
+            log(f"{proc.get('app_id')}: {len(got)} of {len(wins)} window(s) on "
+                f"workspace(s) {[w.get('workspace', {}).get('num') for w in wins[:len(got)]]}")
+
+        if focus_target is not None:
+            sway_cmd(f"[con_id={focus_target}] focus")
+
+        with open(os.open(DONE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+            f.write(now_boot)
+        log("done")
+    finally:
+        try:
+            os.unlink(LOCK)
+        except OSError:
+            pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

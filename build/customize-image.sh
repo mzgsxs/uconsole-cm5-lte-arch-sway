@@ -34,6 +34,7 @@ cp -a /work/overlay/. "$MNT/"
 # the image correct on one host and quietly broken on another.
 chown -R root:root "$MNT/usr/local/bin" "$MNT/etc/systemd" "$MNT/etc/skel" 2>/dev/null || true
 [[ -d $MNT/etc/uconsole ]] && chown -R root:root "$MNT/etc/uconsole"
+[[ -d $MNT/etc/firefox ]]  && chown -R root:root "$MNT/etc/firefox"
 # sudo silently IGNORES a drop-in that is group- or world-writable, or not owned
 # by root -- it warns to syslog and carries on without the rule. That failure is
 # invisible until a key binding quietly stops being able to switch the radios

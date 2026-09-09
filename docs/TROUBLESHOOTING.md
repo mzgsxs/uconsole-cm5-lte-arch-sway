@@ -250,6 +250,79 @@ directly rather than through the compositor.
 
 ---
 
+## Black screen after powering on from fully off
+
+The panel failed to initialise. It is a cold-boot problem, not a software one, and it lies
+about itself: `status=connected enabled=enabled`, `fb0` present, backlight at its normal
+level, nothing on screen. The tell is in dmesg:
+
+```bash
+sudo dmesg | grep -E 'cwu50|Receive failed'
+```
+
+`[drm] Receive failed` means a DSI command read-back failed during init. Compare the
+retries — a bad boot shows about six `regulator isn't ready`, a good one shows one.
+
+**Recover with a warm reboot, not another power cycle.** Press `Ctrl`+`Alt`+`F2`, then
+`Ctrl`+`Alt`+`Del`. No login needed. Powering off and on again is another *cold* boot,
+which is the case this panel is worst at, so the instinctive fix can loop.
+
+If sway was running, the VT switch matters: a compositor holds the seat, so
+`Ctrl`+`Alt`+`Del` alone never reaches the kernel's VT layer.
+
+## The machine powers off when I meant to blank the screen
+
+`POWERKEY_HOLD_MS` in `/etc/uconsole/lowpower.conf` is the hold that triggers a clean
+poweroff, 2000 ms by default. Raise it if that is too easy to hit by accident.
+
+```bash
+journalctl -t uconsole-powerkey-hold -b
+```
+
+A line reading `held 2000ms with the key still down; clean poweroff` means the hold path
+fired. If you see nothing there but the machine still powered off after about five
+seconds, that was logind's own long-press, which is a hardcoded 5 s and cannot be changed.
+
+## A long press does not power the machine off
+
+If the kernel is healthy, hold for 5 s and logind will do it even when the 2 s path is
+unavailable. If the machine is genuinely wedged, only the AXP223's hardware cut remains
+and that needs a **full, uninterrupted 10 seconds** — considerably longer than it feels,
+which is why it often seems not to work.
+
+That 10 s is deliberate and should not be lowered. A clean shutdown takes about 8 s from
+the press (5 s for logind plus 2–3 s of shutdown), so the next value down — 8 s — would cut
+power mid-unmount. Check what is set with:
+
+```bash
+cat /sys/bus/platform/devices/*pek*/startup /sys/bus/platform/devices/*pek*/shutdown
+```
+
+Expect `128` and `10000`. If `startup` reads `3000`, `uconsole-powerkey-tune` has not run
+and every press is taking three seconds longer than it should.
+
+## My session did not come back after a poweroff
+
+```bash
+journalctl -t uconsole-session-restore -b
+```
+
+Nothing at all means the restore did not consider this a resume. It is gated on the boot
+id in the snapshot, so check they differ:
+
+```bash
+cat /proc/sys/kernel/random/boot_id
+python3 -m json.tool ~/.local/state/uconsole/session.json | grep boot_id
+```
+
+Two other causes worth knowing. **The restore runs at login, not at boot** — there is no
+autologin, so nothing happens until you log in on tty1. And **a program started in a bare
+terminal is never restored**: the snapshot records the terminal's own command line, so
+`foot` comes back as a shell. Run things inside tmux if you want them to survive.
+
+If an application is missing from the restore, it may be named in `SESSION_RESTORE_SKIP`,
+or the snapshot may predate it — skips are logged either way.
+
 ## Anything involving suspend hangs the machine
 
 `systemctl suspend` is masked in this image and `/sys/power/state` should not be written

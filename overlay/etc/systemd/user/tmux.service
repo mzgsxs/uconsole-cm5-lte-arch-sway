@@ -7,6 +7,17 @@ Type=forking
 # Starting the server fires tmux-continuum's restore hook, which is what brings
 # the previous sessions back after a reboot.
 ExecStart=/usr/bin/tmux new-session -d -s main
+# Force a tmux-resurrect save BEFORE the server dies.
+#
+# Without this, the only saves are continuum's timer -- so a poweroff discards
+# everything since the last one. That is not hypothetical: a vim session started
+# after the 15-minute mark was simply gone after a power-button shutdown, and the
+# saved state still showed the pane running bash.
+#
+# ExecStop lines run in order, so this saves and then kills. Leading '-' because
+# a missing plugin must not block the shutdown. %h is the user's home, so this
+# works for whatever account the first-boot wizard created.
+ExecStop=-/usr/bin/tmux run-shell %h/.tmux/plugins/tmux-resurrect/scripts/save.sh
 ExecStop=/usr/bin/tmux kill-server
 
 [Install]

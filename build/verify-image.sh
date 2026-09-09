@@ -348,7 +348,27 @@ check "screen toggle script present"   "[[ -x $MNT/usr/local/bin/uconsole-screen
 check "screen toggle uses backlight"   "grep -q 'brightnessctl' $MNT/usr/local/bin/uconsole-screen-toggle"
 check "logind ignores short power press" "grep -q 'HandlePowerKey=ignore' $MNT/etc/systemd/logind.conf.d/uconsole-powerkey.conf"
 check "long press powers off"          "grep -q 'HandlePowerKeyLongPress=poweroff' $MNT/etc/systemd/logind.conf.d/uconsole-powerkey.conf"
-check "sway binds the power key"       "grep -q 'XF86PowerOff exec /usr/local/bin/uconsole-screen-toggle' $MNT/etc/skel/.config/sway/config"
+check "sway binds the power key"       "grep -q 'XF86PowerOff exec /usr/local/bin/uconsole-powerkey-hold' $MNT/etc/skel/.config/sway/config"
+# Two bindings, press and release, so the hold can be timed. logind's long-press
+# is a hardcoded 5s with no setting in any systemd version (systemd#28100), and
+# the AXP223 offers only 4/6/8/10s and is parked at 10s so it never beats a clean
+# shutdown -- so measuring here is the only way to get a shorter one.
+check "power key press binding"        "grep -q 'XF86PowerOff exec /usr/local/bin/uconsole-powerkey-hold press' $MNT/etc/skel/.config/sway/config"
+check "power key release binding"      "grep -q 'XF86PowerOff exec /usr/local/bin/uconsole-powerkey-hold release' $MNT/etc/skel/.config/sway/config"
+check "powerkey hold script present"   "[[ -x $MNT/usr/local/bin/uconsole-powerkey-hold ]]"
+check "powerkey hold script parses"    "bash -n $MNT/usr/local/bin/uconsole-powerkey-hold"
+# THE safety property. The timer must not trust the release event: when it fires
+# it asks the kernel whether the key is still physically held, so a tap cannot
+# power the machine off even if the release binding is missed entirely.
+check "hold timer re-checks the key"   "grep -q 'evtest --query' $MNT/usr/local/bin/uconsole-powerkey-hold"
+check "hold fires only when still down" "grep -q 'eq 10 \]\] || exit 0' $MNT/usr/local/bin/uconsole-powerkey-hold"
+# The INPUT device is axp20x-pek while the platform device is axp221-pek, so a
+# pattern like axp[0-9]*-pek matches nothing -- and an empty result makes press()
+# a no-op that looks exactly like a safety pass. It did, until testing caught it.
+check "power key found by name"        "grep -q 'name ~ /-pek\"/' $MNT/usr/local/bin/uconsole-powerkey-hold"
+check "hold threshold is configurable" "grep -qE '^POWERKEY_HOLD_MS=[0-9]+$' $MNT/etc/uconsole/lowpower.conf"
+# evtest is what makes the timer safe; without it the guard cannot run at all.
+check "evtest installed for the guard" "[[ -x $MNT/usr/bin/evtest ]]"
 # Without --locked sway refuses to run a binding while a locker is active, so the
 # power key would stop working the instant swaylock started -- no way back from
 # a blanked screen.
@@ -500,6 +520,78 @@ check "wake restores WAN mode"         "grep -q 'wan mode restored' $MNT/usr/loc
 check "unstick uses the transient unit" "grep -q 'systemd-run --unit=uconsole-modem-wake' $MNT/usr/local/bin/uconsole-unstick"
 check "uconsole-wan persists its mode" "grep -q 'MODE_FILE=/var/lib/uconsole/wan-mode' $MNT/usr/local/bin/uconsole-wan"
 check "wan mode saved for all 3 modes" "[[ \$(grep -c '^    save_mode ' $MNT/usr/local/bin/uconsole-wan) -eq 3 ]]"
+
+echo "-- session restore (Stage 2) --"
+check "session snapshot present"       "[[ -x $MNT/usr/local/bin/uconsole-session-snapshot ]]"
+check "session restore present"        "[[ -x $MNT/usr/local/bin/uconsole-session-restore ]]"
+# Parsed with the IMAGE's python3, not the host's -- the base container has no
+# python at all, so a host-side check reports "command not found" as a failure.
+#
+# ast.parse, NOT py_compile: py_compile WRITES __pycache__ next to the source, so
+# verifying the image would leave build artifacts inside /usr/local/bin on the
+# card it is meant to be checking. Verification must not modify what it verifies.
+check "session snapshot parses"        "chroot $MNT /usr/bin/python3 -c \"import ast;ast.parse(open('/usr/local/bin/uconsole-session-snapshot').read())\""
+check "session restore parses"         "chroot $MNT /usr/bin/python3 -c \"import ast;ast.parse(open('/usr/local/bin/uconsole-session-restore').read())\""
+check "no python bytecode in the image" "[[ -z \$(find $MNT/usr/local/bin $MNT/etc -name '__pycache__' -o -name '*.pyc' 2>/dev/null | head -1) ]]"
+check "sway starts the restore"        "grep -q 'exec /usr/local/bin/uconsole-session-restore' $MNT/etc/skel/.config/sway/config"
+check "sway starts the snapshotter"    "grep -q 'exec /usr/local/bin/uconsole-session-snapshot' $MNT/etc/skel/.config/sway/config"
+# Order matters: the restore takes a lock the snapshotter honours. Reversed, the
+# snapshotter can capture the half-restored desktop and overwrite the file being
+# restored from -- destroying the session while appearing to work.
+check "restore is exec'd before snapshot" \
+      "[[ \$(grep -n 'uconsole-session-restore' $MNT/etc/skel/.config/sway/config | head -1 | cut -d: -f1) -lt \$(grep -n 'uconsole-session-snapshot' $MNT/etc/skel/.config/sway/config | head -1 | cut -d: -f1) ]]"
+check "snapshotter honours the lock"   "grep -q 'os.path.exists(LOCK)' $MNT/usr/local/bin/uconsole-session-snapshot"
+check "restore takes the lock"         "grep -q 'O_CREAT | os.O_EXCL' $MNT/usr/local/bin/uconsole-session-restore"
+# A restore killed before its `finally` runs used to leave the lock behind, and
+# the snapshotter skips writing whenever it exists -- a session that silently
+# stopped recording, and a next boot with nothing to restore from.
+check "restore reclaims a stale lock"  "grep -q 'clearing a stale restore lock' $MNT/usr/local/bin/uconsole-session-restore"
+# Otherwise an uninstalled app costs the full window timeout, per app, at login.
+check "restore skips missing apps"     "grep -q 'is gone; skipping' $MNT/usr/local/bin/uconsole-session-restore"
+# The boot id is what distinguishes a resume from an ordinary re-login. Without
+# it a logout and login would duplicate every window.
+check "restore is gated on boot id"    "grep -q 'snap.get(\"boot_id\") == now_boot' $MNT/usr/local/bin/uconsole-session-restore"
+check "snapshot stamps the boot id"    "grep -q '\"boot_id\": boot_id()' $MNT/usr/local/bin/uconsole-session-snapshot"
+# for_window makes EVERY window fullscreen, so the work is removing it from the
+# ones that were not. Applying it would be a no-op and leave the rest wrong.
+check "restore clears unwanted fullscreen" "grep -q 'fullscreen disable' $MNT/usr/local/bin/uconsole-session-restore"
+# Switch workspace, then launch. Moving an already-fullscreen container between
+# workspaces leaves two competing on the destination.
+check "restore switches workspace first" "grep -q 'Switch workspace BEFORE launching' $MNT/usr/local/bin/uconsole-session-restore"
+# Firefox is one process with N windows; launching per window starts N browsers.
+check "restore launches per process"   "grep -q 'One launch per PROCESS' $MNT/usr/local/bin/uconsole-session-restore"
+check "snapshot keyed on processes"    "grep -q '\"processes\":' $MNT/usr/local/bin/uconsole-session-snapshot"
+# Window titles are the most sensitive thing on screen and nothing in the restore
+# path needs them. Matched precisely: sway puts a window's title in the CHILD
+# node's "name", while a WORKSPACE's "name" is read from the workspace node and
+# is both needed and harmless. A looser pattern matches the docstring saying
+# titles are not recorded -- the same comment-matching trap as the gpiochip0 and
+# "no sleep states" checks.
+check "snapshot records no window titles" \
+      "[[ \$(grep -c 'child.get(\"name\")\|\"title\"' $MNT/usr/local/bin/uconsole-session-snapshot) -eq 0 ]]"
+check "snapshot is written 0600"       "grep -q '0o600' $MNT/usr/local/bin/uconsole-session-snapshot"
+check "snapshot never ships in skel"   "[[ ! -e $MNT/etc/skel/.local/state/uconsole/session.json ]]"
+check "restore policy is configurable" "grep -qE '^SESSION_RESTORE=[01]$' $MNT/etc/uconsole/lowpower.conf"
+# A denylist, so an application installed later comes back without editing config.
+check "restore skiplist ships"         "grep -q '^SESSION_RESTORE_SKIP=' $MNT/etc/uconsole/lowpower.conf"
+check "restore has no allowlist"       "[[ \$(grep -c 'SESSION_RESTORE_ALLOW' $MNT/etc/uconsole/lowpower.conf $MNT/usr/local/bin/uconsole-session-restore | awk -F: '{s+=\$2} END{print s+0}') -eq 0 ]]"
+# sway reports XWayland windows by WM_CLASS ("Gimp"), which never resolves in
+# PATH -- checking app_id here would skip every X11 app as uninstalled.
+check "missing-app check uses cmdline" "grep -q 'exe = (proc.get(\"cmdline\") or' $MNT/usr/local/bin/uconsole-session-restore"
+check "restore launch cap ships"       "grep -qE '^SESSION_RESTORE_MAX=[0-9]+$' $MNT/etc/uconsole/lowpower.conf"
+# Firefox exits CLEANLY at poweroff, so it will not restore tabs unless told to.
+check "firefox session policy ships"   "[[ -f $MNT/etc/firefox/policies/policies.json ]]"
+check "firefox policy is valid JSON"   "chroot $MNT /usr/bin/python3 -c \"import json;json.load(open('/etc/firefox/policies/policies.json'))\""
+check "firefox policy restores session" "grep -q 'browser.startup.page' $MNT/etc/firefox/policies/policies.json"
+# tmux-continuum restores into the server; attaching before it is up lands you
+# in an empty session instead of the one you left.
+check "restore waits for tmux"         "grep -q 'def tmux_ready' $MNT/usr/local/bin/uconsole-session-restore"
+# /proc reports Firefox as /usr/lib/firefox/firefox; relaunching that bypasses
+# whatever /usr/bin/firefox does. Prefer the name the desktop knows it by.
+check "restore prefers the PATH name"  "grep -q 'shutil.which(app_id)' $MNT/usr/local/bin/uconsole-session-restore"
+# A terminal launched from sway inherits sway's cwd of "/", so restoring it
+# faithfully drops you in the root directory instead of at home.
+check "restore ignores a cwd of /"     "grep -q 'cwd not in (\"/\", os.sep)' $MNT/usr/local/bin/uconsole-session-restore"
 
 echo "-- power measurement --"
 check "power probe present"            "[[ -x $MNT/usr/local/bin/uconsole-power-probe ]]"

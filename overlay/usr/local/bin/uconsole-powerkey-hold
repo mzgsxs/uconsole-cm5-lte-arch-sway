@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# uconsole-powerkey-hold {press|release}
+#
+# Give the power key a SHORTER long-press than logind can offer, and fire it
+# WHILE THE KEY IS STILL DOWN so you feel it happen.
+#
+# logind's long-press is a hardcoded 5 seconds -- LONG_PRESS_DURATION in its
+# source, with no setting for it in any systemd version (systemd#28100 is the
+# open request). The AXP223's own forced-off cannot help either: it offers only
+# 4/6/8/10s and is deliberately parked at 10s so it always loses the race to a
+# clean shutdown. So a sub-5s clean poweroff has to come from whoever else
+# already sees the key, and sway does.
+#
+# WHY IT FIRES ON A TIMER, AND WHY THAT IS SAFE HERE
+#
+# An earlier version decided on RELEASE instead: no timer, so nothing could ever
+# fire unexpectedly. Safe, but unusable -- you cannot feel the interval elapse
+# when nothing happens until you let go, so you are guessing at the duration
+# every time.
+#
+# The danger of a timer is that it is armed at press and cancelled at release: if
+# a release event is ever missed, it fires after an ordinary tap and the machine
+# powers off in your hands.
+#
+# That is closed by not trusting the release event at all. When the timer expires
+# it asks the KERNEL whether the key is still physically down, via evtest
+# --query, which reports live state rather than replaying events. A tap cannot
+# power the machine off, because by the time the timer expires the hardware says
+# the key is up -- regardless of whether the release binding ran, was dropped,
+# or never existed.
+#
+# Every failure mode therefore lands on "do nothing":
+#   evtest missing, device unreadable, query fails, key already up,
+#   press stamp gone  ->  no poweroff, and logind's 5s still applies underneath.
+set -uo pipefail
+
+CONF=/etc/uconsole/lowpower.conf
+POWERKEY_HOLD_MS=2000
+# shellcheck source=/dev/null
+[[ -r $CONF ]] && . "$CONF"
+
+RUNTIME="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+STAMP="$RUNTIME/uconsole-powerkey.down"
+TIMER="$RUNTIME/uconsole-powerkey.timer"
+TOGGLE=/usr/local/bin/uconsole-screen-toggle
+
+# Find the PMIC power key by name rather than hardcoding an event number: the
+# numbering depends on USB enumeration order and is not stable across boots.
+power_key_device() {
+    local dev
+    dev=$(awk '
+        /^N: Name=/ { name = $0 }
+        # Matched on "-pek" alone. The platform device is axp221-pek but the
+        # INPUT device is named axp20x-pek, so a pattern like axp[0-9]*-pek
+        # silently matches nothing -- and this function returning empty makes
+        # press() a no-op, which looks exactly like a safety pass.
+        /^H: Handlers=/ && name ~ /-pek"/ {
+            match($0, /event[0-9]+/); print substr($0, RSTART, RLENGTH); exit
+        }' /proc/bus/input/devices 2>/dev/null)
+    [[ -n $dev ]] && printf '/dev/input/%s' "$dev"
+}
+
+case "${1:-}" in
+press)
+    DEV="$(power_key_device)"
+    # No device means no way to confirm the key is still down later, so do not
+    # arm anything at all -- logind's 5s remains.
+    [[ -n $DEV ]] || exit 0
+
+    date +%s%N > "$STAMP" 2>/dev/null || true
+
+    # setsid so the timer is not tied to the lifetime of the transient shell sway
+    # spawns for this binding.
+    setsid bash -c '
+        sleep "$1"
+        # Cancelled by a release?
+        [[ -e "$2" ]] || exit 0
+        # Still physically held? This is the check that makes a timer safe.
+        evtest --query "$3" EV_KEY KEY_POWER
+        [[ $? -eq 10 ]] || exit 0
+        rm -f "$2"
+        logger -t uconsole-powerkey-hold "held $4ms with the key still down; clean poweroff"
+        # Nothing to flush first: the session snapshot is written continuously and
+        # tmux.service ExecStop forces a tmux-resurrect save on the way down.
+        systemctl poweroff
+    ' _ "$(awk "BEGIN{printf \"%.3f\", ${POWERKEY_HOLD_MS:-2000}/1000}")" \
+        "$STAMP" "$DEV" "${POWERKEY_HOLD_MS:-2000}" >/dev/null 2>&1 &
+    echo $! > "$TIMER" 2>/dev/null || true
+    ;;
+
+release)
+    # Cancel first, so a release that beats the timer always wins.
+    [[ -r $TIMER ]] && kill "$(cat "$TIMER")" 2>/dev/null
+    rm -f "$TIMER"
+
+    fired=0
+    [[ -e $STAMP ]] || fired=1     # the timer removed it, so it already acted
+    rm -f "$STAMP"
+
+    # If the timer already started a poweroff there is nothing useful left to do,
+    # and blanking the screen mid-shutdown would only be confusing.
+    (( fired )) && exit 0
+    exec "$TOGGLE"
+    ;;
+
+*)
+    echo "usage: uconsole-powerkey-hold {press|release}" >&2
+    exit 2 ;;
+esac
