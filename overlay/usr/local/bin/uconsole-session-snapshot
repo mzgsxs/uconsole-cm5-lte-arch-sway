@@ -197,12 +197,25 @@ def build():
             }
             order.append(pid)
         processes[pid]["windows"].append({
+            # con_id is kept only to sort by below, then dropped. sway allocates
+            # it monotonically, so it is creation order -- and an application
+            # restoring its own windows (Firefox) reopens them in creation order
+            # too. Recording them in TREE order instead would be workspace order,
+            # which agrees with creation order only by luck.
+            "_con_id": w["con_id"],
             "workspace": w["workspace"],
             "fullscreen": w["fullscreen"],
             "floating": w["floating"],
             "rect": w["rect"],
             "focused": w["focused"],
         })
+
+    # Creation order, so the restore's arrival-order pairing lines up with how
+    # the application reopens its own windows.
+    for proc in processes.values():
+        proc["windows"].sort(key=lambda w: w["_con_id"])
+        for w in proc["windows"]:
+            del w["_con_id"]
 
     return {
         "schema": SCHEMA,
