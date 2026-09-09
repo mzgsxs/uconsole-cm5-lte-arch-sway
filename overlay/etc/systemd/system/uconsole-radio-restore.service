@@ -1,0 +1,15 @@
+[Unit]
+Description=Restore radios after a low-power blank that never woke
+Documentation=file:///usr/local/bin/uconsole-radio-restore
+# After NetworkManager, not before: the NM radio flag is only settable once its
+# D-Bus interface is up, and rfkill unblocking is harmless at any point.
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/uconsole-radio-restore
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target

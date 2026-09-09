@@ -1,0 +1,9 @@
+# The low-power blank is triggered by a sway key binding, which runs as the
+# logged-in user and has nowhere to prompt for a password. Radios, cpufreq and
+# CPU hotplug all need root, so wheel gets passwordless access to exactly one
+# binary -- not to a shell, not to systemctl, and not to a wildcard.
+#
+# uconsole-lowpower is root-owned and mode 755, so a wheel user cannot edit what
+# this rule lets them run. It accepts only the literal words down, up and status
+# and evaluates nothing from its arguments.
+%wheel ALL=(root) NOPASSWD: /usr/local/bin/uconsole-lowpower

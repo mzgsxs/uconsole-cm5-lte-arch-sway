@@ -250,6 +250,108 @@ directly rather than through the compositor.
 
 ---
 
+## Anything involving suspend hangs the machine
+
+`systemctl suspend` is masked in this image and `/sys/power/state` should not be written
+by hand. If you unmask it and try anyway, expect a hard hang needing a battery pull, and a
+dirty FAT boot partition afterwards:
+
+```bash
+sudo umount /boot && sudo fsck.vfat -a /dev/mmcblk0p1 && sudo mount /boot
+```
+
+`/sys/power/mem_sleep` reading `s2idle [deep]` does **not** mean suspend works — `deep` is
+a firmware stub and `s2idle` wedges the Wi-Fi chip beyond what a driver reload can fix.
+Full account in [`HARDWARE.md`](HARDWARE.md) §3.9.
+
+## No Wi-Fi after a blank, or after the battery died while blanked
+
+The low-power blank `rfkill`-blocks Wi-Fi and Bluetooth. If the machine died before waking,
+`uconsole-radio-restore` unblocks them at the next boot — it keys on a stamp written
+*before* anything is blocked, precisely so a half-finished descent still recovers.
+
+If you are stuck now, and the network is what you would have used to fix it:
+
+```bash
+# Ctrl+Alt+F2, log in, then:
+sudo uconsole-unstick --unlock
+```
+
+That restores backlight, input, audio, CPU and radios, and starts the modem wake. Return
+with `Ctrl`+`Alt`+`F1`. Set `RADIO_OFF_ON_BLANK=0` in `/etc/uconsole/lowpower.conf` if you
+would rather keep SSH reachable while the screen is off.
+
+## LTE does not come back after waking
+
+Check what the wake actually did — it runs as its own unit and logs every step:
+
+```bash
+journalctl -t uconsole-modem-wake -b
+```
+
+A healthy wake reads `modem state after power-on: disabled` → `enabling the modem` →
+`modem registered` → `bearer reconnected` → `done`. It can legitimately take twenty
+seconds to a couple of minutes; the desktop returns immediately and LTE catches up behind
+it.
+
+Two failure modes have real history here. **Restoring power state does not enable the
+modem** — coming back from ModemManager's low-power state leaves it `disabled`, which
+never searches and never registers, so the bearer times out after 90 s. And **the wake
+used to be a background subshell**, which sudo killed on exit, so it never ran at all. To
+recover by hand:
+
+```bash
+sudo mmcli -m 0 --set-power-state-on && sudo mmcli -m 0 --enable
+```
+
+## Audio is silent after waking
+
+Fixed, but if you hit it on an older image: the blank used to save the *prior* mute state
+and replay it on wake, which latches — once anything leaves the sink muted, every later
+cycle faithfully re-mutes it. Clear it with:
+
+```bash
+wpctl set-mute @DEFAULT_AUDIO_SINK@ 0 && rm -f /run/user/$(id -u)/uconsole-mute.save
+```
+
+`uconsole-unstick` does both unconditionally.
+
+## The machine is running on one CPU core
+
+**CPU offlining is one-way on this board.** Bring-up fails with `CPU1: failed in unknown
+state : 0x0` and only a reboot recovers. Check with:
+
+```bash
+uconsole-lowpower status
+```
+
+`CPU_OFFLINE_CORES_ON_BLANK` defaults to `0` for this reason. If you enabled it, disable
+it and reboot. On other hardware, test reversibility first — it costs one core if the
+answer is no:
+
+```bash
+sudo uconsole-lowpower selftest-cores
+```
+
+## The blank does not seem to save any power
+
+Measure rather than guess:
+
+```bash
+uconsole-power-probe run
+```
+
+If the report prints `THE LOW-POWER DESCENT DID NOT ENGAGE`, the blanked phase ran in the
+same state as the baseline and only the backlight was switched off. Check:
+
+```bash
+journalctl -t uconsole-screen-toggle -t uconsole-lowpower -b | tail
+```
+
+If it *did* engage and the saving is still around a watt, that is expected. Measured on
+this hardware: backlight ~0.7 W, everything else in the blank ~0.2 W, and a ~3.2 W floor
+of SoC, DSI panel and RP1/USB that userspace cannot reach.
+
 ## Lessons that shaped the verification suite
 
 Several checks are written in a non-obvious way because the obvious version was wrong.

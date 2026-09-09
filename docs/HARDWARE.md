@@ -43,6 +43,32 @@ only zone in the tree, which is why `thermal-zone: 0` is the right waybar settin
 from the part number rather than the DTB leads you to look for a 2712 driver that does not
 exist.
 
+**CPU offlining is one-way — the firmware can park a core but cannot restart it.**
+Offlining succeeds; bringing the core back fails, and only a reboot recovers it. Measured
+on this board 2026-09-08 on all of cpu1–cpu3:
+
+```
+psci: CPU1 killed (polled 0 ms)         <- CPU_OFF worked
+CPU1: failed to come online
+CPU1: failed in unknown state : 0x0     <- the core never ran kernel code again
+```
+
+`unknown state : 0x0` is arm64's `secondary_data.status` never being updated by the
+incoming CPU: PSCI `CPU_ON` returned, but the core never started executing. The userspace
+write reports `EINVAL` (*write error: Invalid argument*) after arm64's **5-second per-CPU
+boot timeout**, so recovering three cores stalls for fifteen seconds and then fails anyway.
+
+This is the same minimal PSCI implementation described in §3.9 — the one whose
+`SYSTEM_SUSPEND` is a firmware stub. It boots secondaries once, at startup, and that is
+all.
+
+Consequences for anything that parks cores to save power: the machine is crippled
+*permanently*, not temporarily; the wake path stalls 5 s per core before failing; and
+because the write on the way **down** returns success, a naive implementation leaves no
+trace at all. A later "screen on, idle" power measurement was recorded at one core without
+anyone noticing. `CPU_OFFLINE_CORES_ON_BLANK` therefore defaults to 0. Verify on any other
+board with `uconsole-lowpower selftest-cores`, which costs one core if the answer is no.
+
 **The panel is 1280×720, not 1280×480.** At 5″ that is ~294 PPI, so scaling is essential.
 Prefer a scale that divides evenly: 1.25 → 1024×576, 1.6 → 800×450, 2.0 → 640×360. A
 fractional scale that does not (1280/1.2 = 1066.67) leaves a partial pixel column at the
@@ -62,7 +88,7 @@ Derived from an on-device defect report. Section numbers reference that report.
 | 3.6 | No RTC; clock wrong every boot | **Mitigated** — networkd fix lets timesyncd work; NTP servers pinned by IP so a first sync does not need DNS |
 | 3.7 | `wireless-regdb` missing — 299 brcmfmac channel errors per boot, 14.5 % of the journal | **Fixed** — `wireless-regdb` and `iw` installed |
 | 3.8 | DSI panel never wakes from `dpms off`; presents as a hung machine | **Fixed** — idle dims the backlight instead; `dpms` is never used |
-| 3.9 | No kernel suspend support (`/sys/power/state` empty) | **Kernel rebuilt** with `CONFIG_SUSPEND`/`PM_SLEEP`. Not wired to the power key — see below |
+| 3.9 | No kernel suspend support (`/sys/power/state` empty) | **Superseded.** The premise was a CM4 observation. On this build both sleep states register — and both are unusable. Suspend is now masked; see below |
 | 3.10 | PWM audio picks up LTE transmit bursts as audible static | **Not fixable in software** — see below |
 | 3.11 | Missing `usbutils`/`iw`, no swap, sshd defaults | **Partly fixed** — tools and `zram-generator` added; sshd left enabled |
 
@@ -75,21 +101,65 @@ output. No driver change removes it; it needs antenna routing away from the audi
 or an I2S codec on a hardware revision. Usefully, the static is the audible signature of
 the current spikes that cause undervoltage shutdowns — treat it as an early warning.
 
-**§3.9, suspend.** The capability is now compiled in, but nothing uses it. BCM2712
-suspend-to-RAM is not meaningfully supported upstream, so the likely outcome is s2idle,
-which saves little. More importantly, resume must re-initialise the DSI link — and §3.8
-showed the panel already fails to return from a plain `dpms off`. Validate the panel
-before investing in suspend. The power key blanks the backlight instead, which captures
-most of the practical benefit on a handheld where the backlight dominates idle draw.
+**§3.9, suspend.** Do not use it. Not "it saves little" — it hard-hangs this machine,
+and the sysfs entries actively invite you to try.
+
+`/sys/power/mem_sleep` reads `s2idle [deep]` and `/sys/power/state` reads `freeze mem`,
+so everything looks available. Neither state is:
+
+- **`deep` is not suspend-to-RAM on BCM2712.** Broadcom has never delivered the DDR PHY
+  self-refresh entry/exit sequences. Raspberry Pi's firmware advertises PSCI
+  `SYSTEM_SUSPEND` anyway, so the kernel registers `PM_SUSPEND_MEM` in good faith; behind
+  it is a stub that exercises the mailbox and parks the ARM core for about a second.
+  `mem_sleep` resets to `deep` on **every boot** — it is not persisted — so a bare
+  `echo mem > /sys/power/state` silently takes this path.
+- **`s2idle` is real, but its device-suspend phase wedges the Wi-Fi chip.** `brcmfmac`
+  on the SDIO-attached BCM4345/6 fails its bus-sleep transition with `-110` backplane
+  timeouts every single time, including with the radio already soft-blocked via `rfkill`.
+  The chip does not come back: reprobing all three SDIO functions fails with
+  `Failed to force clock for F2: err -110`. **A module reload does not recover it — only
+  a reboot does.**
+
+Five suspend attempts produced five hard hangs. Four needed a battery pull; the ext4 root
+replayed its journal each time, systemd rotated corrupted journal files, and the FAT boot
+partition was left dirty twice. A sixth attempt using `/sys/power/pm_test` at the
+`devices` level isolated the two causes cleanly: it reproduced the Wi-Fi wedge without
+hanging the kernel, proving brcmfmac is sufficient to kill the radio on its own but that
+the total hang additionally needs the deeper stages `pm_test` skips.
+
+Note that `pm_test`'s printed level list (`none core processors platform devices freezer`)
+is **not** severity order. The cumulative order is
+`freezer < devices < platform < processors < core < none`.
+
+This image therefore masks `sleep.target`, `suspend.target`, `hibernate.target`,
+`hybrid-sleep.target` and `suspend-then-hibernate.target`, and pins
+`mem_sleep_default=s2idle` on the kernel command line so that anything writing
+`/sys/power/state` directly degrades to the merely-broken state rather than the
+firmware stub.
+
+The power key blanks the backlight instead, and unlike suspend it comes back.
+
+**Do not repeat the claim that the backlight dominates idle draw here — it does not.**
+Measured on this unit: 4.08 W with the screen on, 3.36 W with the backlight at zero and
+nothing else touched. The backlight is worth **0.72 W, about 18 %**. The remaining 3.36 W
+is radios, CPU and the RP1/USB tree, which is why the low-power blank switches those off
+too rather than stopping at the panel.
 
 ## Power figures
 
 Measured on this hardware:
 
-- Idle, screen on: ~5–7 W
+- Idle, screen on: **4.08 W** measured on battery (2026-09-08, `uconsole-power-probe`).
+  An earlier ~5–7 W estimate was not measured on this unit.
+- Idle, backlight off, nothing else changed: **3.36 W**
 - LTE connected but not routed ("hot standby"): ~0.1 W, ~4 MiB/month
 - LTE transmit burst: 4.4 A swing, 305 mV rail sag
-- Pack: 24.79 Wh nominal
+- Pack: **14.8 Wh nominal** on this unit -- 2x 18650 at 3.7V 2000mAh, wired in
+  **parallel** (3.7V x 4000mAh). Parallel is not an assumption: the AXP223 is a
+  single-cell PMIC and the pack reads 3.4-4.2V in sysfs, where a series pair would
+  read double. An earlier figure of 24.79 Wh came from the defect report and
+  described larger cells; it is wrong for this hardware.
+  Set `PACK_WH` in `/etc/uconsole/lowpower.conf` if you fit different cells.
 
 The gauge is uncalibrated (`calibrate` reads 0) and its percentage cannot be trusted —
 it read 49 % at 3.402 V. Use voltage, which is what `uconsole-battery-guard` does.

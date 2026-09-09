@@ -5,7 +5,7 @@ A build system that produces a bootable **Arch Linux ARM** image with a
 fitted with a **Raspberry Pi Compute Module 5**.
 
 The kernel is compiled from source; the image is assembled and then checked by an
-automated verification suite — currently **265 checks**, all passing.
+automated verification suite — currently **344 checks**, all passing.
 
 Inputs are pinned where upstream allows it: the kernel commit, the upstream builder, and
 the tmux plugins. Arch Linux ARM publishes only a rolling `latest` rootfs tarball, so
@@ -16,6 +16,11 @@ tarball's SHA-256 and says so when it differs.
 > A CM5 Lite will very likely *not* boot from SD until its bootloader EEPROM is
 > reconfigured. This is a firmware defect, not an image problem, and no amount of
 > reflashing fixes it.
+
+> **Do not use suspend on this hardware.** `/sys/power/state` reads `freeze mem`, so it
+> looks available; it is not. Both states hang the machine hard enough to need a battery
+> pull, and this image masks them deliberately. See
+> [`docs/HARDWARE.md`](docs/HARDWARE.md) §3.9.
 
 ---
 
@@ -32,6 +37,8 @@ tarball's SHA-256 and says so when it differs.
 | **VPN** | Tailscale pre-installed, daemon enabled — unauthenticated, no key baked in |
 | **Terminal** | tmux with TPM, resurrect and continuum — sessions survive reboots |
 | **Security** | Login required at boot and on wake; firewall limits SSH to LAN/tailnet |
+| **Power** | Short press blanks, locks, and switches off radios, modem and clock headroom; measured, not assumed |
+| **Recovery** | `Ctrl`+`Alt`+`F2` → `uconsole-unstick` — works with the network off |
 | **First boot** | Prompts for a username and password; expands the root filesystem to fill the card |
 
 ## Quick start
@@ -99,8 +106,14 @@ It also verifies that the built system can **install packages after boot**, whic
 different question from "packages installed during the build" and caught two real defects
 that structural checks alone had missed.
 
+Many checks exist because a specific bug got through. The suite asserts that the wake path
+restores the backlight *to the same value* it had before, that the sudoers drop-in is
+root-owned and `0440` (sudo silently ignores it otherwise), and that no script probes
+privilege with a command different from the one it intends to run — each of which was a
+real defect found by measuring the machine rather than reading the code.
+
 ```
-RESULT: 265 passed, 0 failed
+RESULT: 344 passed, 0 failed
 ```
 
 Structural verification is not a boot test. Nothing here has been validated by an

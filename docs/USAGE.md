@@ -7,9 +7,11 @@ The machine prompts on tty1 for a **username and password**. That account gets s
 The wizard then disables itself.
 
 **There is no autologin.** Every boot presents a login prompt; sway starts once you log in
-on tty1. A short press of the power button blanks the backlight, **locks the session, and
-silences the keyboard and trackball**, so the machine can sit in a bag without stray input
-reaching your work. Pressing it again restores input and asks for your password.
+on tty1. A short press of the power button blanks the backlight, **locks the session,
+silences the trackball, and puts the machine into low power** — radios off, CPU clamped,
+cores parked — so it can sit in a bag without stray input reaching your work and without
+draining the pack. Pressing it again restores everything and asks for your password. See
+[Low-power blank](#low-power-blank) for what exactly gets switched off.
 
 Only **pointer** devices are silenced — the trackball, which is what actually generates
 spurious events rolling around in a bag. Keyboards are deliberately left alone: the power
@@ -17,11 +19,23 @@ key is a keyboard-type device whose identifier cannot be predicted reliably, and
 it would be unrecoverable. Keyboard input is not a hazard anyway, because swaylock holds the
 session and keystrokes go to the password prompt rather than to your work.
 
-If you are ever stuck at a black screen, SSH in and run:
+### If you are ever stuck at a black screen
+
+Press **`Ctrl`+`Alt`+`F2`**, log in, and run:
 
 ```bash
-brightnessctl set 50% && swaymsg input '*' events enabled && pkill swaylock
+uconsole-unstick
 ```
+
+That restores the backlight, re-enables every sway input, brings any offlined CPU cores
+back, clears the frequency clamp and unblocks the radios. Add `--unlock` to dismiss
+`swaylock` too. Return to the desktop with `Ctrl`+`Alt`+`F1`.
+
+Use the second virtual terminal rather than SSH. VT switching is handled by the kernel and
+logind, so it works when sway has stopped responding to input, when sway's inputs have
+been left disabled, **and when the network is off** — which matters because the low-power
+blank is itself capable of switching the radios off. SSH works too when there is a
+network, and `uconsole-unstick` behaves identically over it.
 
 A long power press also still shuts down cleanly, since logind sees the power key directly
 rather than through sway.
@@ -49,7 +63,7 @@ Alt is the modifier throughout — the uConsole keyboard has no Super key.
 | `Alt`+`Shift`+`h/j/k/l` | Move window within the layout |
 | `Alt`+`Shift`+`c` | Reload sway config |
 | `Print` | Region screenshot |
-| Power button (short) | Blank the backlight; press again to restore |
+| Power button (short) | Blank, lock and enter low power; press again to restore |
 | Power button (~5 s) | Clean poweroff |
 
 The trackball has no scroll wheel: **hold the right button and roll** to scroll.
@@ -215,6 +229,101 @@ Password authentication stays enabled, because the firewall is what closes the e
 ```bash
 sudo nft list ruleset          # what is actually loaded
 ```
+
+## Low-power blank
+
+A short power press does more than blank the screen. It locks the session, silences the
+trackball, mutes audio, blocks Wi-Fi and Bluetooth, powers the LTE modem down, clamps the
+CPU to minimum frequency and takes cores 1–3 offline. Pressing again reverses all of it.
+
+Policy lives in `/etc/uconsole/lowpower.conf`; every knob can be turned off individually.
+
+```bash
+uconsole-lowpower status         # what is currently switched off
+journalctl -t uconsole-modem-wake -b   # what the last wake did to the modem
+```
+
+The modem wake runs as its own transient unit rather than a background job, so it survives
+the key-binding process that started it and its progress is in the journal.
+`sudo uconsole-lowpower selftest-cores` tests whether CPU core parking is reversible on
+your board — it is not on this one.
+
+**LTE takes a while to come back.** Re-powering the module and re-registering can take
+anywhere from twenty seconds to the three-minute unit timeout. The wake path never blocks
+on it — the desktop returns immediately and data catches up behind it. Your
+`uconsole-wan` routing mode is re-applied automatically once the bearer is back. Set
+`MODEM_OFF_ON_BLANK=0` if you blank in short bursts and would rather keep the bearer
+alive.
+
+**Wi-Fi off means no SSH while blanked.** That is why the recovery path is
+`Ctrl`+`Alt`+`F2` rather than SSH — see above. Set `RADIO_OFF_ON_BLANK=0` to keep the
+machine reachable.
+
+## Measuring power draw
+
+```bash
+uconsole-power-probe run          # baseline -> blank -> wake -> report
+uconsole-power-probe watch        # live readings, one line per interval
+uconsole-power-probe report       # re-print the most recent run
+```
+
+`run` measures two minutes with the screen on, blanks the machine, measures five more,
+wakes it and prints a comparison with estimated runtime on the pack. Defaults are
+adjustable: `--baseline SEC`, `--blank SEC`, `--interval SEC`.
+
+Two things it refuses to do, both because they produce confident wrong answers. It will
+not run **on AC** — charging current swamps load current. And it will not run **over SSH**
+— blanking switches Wi-Fi off, so the session watching the measurement is the one thing
+guaranteed not to survive it. Start it from the uConsole's own terminal and leave the
+machine alone until it wakes itself.
+
+Absolute figures include the sampler's own overhead, which is not nothing on a machine
+clamped to one core under a watt. **Trust the difference between phases, not the
+absolutes.**
+
+### After a cell swap
+
+Runtime estimates use `PACK_WH` from `/etc/uconsole/lowpower.conf`. Don't edit it by hand
+and don't redo the arithmetic — tell the tool what's fitted:
+
+```bash
+sudo uconsole-power-probe pack 2x3500
+```
+
+| Cells (parallel) | `PACK_WH` |
+|---|---|
+| 2 × 2000 mAh | 14.8 Wh |
+| 2 × 3500 mAh | 25.9 Wh |
+
+`uconsole-power-probe pack` with no argument shows what's currently set. A bare number
+(`pack 20.35`) sets watt-hours directly, which is what you want after measuring the pack
+for real.
+
+Nothing safety-critical reads this value — the low-voltage guard is voltage-based and
+never consults it. The estimate it produces is an **upper bound**: the guard shuts down at
+3.40 V, well above where an 18650 is actually empty, so several percent of nominal energy
+is never available to you. Nameplate capacity is optimistic too, especially on used cells,
+so `sudo uconsole-battery-calibrate run` gives a truer figure than any datasheet.
+
+> **Pairing cells.** The AXP223 is a single-cell PMIC: it sees the parallel pair as one
+> cell and balances nothing. Fit two cells of the **same capacity, age and charge level**.
+> A 3500 mAh cell wired alongside a 2000 mAh one dumps current into it the moment they're
+> connected, and the pair drifts further apart with every cycle. Pair like with like.
+
+## Suspend — do not use it
+
+`systemctl suspend` will not work, and that is deliberate. The sleep targets are masked
+in this image.
+
+If you look at `/sys/power/state` you will see `freeze mem` and reasonably conclude
+suspend is available. It is not. `deep` is a firmware stub with no DDR self-refresh behind
+it, and `s2idle` reliably wedges the Wi-Fi chip badly enough that only a reboot recovers
+it. Five attempts produced five hard hangs and two dirty filesystems. The full account is
+in [`docs/HARDWARE.md`](HARDWARE.md) §3.9.
+
+If you unmask the targets anyway, do not run a bare `rtcwake -m mem`: read
+`/sys/power/mem_sleep` first (it resets to `deep` on every boot), and bisect with
+`/sys/power/pm_test` rather than power-cycling.
 
 ## Keeping the kernel current
 

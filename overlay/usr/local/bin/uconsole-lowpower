@@ -1,0 +1,304 @@
+#!/usr/bin/env bash
+# uconsole-lowpower {down|up|status}
+#
+# The privileged half of the low-power blank. uconsole-screen-toggle runs as the
+# logged-in user from a sway binding, so it can handle the backlight, the lock
+# and the audio sink -- but rfkill, cpufreq and CPU hotplug all need root, and a
+# key binding has nowhere to prompt for a password. Hence this split, plus a
+# sudoers drop-in granting wheel NOPASSWD for exactly this one binary.
+#
+#   down    switch off what a blanked machine is not using
+#   up      put everything back, unconditionally
+#   status  what is currently switched off
+#
+# DESIGN RULE, and the one that matters most: `up` never asks whether `down` set
+# something. It restores the safe value regardless, and a missing state file
+# means "use the sane default", never "do nothing". This is the path that has to
+# clean up after a descent that failed halfway through. A machine left with
+# three cores offline, a frequency clamp and no radio is far worse than one that
+# never went to sleep at all.
+set -uo pipefail
+
+CONF=/etc/uconsole/lowpower.conf
+STATE=/run/uconsole/lowpower.save
+STAMP=/var/lib/uconsole/radios-off-by-lowpower
+
+RADIO_OFF_ON_BLANK=1
+MODEM_OFF_ON_BLANK=0
+CPU_CLAMP_ON_BLANK=1
+CPU_OFFLINE_CORES_ON_BLANK=1
+# shellcheck source=/dev/null
+[[ -r $CONF ]] && . "$CONF"
+
+log() { logger -t uconsole-lowpower "$*"; printf '[uconsole-lowpower] %s\n' "$*"; }
+
+[[ $EUID -eq 0 ]] || { echo "uconsole-lowpower: must run as root" >&2; exit 1; }
+
+POLICY_GLOB=(/sys/devices/system/cpu/cpufreq/policy*)
+
+save() { printf '%s=%s\n' "$1" "$2" >> "$STATE"; }
+load() { [[ -r $STATE ]] && grep -m1 "^$1=" "$STATE" 2>/dev/null | cut -d= -f2- || true; }
+
+### down ---------------------------------------------------------------------
+do_down() {
+    mkdir -p /run/uconsole /var/lib/uconsole
+    : > "$STATE"          # fresh every descent; a stale file is worse than none
+    chmod 600 "$STATE"
+
+    if [[ ${CPU_CLAMP_ON_BLANK:-1} == 1 ]]; then
+        for p in "${POLICY_GLOB[@]}"; do
+            [[ -d $p ]] || continue
+            local n; n=$(basename "$p")
+            save "gov_$n"  "$(cat "$p/scaling_governor"  2>/dev/null)"
+            save "maxf_$n" "$(cat "$p/scaling_max_freq" 2>/dev/null)"
+            # Both, not either. The governor alone can be overridden by a
+            # min-freq floor something else left behind, and clamping max_freq
+            # alone leaves an ondemand governor free to sit at that ceiling.
+            if grep -qw powersave "$p/scaling_available_governors" 2>/dev/null; then
+                echo powersave > "$p/scaling_governor" 2>/dev/null
+            fi
+            if [[ -r $p/cpuinfo_min_freq ]]; then
+                cat "$p/cpuinfo_min_freq" > "$p/scaling_max_freq" 2>/dev/null
+                # Read back: raspberrypi-cpufreq goes through the firmware and a
+                # write is not guaranteed to take (the S3.1 lesson -- a silent
+                # no-op that looks like success).
+                local want got
+                want=$(cat "$p/cpuinfo_min_freq" 2>/dev/null)
+                got=$(cat "$p/scaling_max_freq"  2>/dev/null)
+                [[ $want == "$got" ]] || log "WARNING: $n scaling_max_freq is $got, wanted $want"
+            fi
+        done
+        log "cpu clamped"
+    fi
+
+    # Cores last, so the survivor is already running under the clamp.
+    if [[ ${CPU_OFFLINE_CORES_ON_BLANK:-1} == 1 ]]; then
+        local off=0
+        for c in /sys/devices/system/cpu/cpu[1-9]*/online; do
+            [[ -w $c ]] || continue
+            [[ $(cat "$c" 2>/dev/null) == 1 ]] || continue
+            echo 0 > "$c" 2>/dev/null && off=$((off+1))
+        done
+        save "cores_offlined" "$off"
+        log "offlined $off core(s); cpu0 untouched"
+    fi
+
+    if [[ ${RADIO_OFF_ON_BLANK:-1} == 1 ]]; then
+        # The stamp is what uconsole-radio-restore looks for at boot. Written
+        # BEFORE the block, so a machine that dies mid-descent still comes back
+        # with radios rather than silently stranded with no network.
+        touch "$STAMP"
+        save "wifi_was"      "$(rfkill list wifi      2>/dev/null | grep -c 'Soft blocked: no' || true)"
+        save "bluetooth_was" "$(rfkill list bluetooth 2>/dev/null | grep -c 'Soft blocked: no' || true)"
+        rfkill block wifi bluetooth 2>/dev/null
+        log "wifi and bluetooth blocked"
+    fi
+
+    if [[ ${MODEM_OFF_ON_BLANK:-0} == 1 ]]; then
+        save "modem_was_on" 1
+        systemctl stop uconsole-modem-connect.service 2>/dev/null
+
+        # Put the radio to sleep through ModemManager rather than yanking its
+        # supply. Cutting the GPIO rail was the first attempt and it did not
+        # work: releasing the line leaves the SIM7600 enumerated and, as far as
+        # anything could tell, still transmitting -- there is no power-down
+        # sequence in that path, and nothing checked. --set-power-state-low is
+        # the documented way, it is reversible in seconds instead of minutes,
+        # and its result can actually be read back.
+        local idx st
+        idx=$(mmcli -L 2>/dev/null | grep -o '/Modem/[0-9]*' | head -1 | tr -d '/A-Za-z')
+        if [[ -n $idx ]]; then
+            mmcli -m "$idx" --set-power-state-low >/dev/null 2>&1
+            sleep 1
+            st=$(mmcli -m "$idx" 2>/dev/null | awk -F': *' '/power state/{print $2; exit}')
+            if [[ $st == low ]]; then
+                log "modem radio in low-power state"
+            else
+                log "WARNING: modem power state is '${st:-unknown}', wanted 'low'"
+            fi
+        else
+            log "no modem to power down"
+        fi
+
+        # Optionally also drop the supply rail. Off by default: it costs a full
+        # re-enumeration on wake (up to the 180s unit timeout) and buys little
+        # once the radio is already asleep.
+        if [[ ${MODEM_RAIL_OFF_ON_BLANK:-0} == 1 ]]; then
+            save "modem_rail_cut" 1
+            /usr/local/bin/uconsole-modem-power disable >/dev/null 2>&1
+            sleep 1
+            if grep -qs 1e0e /sys/bus/usb/devices/*/idVendor; then
+                log "WARNING: rail released but the modem is still on the USB bus"
+            else
+                log "modem rail released; module off the bus"
+            fi
+        fi
+    fi
+}
+
+### up -----------------------------------------------------------------------
+do_up() {
+    # Cores before frequency: a core coming online adopts the current policy, so
+    # doing it the other way round can leave the newcomers clamped.
+    # Read back, do not trust the write.
+    #
+    # `echo 1 > .../online` returning 0 does NOT mean the core came up: on this
+    # board cores were observed staying offline across a full blank/wake cycle,
+    # leaving the machine permanently at 1 of 4 with nothing logged. Verify, and
+    # make the failure loud -- a silently crippled CPU is far worse than a blank
+    # that saved nothing.
+    local back=0 stuck=0
+    for c in /sys/devices/system/cpu/cpu[1-9]*/online; do
+        [[ -w $c ]] || continue
+        [[ $(cat "$c" 2>/dev/null) == 0 ]] || continue
+        echo 1 > "$c" 2>/dev/null
+        if [[ $(cat "$c" 2>/dev/null) == 1 ]]; then
+            back=$((back+1))
+        else
+            stuck=$((stuck+1))
+            log "ERROR: $c stayed offline after writing 1 -- CPU hotplug bring-up failed"
+        fi
+    done
+    (( back ))  && log "brought $back core(s) back online"
+    (( stuck )) && log "ERROR: $stuck core(s) could NOT be brought back; running degraded. Check dmesg."
+
+    for p in "${POLICY_GLOB[@]}"; do
+        [[ -d $p ]] || continue
+        local n g m; n=$(basename "$p")
+        m=$(load "maxf_$n"); g=$(load "gov_$n")
+        # Fall back to the hardware maximum and a sane governor rather than
+        # leaving the machine clamped when the state file is missing or junk.
+        [[ $m =~ ^[0-9]+$ ]] || m=$(cat "$p/cpuinfo_max_freq" 2>/dev/null)
+        [[ -n $m ]] && echo "$m" > "$p/scaling_max_freq" 2>/dev/null
+        if [[ -z $g ]] || ! grep -qw -- "$g" "$p/scaling_available_governors" 2>/dev/null; then
+            for cand in schedutil ondemand performance; do
+                grep -qw "$cand" "$p/scaling_available_governors" 2>/dev/null && { g=$cand; break; }
+            done
+        fi
+        [[ -n $g ]] && echo "$g" > "$p/scaling_governor" 2>/dev/null
+    done
+    log "cpu restored"
+
+    # Unconditional: unblock whatever is blocked, whether or not we blocked it.
+    # Being stranded with no radio is the failure mode worth preventing; briefly
+    # unblocking something the user blocked by hand is a minor annoyance.
+    rfkill unblock wifi bluetooth 2>/dev/null
+    nmcli radio wifi on >/dev/null 2>&1
+    rm -f "$STAMP"
+    log "radios restored"
+
+    # Backgrounded on purpose: re-powering the module and re-registering can take
+    # up to the 180s unit timeout, and the wake path must never block on a radio.
+    #
+    # The trigger is a real condition, not just the saved flag. A descent that
+    # died after cutting modem power but before writing state would otherwise
+    # leave the radio off with nothing to notice -- so also fire whenever policy
+    # says the modem gets cut and the module is not currently enumerated.
+    local want_modem=0
+    [[ $(load "modem_was_on") == 1 ]] && want_modem=1
+    # grep -c, not grep -q: with `set -o pipefail`, grep -q exits on the first
+    # match and SIGPIPEs the upstream process, marking the pipeline failed and
+    # inverting the test. Same trap as everywhere else in this repo.
+    if [[ ${MODEM_OFF_ON_BLANK:-0} == 1 ]] \
+       && [[ $(/usr/local/bin/uconsole-modem-power status 2>/dev/null | grep -c enumerated || true) -eq 0 ]]; then
+        want_modem=1
+    fi
+
+    if (( want_modem )); then
+        # A transient systemd unit, NOT `( ... ) &`.
+        #
+        # The subshell version silently never ran. This script is invoked through
+        # `sudo -n` from a sway key binding; sudo 1.9.14+ runs commands in a pty
+        # by default and kills what is left in that session on exit. `up` returns
+        # in under a second, the modem sequence needs tens of seconds, so it was
+        # being killed every time -- the radio stayed in low power after every
+        # wake while everything synchronous restored correctly.
+        #
+        # Arguments are passed rather than re-read from $STATE, which the line
+        # below deletes: the old code raced its own cleanup.
+        local args=()
+        [[ $(load "modem_rail_cut") == 1 ]] && args+=(--rail-cut)
+        local wm; wm=$(cat /var/lib/uconsole/wan-mode 2>/dev/null)
+        [[ -n $wm ]] && args+=(--wan-mode "$wm")
+
+        systemctl stop uconsole-modem-wake.service >/dev/null 2>&1
+        systemctl reset-failed uconsole-modem-wake.service >/dev/null 2>&1
+        if systemd-run --unit=uconsole-modem-wake --collect \
+             --description="Restore the uConsole LTE modem after a low-power blank" \
+             /usr/local/bin/uconsole-modem-wake "${args[@]}" >/dev/null 2>&1; then
+            log "modem wake started as uconsole-modem-wake.service (data returns in ~20s-3min)"
+        else
+            # Last resort: run it inline. Slow, and it blocks the wake, but a
+            # modem left asleep with nothing trying to fix it is worse.
+            log "WARNING: systemd-run failed; running the modem wake inline"
+            /usr/local/bin/uconsole-modem-wake "${args[@]}" >/dev/null 2>&1 &
+        fi
+    fi
+
+    rm -f "$STATE"
+}
+
+### status -------------------------------------------------------------------
+do_status() {
+    printf 'state file : %s\n' "$([[ -r $STATE ]] && echo present || echo absent)"
+    printf 'radio stamp: %s\n' "$([[ -f $STAMP ]] && echo present || echo absent)"
+    for p in "${POLICY_GLOB[@]}"; do
+        [[ -d $p ]] || continue
+        printf '%-11s: governor=%s max=%s min=%s\n' "$(basename "$p")" \
+            "$(cat "$p/scaling_governor" 2>/dev/null)" \
+            "$(cat "$p/scaling_max_freq" 2>/dev/null)" \
+            "$(cat "$p/scaling_min_freq" 2>/dev/null)"
+    done
+    # getconf, not `grep -c` over the sysfs files: grep with several filenames
+    # prints "path:count" per file rather than one total, which turned this line
+    # into four lines of paths.
+    printf 'cores      : %s of %s online\n' \
+        "$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo '?')" \
+        "$(getconf _NPROCESSORS_CONF 2>/dev/null || echo '?')"
+    rfkill list 2>/dev/null | grep -E '^[0-9]+:|Soft blocked' | paste - - 2>/dev/null
+}
+
+### selftest-cores ----------------------------------------------------------
+# Is CPU hotplug reversible on THIS board? Do not assume it is.
+#
+# On the uConsole's CM5 it is not: offlining succeeds, and the write to bring a
+# core back fails with EINVAL ("Invalid argument"). Only a reboot restores it.
+# That is consistent with how thin this platform's PSCI implementation turned out
+# to be elsewhere (see docs/HARDWARE.md S3.9) but the failure is what matters,
+# not the theory.
+#
+# The test costs ONE core if bring-up is broken -- which is the point: far better
+# to lose one deliberately than three silently, on a machine whose screen is off.
+do_selftest_cores() {
+    local c=/sys/devices/system/cpu/cpu1/online
+    [[ -w $c ]] || { echo "no hotplug control at $c"; return 1; }
+    [[ $(cat "$c") == 1 ]] || { echo "cpu1 is already offline; reboot before testing"; return 1; }
+
+    echo "Offlining cpu1, then immediately trying to bring it back."
+    echo "If bring-up is broken on this board you will be left with one fewer core"
+    echo "until you reboot. Ctrl-C now if that is not acceptable."
+    sleep 5
+
+    echo 0 > "$c" 2>/dev/null
+    if [[ $(cat "$c") != 0 ]]; then echo "RESULT: cpu1 would not go offline; hotplug unavailable."; return 1; fi
+    echo "  cpu1 offline, cores now $(getconf _NPROCESSORS_ONLN)"
+
+    local err; err=$( { echo 1 > "$c"; } 2>&1 )
+    if [[ $(cat "$c") == 1 ]]; then
+        echo "RESULT: PASS -- cpu1 came back. CPU_OFFLINE_CORES_ON_BLANK=1 is safe here."
+        echo "  cores now $(getconf _NPROCESSORS_ONLN)"
+        return 0
+    fi
+    echo "RESULT: FAIL -- cpu1 did NOT come back${err:+ ($err)}."
+    echo "  Offlining is one-way on this kernel. Leave CPU_OFFLINE_CORES_ON_BLANK=0."
+    echo "  REBOOT to recover the core."
+    return 1
+}
+
+case "${1:-}" in
+    down)   do_down ;;
+    up)     do_up ;;
+    status) do_status ;;
+    selftest-cores) do_selftest_cores ;;
+    *)      echo "usage: uconsole-lowpower {down|up|status|selftest-cores}" >&2; exit 2 ;;
+esac

@@ -25,6 +25,35 @@ check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
 # three times now. `grep -c` drains its input, so nothing gets SIGPIPEd.
 has_string() { [[ $(strings "$1" 2>/dev/null | grep -cx -- "$2" || true) -gt 0 ]]; }
 
+# Create the /dev/loopNpM nodes that Docker Desktop never will.
+#
+# Its /dev is a plain tmpfs with no udev, so `losetup -P` registers the
+# partitions with the kernel -- they appear in sysfs and fdisk lists them -- but
+# no device nodes are created. Every partition check then fails with "Can't
+# lookup blockdev" on an image that is perfectly fine, which is the worst kind of
+# verification failure: alarming, and wrong.
+#
+# The image build solves this by wrapping partprobe. Verification cannot reuse
+# that: it runs in its own fresh container, and the base image does not even ship
+# parted -- the build pacman-installs it as its first step. So do the same work
+# directly from sysfs, which needs nothing but coreutils.
+#
+# Nodes are always recreated, never skipped when present. Partition minors are
+# allocated dynamically, so a node left over from an earlier losetup can point at
+# the wrong device -- that surfaces much later as a confusing mount failure.
+materialise_parts() {
+    local dev="$1" base pdir pn devspec
+    base="$(basename "$dev")"
+    for pdir in /sys/block/"$base"/"$base"p*; do
+        [[ -d $pdir && -r $pdir/dev ]] || continue
+        pn="$(basename "$pdir")"
+        devspec="$(cat "$pdir/dev")"
+        rm -f "/dev/$pn"
+        mknod "/dev/$pn" b "${devspec%%:*}" "${devspec##*:}" 2>/dev/null \
+            && echo "  (created /dev/$pn -> $devspec)"
+    done
+}
+
 echo "############ VERIFYING $IMG ############"
 echo
 echo "### 1. image file"
@@ -35,7 +64,7 @@ check "image carries a DOS/MBR partition table" "sfdisk -d '$IMG' 2>/dev/null | 
 
 echo
 echo "### 2. partition table"
-LOOP="$(losetup -Pf --show "$IMG")"; partprobe "$LOOP" || true; sleep 1
+LOOP="$(losetup -Pf --show "$IMG")"; sleep 1; materialise_parts "$LOOP"
 fdisk -l "$LOOP"
 check "partition 1 exists (boot)" "[[ -b ${LOOP}p1 ]]"
 check "partition 2 exists (root)" "[[ -b ${LOOP}p2 ]]"
@@ -270,7 +299,11 @@ check "both are in modules-right"      "grep -q '\"temperature\",' $MNT/etc/skel
 check "waybar has temperature compiled in" "has_string $MNT/usr/bin/waybar temperature"
 check "waybar has memory compiled in"  "has_string $MNT/usr/bin/waybar memory"
 check "thermal driver present in kernel" "grep -q 'bcm2711_thermal' $MNT/usr/lib/modules/$KVER/modules.builtin"
-check "waybar config is valid JSON"    "python3 -c \"import json;json.load(open('$MNT/etc/skel/.config/waybar/config'))\""
+# Parsed with the IMAGE's python3, not the host's. The base container ships no
+# python at all, so a host-side `python3 -c ...` here does not report "invalid
+# JSON" -- it reports "command not found" as a failed check, which reads as a
+# broken image when the image is fine.
+check "waybar config is valid JSON"    "chroot $MNT /usr/bin/python3 -c \"import json;json.load(open('/etc/skel/.config/waybar/config'))\""
 check "temperature styled in css"      "grep -q '#temperature' $MNT/etc/skel/.config/waybar/style.css"
 
 echo
@@ -331,12 +364,168 @@ check "powerkey tuner present"         "[[ -x $MNT/usr/local/bin/uconsole-powerk
 check "powerkey tuner enabled"         "[[ -L $MNT/etc/systemd/system/multi-user.target.wants/uconsole-powerkey-tune.service ]]"
 check "tuner shortens press detection" "grep -q 'set_first_accepted \"\$f\" 128' $MNT/usr/local/bin/uconsole-powerkey-tune"
 check "tuner defers the hardware cut"  "grep -q 'set_first_accepted \"\$f\" 10000' $MNT/usr/local/bin/uconsole-powerkey-tune"
-echo "-- kernel suspend (S3.9) --"
-gzip -dc "$MNT/boot/vmlinuz-linux-uconsole-cm5-git" > /tmp/vmlinux2.raw 2>/dev/null || true
-_susp=$(strings /tmp/vmlinux2.raw | grep -ci "suspend_ops\|mem_sleep\|PM: suspend" || true)
-echo "suspend-related strings in kernel: ${_susp:-0}"
-if [[ ${_susp:-0} -gt 0 ]]; then ok "kernel has suspend support compiled in"; else bad "kernel still lacks suspend"; fi
-rm -f /tmp/vmlinux2.raw
+echo "-- suspend is a hazard, not a feature (S3.9) --"
+# The kernel still has suspend compiled in, and that is fine -- what matters is
+# that nothing can REACH it. Both registered states hang this machine: `deep` is
+# a PSCI firmware stub and `s2idle` wedges the SDIO Wi-Fi chip beyond what a
+# module reload can recover. So these checks assert the locks, not the feature.
+for t in sleep suspend hibernate hybrid-sleep suspend-then-hibernate; do
+    check "${t}.target masked" "[[ \$(readlink $MNT/etc/systemd/system/${t}.target) == /dev/null ]]"
+done
+# Defence in depth for anything writing /sys/power/state directly and bypassing
+# systemd -- exactly what rtcwake does. mem_sleep resets to `deep` every boot,
+# so without this a bare `echo mem` always takes the firmware-stub path.
+check "mem_sleep pinned to s2idle"     "grep -q 'mem_sleep_default=s2idle' $MNT/boot/cmdline.txt"
+# systemd-rfkill would carry a low-power radio block across a reboot, so a crash
+# while blanked would come up with no radios and no SSH to fix it.
+check "systemd-rfkill masked"          "[[ \$(readlink $MNT/etc/systemd/system/systemd-rfkill.service) == /dev/null ]]"
+check "rfkill socket masked"           "[[ \$(readlink $MNT/etc/systemd/system/systemd-rfkill.socket) == /dev/null ]]"
+check "radio restore present"          "[[ -x $MNT/usr/local/bin/uconsole-radio-restore ]]"
+check "radio restore enabled"          "[[ -L $MNT/etc/systemd/system/multi-user.target.wants/uconsole-radio-restore.service ]]"
+# The stale "kernel registers no sleep states" comment is what invited five
+# suspend attempts: a reader checks sysfs, sees two states, and concludes the
+# warning is obsolete. Assert it is gone everywhere it was written down.
+for f in "$MNT/etc/skel/.config/sway/config" "$MNT/etc/systemd/logind.conf.d/uconsole-powerkey.conf"; do
+    # Match on 'no sleep states' alone, not the full sentence: the original
+    # wording line-wrapped between 'sleep' and 'states', so a stricter pattern
+    # passes by luck rather than because the claim is gone.
+    check "no stale 'no sleep states' claim in $(basename "$f")" \
+          "[[ \$(tr '\n' ' ' < $f | tr -s ' ' | grep -c 'no sleep states' || true) -eq 0 ]]"
+done
+# Recovery from a blank must not depend on the network, because the low-power
+# blank is what switches the network off.
+check "VT recovery tool present"       "[[ -x $MNT/usr/local/bin/uconsole-unstick ]]"
+
+echo "-- low-power blank (Stage 1) --"
+check "lowpower policy ships"          "[[ -f $MNT/etc/uconsole/lowpower.conf ]]"
+check "lowpower policy parses"         "bash -n $MNT/etc/uconsole/lowpower.conf"
+check "lowpower helper present"        "[[ -x $MNT/usr/local/bin/uconsole-lowpower ]]"
+check "lowpower helper parses"         "bash -n $MNT/usr/local/bin/uconsole-lowpower"
+# sudo IGNORES a drop-in that is not root-owned and 0440, warning only to syslog.
+# The symptom is a key binding that quietly stops saving power, so assert both.
+check "sudoers drop-in ships"          "[[ -f $MNT/etc/sudoers.d/uconsole-lowpower ]]"
+check "sudoers drop-in is 0440"        "[[ \$(stat -c%a $MNT/etc/sudoers.d/uconsole-lowpower) == 440 ]]"
+check "sudoers drop-in is root-owned"  "[[ -f $MNT/etc/sudoers.d/uconsole-lowpower && \$(stat -c%u:%g $MNT/etc/sudoers.d/uconsole-lowpower) == 0:0 ]]"
+check "sudoers drop-in parses"         "chroot $MNT /usr/bin/visudo -c -f /etc/sudoers.d/uconsole-lowpower"
+# Scoped to one binary: no shell, no systemctl, no wildcard.
+check "sudoers grants only the helper" "[[ \$(grep -c 'NOPASSWD: /usr/local/bin/uconsole-lowpower$' $MNT/etc/sudoers.d/uconsole-lowpower) -eq 1 ]]"
+check "toggle calls lowpower down"     "grep -q 'lowpower down' $MNT/usr/local/bin/uconsole-screen-toggle"
+# The sudoers rule grants NOPASSWD for uconsole-lowpower and NOTHING ELSE, so
+# probing with any other command ("sudo -n true") gets "a password is required"
+# and silently skips the whole descent -- on a machine whose screen is off, so
+# it looks like it worked. Never probe with a different command than you run.
+# Comment lines are excluded deliberately: both scripts DESCRIBE this bug in
+# their headers so it does not get reintroduced, and a naive grep matches the
+# explanation as readily as the defect. Same trap as the gpiochip0 check.
+check "toggle does not probe sudo -n true" "[[ \$(grep -v '^[[:space:]]*#' $MNT/usr/local/bin/uconsole-screen-toggle | grep -c 'sudo -n true') -eq 0 ]]"
+check "toggle invokes the helper directly" "grep -q 'sudo -n /usr/local/bin/uconsole-lowpower' $MNT/usr/local/bin/uconsole-screen-toggle"
+check "unstick does not probe sudo -n true" "[[ \$(grep -v '^[[:space:]]*#' $MNT/usr/local/bin/uconsole-unstick | grep -c 'sudo -n true') -eq 0 ]]"
+check "unstick delegates to the helper" "grep -q 'uconsole-lowpower up' $MNT/usr/local/bin/uconsole-unstick"
+# A descent that silently fails to engage is indistinguishable, in watts alone,
+# from one that engaged and had nothing to give. The probe must record state.
+check "probe records power state"      "grep -q '_NPROCESSORS_ONLN' $MNT/usr/local/bin/uconsole-power-probe"
+check "probe flags a skipped descent"  "grep -q 'DID NOT ENGAGE' $MNT/usr/local/bin/uconsole-power-probe"
+# The wake path is where the risk lives. A descent that half-failed must still
+# come back to a usable machine, so every one of these has to be on the way up.
+check "wake restores lowpower state"   "grep -q 'lowpower up' $MNT/usr/local/bin/uconsole-screen-toggle"
+check "wake restores mute state"       "grep -q 'set-mute @DEFAULT_AUDIO_SINK@ 0' $MNT/usr/local/bin/uconsole-screen-toggle"
+check "lowpower up restores cores"     "grep -q 'brought .* core' $MNT/usr/local/bin/uconsole-lowpower"
+check "lowpower up unblocks radios"    "grep -q 'rfkill unblock wifi bluetooth' $MNT/usr/local/bin/uconsole-lowpower"
+# Written BEFORE the block, so a machine that dies mid-descent still comes back
+# with radios rather than stranded with no network and no explanation.
+check "radio stamp set before block"   "[[ \$(grep -n 'touch \"\$STAMP\"' $MNT/usr/local/bin/uconsole-lowpower | cut -d: -f1) -lt \$(grep -n 'rfkill block' $MNT/usr/local/bin/uconsole-lowpower | cut -d: -f1) ]]"
+# cpu0 must never be offlined -- the glob is cpu[1-9]*, not cpu*.
+check "core offlining spares cpu0"     "[[ \$(grep -c 'cpu\[1-9\]\*/online' $MNT/usr/local/bin/uconsole-lowpower) -ge 2 ]]"
+# Offlining is ONE-WAY on this board: bring-up fails with EINVAL and only a
+# reboot recovers. Shipping this on by default cripples the machine after the
+# first blank, silently, because the write on the way down reports success.
+check "core parking off by default"    "grep -q '^CPU_OFFLINE_CORES_ON_BLANK=0' $MNT/etc/uconsole/lowpower.conf"
+check "core bring-up is verified"      "grep -q 'stayed offline after writing 1' $MNT/usr/local/bin/uconsole-lowpower"
+check "hotplug selftest present"       "grep -q 'selftest-cores' $MNT/usr/local/bin/uconsole-lowpower"
+# Modem presence is the only direct evidence MODEM_OFF_ON_BLANK actually worked.
+# A QMI raw_ip netdev reports operstate "unknown" whether the radio is on or
+# off, so it can never show the transition. Read ModemManager's power state --
+# once per phase, because mmcli is far too heavy to run per sample.
+check "probe records modem state"      "grep -q 'modem_state()' $MNT/usr/local/bin/uconsole-power-probe"
+check "probe reads MM power state"     "grep -q 'power state' $MNT/usr/local/bin/uconsole-power-probe"
+check "probe caches modem state per phase" "grep -q 'PHASE_MODEM=\$(modem_state)' $MNT/usr/local/bin/uconsole-power-probe"
+check "probe does not use operstate proxy" "[[ \$(grep -v '^[[:space:]]*#' $MNT/usr/local/bin/uconsole-power-probe | grep -c 'operstate') -eq 0 ]]"
+# Releasing the GPIO rail is not a power-down sequence -- the module stayed
+# enumerated and nothing checked. The radio goes to sleep via ModemManager.
+check "modem uses MM low-power state"  "grep -q 'set-power-state-low' $MNT/usr/local/bin/uconsole-lowpower"
+check "modem power-down is verified"   "grep -q \"wanted 'low'\" $MNT/usr/local/bin/uconsole-lowpower"
+check "modem rail cut is opt-in"       "grep -q '^MODEM_RAIL_OFF_ON_BLANK=0' $MNT/etc/uconsole/lowpower.conf"
+# Saving the PRIOR mute state latches: once anything leaves the sink muted, every
+# later cycle faithfully re-mutes it. Record our own action instead.
+check "mute records our own action"    "grep -q 'we are muting' $MNT/usr/local/bin/uconsole-screen-toggle"
+check "missing mute state means unmute" "grep -q 'cat \"\$MUTESTATE\" 2>/dev/null || echo 1' $MNT/usr/local/bin/uconsole-screen-toggle"
+check "no grep -q on the mute probe"   "[[ \$(grep -v '^[[:space:]]*#' $MNT/usr/local/bin/uconsole-screen-toggle | grep -c 'grep -q MUTED') -eq 0 ]]"
+check "unstick unmutes"                "grep -q 'set-mute @DEFAULT_AUDIO_SINK@ 0' $MNT/usr/local/bin/uconsole-unstick"
+# The wake has to give the screen back at the SAME brightness, not merely a
+# non-zero one -- on a 0-9 panel, 1 vs 5 is unreadable vs usable.
+check "probe samples the backlight"    "grep -q 'BLMAX' $MNT/usr/local/bin/uconsole-power-probe"
+check "probe checks backlight on wake" "grep -q 'matching before the blank' $MNT/usr/local/bin/uconsole-power-probe"
+check "probe checks mute on wake"      "grep -q 'audio mute state unchanged' $MNT/usr/local/bin/uconsole-power-probe"
+check "probe default run is short"     "grep -q 'local base_s=60 blank_s=60' $MNT/usr/local/bin/uconsole-power-probe"
+check "modem policy is set"            "grep -qE '^MODEM_OFF_ON_BLANK=[01]$' $MNT/etc/uconsole/lowpower.conf"
+# Cycling the modem on every blank makes these load-bearing rather than nice to
+# have: the reconnect must be backgrounded (the 180s unit timeout must never
+# block a wake) and the routing mode must be re-applied, because tearing the
+# bearer down drops whatever `uconsole-wan lte|auto` the user had selected.
+# The modem wake MUST NOT be a background subshell. uconsole-lowpower runs under
+# `sudo -n` from a key binding, and sudo 1.9.14+ runs commands in a pty and kills
+# what is left in that session on exit -- so `( ... ) &` was reaped every time,
+# leaving the radio in low power after every wake while everything synchronous
+# restored correctly. A transient systemd unit is not reaped.
+check "modem wake helper present"      "[[ -x $MNT/usr/local/bin/uconsole-modem-wake ]]"
+check "modem wake helper parses"       "bash -n $MNT/usr/local/bin/uconsole-modem-wake"
+check "wake uses a transient unit"     "grep -q 'systemd-run --unit=uconsole-modem-wake' $MNT/usr/local/bin/uconsole-lowpower"
+check "wake is not a background subshell" "[[ \$(grep -c ') &\$' $MNT/usr/local/bin/uconsole-lowpower) -le 1 ]]"
+check "modem wake verifies power state" "grep -q 'stuck in power state' $MNT/usr/local/bin/uconsole-modem-wake"
+check "modem wake retries"             "grep -q 'attempt \$attempt' $MNT/usr/local/bin/uconsole-modem-wake"
+check "modem wake reconnects bearer"   "grep -q 'systemctl restart uconsole-modem-connect.service' $MNT/usr/local/bin/uconsole-modem-wake"
+# Restoring POWER state does not ENABLE the modem. A modem left "disabled" never
+# searches and never registers, so uconsole-modem-connect burns its full 90s
+# wait and exits 2 -- reported only as "failed to start".
+check "modem wake enables the modem"   "grep -q 'mmcli -m \"\$IDX\" --enable' $MNT/usr/local/bin/uconsole-modem-wake"
+check "modem wake waits for registration" "grep -q 'registered|connected' $MNT/usr/local/bin/uconsole-modem-wake"
+check "modem wake reports why it failed" "grep -q 'systemctl status --no-pager' $MNT/usr/local/bin/uconsole-modem-wake"
+# mmcli prints both "state:" and "power state:", so line-oriented scraping picks
+# whichever comes first. Parse the JSON instead.
+check "modem wake parses mmcli JSON"   "grep -q 'mmcli -m \"\$1\" -J' $MNT/usr/local/bin/uconsole-modem-wake"
+# Under systemd-run stdout is captured into the journal, so an unguarded printf
+# alongside logger writes every line twice.
+check "modem wake does not double-log" "grep -q '\[\[ -t 1 \]\] && printf' $MNT/usr/local/bin/uconsole-modem-wake"
+check "wake restores WAN mode"         "grep -q 'wan mode restored' $MNT/usr/local/bin/uconsole-modem-wake"
+check "unstick uses the transient unit" "grep -q 'systemd-run --unit=uconsole-modem-wake' $MNT/usr/local/bin/uconsole-unstick"
+check "uconsole-wan persists its mode" "grep -q 'MODE_FILE=/var/lib/uconsole/wan-mode' $MNT/usr/local/bin/uconsole-wan"
+check "wan mode saved for all 3 modes" "[[ \$(grep -c '^    save_mode ' $MNT/usr/local/bin/uconsole-wan) -eq 3 ]]"
+
+echo "-- power measurement --"
+check "power probe present"            "[[ -x $MNT/usr/local/bin/uconsole-power-probe ]]"
+check "power probe parses"             "bash -n $MNT/usr/local/bin/uconsole-power-probe"
+# On AC the charger current swamps the load current, which is the easiest way to
+# produce a confident and completely wrong idle figure.
+check "power probe refuses on AC"      "grep -q 'on AC power' $MNT/usr/local/bin/uconsole-power-probe"
+# Blanking switches Wi-Fi off, so a session watching over SSH cannot survive its
+# own measurement.
+check "power probe refuses over SSH"   "grep -q 'SSH_CONNECTION' $MNT/usr/local/bin/uconsole-power-probe"
+# Pack size is policy, not a constant -- it depends on which cells are fitted.
+# The probe must read it from the config rather than carrying its own copy, or
+# the two drift apart and the runtime figures quietly become wrong.
+check "pack size is configurable"      "grep -qE '^PACK_WH=[0-9.]+$' $MNT/etc/uconsole/lowpower.conf"
+check "probe reads pack size from conf" "grep -q 'lowpower.conf' $MNT/usr/local/bin/uconsole-power-probe"
+# Cell swaps should not mean hand-editing a config file and redoing arithmetic.
+check "pack has a setter"              "grep -q 'do_pack()' $MNT/usr/local/bin/uconsole-power-probe"
+# A sed that silently no-ops would leave every future runtime estimate wrong
+# with nothing to notice -- the S3.1 failure mode again.
+check "pack setter verifies its write" "grep -q 'write did not take' $MNT/usr/local/bin/uconsole-power-probe"
+# The AXP223 balances nothing across a parallel pair, so mismatched cells are a
+# hazard rather than an untidiness. Warn where someone is actually changing it.
+check "pack setter warns on mismatch"  "grep -q 'same capacity, age and charge level' $MNT/usr/local/bin/uconsole-power-probe"
+# 24.79 Wh came from the defect report and describes larger cells than this unit
+# has. Assert it is gone so it cannot creep back into a runtime estimate.
+check "stale 24.79Wh figure is gone"   "[[ \$(grep -rc '24\\.79' $MNT/etc/uconsole $MNT/usr/local/bin/uconsole-power-probe 2>/dev/null | awk -F: '{s+=\$2} END{print s+0}') -eq 0 ]]"
 echo "-- display fixes --"
 check "panel scale divides evenly (1.25)" "grep -q 'output DSI-2 scale 1.25' $MNT/etc/skel/.config/sway/config"
 check "software cursors forced"        "grep -q 'WLR_NO_HARDWARE_CURSORS=1' $MNT/etc/skel/.bash_profile"

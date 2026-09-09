@@ -11,6 +11,38 @@
 # which presents as a hung machine.
 set -uo pipefail
 STATE=/run/user/$(id -u)/uconsole-backlight.save
+MUTESTATE=/run/user/$(id -u)/uconsole-mute.save
+CONF=/etc/uconsole/lowpower.conf
+
+MUTE_ON_BLANK=1
+# shellcheck source=/dev/null
+[[ -r $CONF ]] && . "$CONF"
+
+# Hand the privileged half off to uconsole-lowpower. This script runs as the
+# logged-in user from a sway binding, so it cannot touch rfkill, cpufreq or CPU
+# hotplug directly, and a key binding has nowhere to prompt for a password --
+# hence `sudo -n` plus a sudoers drop-in scoped to this one binary.
+#
+# Never fatal. If the privileged half is missing or sudo refuses, the screen
+# still blanks and still locks; we just save less power and say so in the log.
+# Never probe with a DIFFERENT command than the one you intend to run.
+#
+# This previously tested `sudo -n true` first. The sudoers drop-in grants
+# NOPASSWD for /usr/local/bin/uconsole-lowpower and nothing else, so sudo
+# answered "a password is required" for /usr/bin/true, the guard failed, and the
+# whole descent was skipped -- silently, on a machine whose screen is off. The
+# blank still blanked and still locked, so it looked like it worked; it just
+# saved nothing but the backlight. Run the real command and judge by its result.
+lowpower() {
+    [[ -x /usr/local/bin/uconsole-lowpower ]] || return 0
+    if [[ $EUID -eq 0 ]]; then
+        /usr/local/bin/uconsole-lowpower "$1" >/dev/null 2>&1 && return 0
+    else
+        sudo -n /usr/local/bin/uconsole-lowpower "$1" >/dev/null 2>&1 && return 0
+    fi
+    logger -t uconsole-screen-toggle "WARNING: 'lowpower $1' failed -- no passwordless sudo, or the helper errored"
+    return 0
+}
 
 cur=$(brightnessctl get 2>/dev/null || echo 0)
 max=$(brightnessctl max 2>/dev/null || echo 0)
@@ -68,8 +100,30 @@ if [[ ${cur:-0} -gt 0 ]]; then
     # Lock before blanking so the desktop is never briefly visible on wake.
     lock_session
     set_inputs disabled pointers
+
+    # Record whether WE muted, not what the mute state was.
+    #
+    # The previous version saved the prior state and replayed it on wake. That
+    # can latch: once anything leaves the sink muted, the next descent records
+    # "was muted", the next wake dutifully re-mutes, and the machine is silent
+    # forever with every cycle looking correct. Recording our own action cannot
+    # latch -- if we did not mute it, we do not touch it.
+    #
+    # `grep -c`, never `grep -q`: with `set -o pipefail`, grep -q exits on the
+    # first match and SIGPIPEs wpctl, which marks the whole pipeline failed and
+    # inverts the result. That exact bug has bitten this repo three times.
+    if [[ ${MUTE_ON_BLANK:-1} == 1 ]] && command -v wpctl >/dev/null 2>&1; then
+        if [[ $(wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null | grep -c MUTED || true) -gt 0 ]]; then
+            echo 0 > "$MUTESTATE"          # already muted by the user; leave it alone
+        else
+            echo 1 > "$MUTESTATE"          # we are muting, so we must unmute on wake
+            wpctl set-mute @DEFAULT_AUDIO_SINK@ 1 >/dev/null 2>&1
+        fi
+    fi
+
     brightnessctl set 0 >/dev/null 2>&1
-    logger -t uconsole-screen-toggle "blanked, locked, pointer input silenced"
+    lowpower down
+    logger -t uconsole-screen-toggle "blanked, locked, pointer input silenced, low-power engaged"
 else
     # Re-enable EVERY input, not just what we silenced. If anything went wrong on
     # the way down, this is the path that has to recover it -- an input left
@@ -80,5 +134,21 @@ else
     else
         brightnessctl set "$(( max * 40 / 100 ))" >/dev/null 2>&1
     fi
-    logger -t uconsole-screen-toggle "woken, input restored"
+
+    # Screen and input first, hardware second: whatever else fails, the user gets
+    # a visible, responsive machine back.
+    lowpower up
+
+    if command -v wpctl >/dev/null 2>&1; then
+        # Unmute unless we explicitly recorded that the user had already muted.
+        # A missing or unreadable state file means UNMUTE: a machine left silent
+        # with no record of why is the worse failure, and this is the branch that
+        # has to clean up after a descent that died halfway.
+        if [[ $(cat "$MUTESTATE" 2>/dev/null || echo 1) != 0 ]]; then
+            wpctl set-mute @DEFAULT_AUDIO_SINK@ 0 >/dev/null 2>&1
+        fi
+        rm -f "$MUTESTATE"
+    fi
+
+    logger -t uconsole-screen-toggle "woken, input and low-power state restored"
 fi

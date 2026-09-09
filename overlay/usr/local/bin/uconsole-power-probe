@@ -1,0 +1,455 @@
+#!/usr/bin/env bash
+# uconsole-power-probe -- measure what the machine actually draws.
+#
+#   uconsole-power-probe run          baseline -> blank -> wake -> report
+#   uconsole-power-probe sample ...   log one labelled phase
+#   uconsole-power-probe report [F]   summarise a log
+#   uconsole-power-probe watch        live readings, one line per interval
+#   uconsole-power-probe pack 2x3500  record which cells are fitted
+#
+# WHY THIS EXISTS
+#
+# Every power decision in this image has so far been argued from community
+# figures and datasheets. Nobody has measured this unit. The blank is claimed to
+# be worth "most of the benefit", the CPU clamp "modest", the radios "the whole
+# story" -- all plausible, none measured. This produces the numbers.
+#
+# THE TOOL CANNOT WATCH OVER SSH, AND THAT IS THE POINT
+#
+# With RADIO_OFF_ON_BLANK=1 the blank switches Wi-Fi off, so an SSH session
+# watching a blanked machine is the one thing guaranteed not to survive the
+# measurement. `run` therefore does the whole sequence on the device -- samples,
+# blanks, keeps sampling, wakes, reports -- and must be started from the
+# uConsole's own terminal. It refuses to start over SSH.
+#
+# THE OBSERVER COSTS POWER
+#
+# While blanked the machine is clamped to minimum frequency and may have cores
+# parked. A sampling loop is a real fraction of what is left, so the default
+# interval is 5s rather than 1s, samples buffer in RAM and flush once a minute
+# rather than hitting the SD card each time, and the reported figure is
+# "draw while being measured" -- a small overestimate of true idle. Treat
+# DIFFERENCES between phases as the trustworthy output, not absolutes.
+set -uo pipefail
+
+B=/sys/class/power_supply/axp20x-battery
+AC=/sys/class/power_supply/axp22x-ac/online
+CONF=/etc/uconsole/lowpower.conf
+# Pack size varies with whatever cells are actually fitted, so it is policy, not
+# a constant. The fallback assumes 2x 18650 2000mAh in parallel (3.7V * 4.0Ah).
+PACK_WH=14.8
+# shellcheck source=/dev/null
+[[ -r $CONF ]] && . "$CONF"
+OUTDIR="${XDG_STATE_HOME:-$HOME/.local/state}/uconsole/power"
+INTERVAL=5
+SETTLE=15                         # seconds discarded after a state change
+
+die()  { echo "uconsole-power-probe: $*" >&2; exit 1; }
+note() { printf '  %s\n' "$*"; }
+
+### preflight ---------------------------------------------------------------
+preflight() {
+    [[ -r $B/voltage_now ]] || die "no battery at $B -- is this a uConsole?"
+    if [[ ! -r $B/current_now ]]; then
+        echo "WARNING: this gauge exposes no current_now."
+        echo "         Power in watts cannot be computed; only voltage sag is logged."
+    fi
+    # On AC the charger current swamps the load current and the number means
+    # nothing for idle draw. This is the single easiest way to produce a
+    # confident, wrong measurement, so refuse rather than warn.
+    if [[ $(cat "$AC" 2>/dev/null || echo 0) == 1 ]]; then
+        die "on AC power. Unplug and re-run -- charging current makes this meaningless."
+    fi
+}
+
+### one sample --------------------------------------------------------------
+# Every sample carries the machine's POWER STATE alongside its draw, not just
+# watts. Without that a descent that silently failed to engage is indistinguish-
+# able from one that engaged and saved nothing -- and that is not hypothetical:
+# a bad sudo guard once skipped the entire descent while the screen still
+# blanked and locked, so it looked correct and saved only the backlight.
+# The report compares these fields between phases and says so outright.
+POL=/sys/devices/system/cpu/cpufreq/policy0
+BL=""; BLMAX=""
+for _b in /sys/class/backlight/*; do
+    [[ -r $_b/brightness ]] && { BL="$_b/brightness"; BLMAX="$_b/max_brightness"; break; }
+done
+WLAN_SOFT=""
+for _r in /sys/class/rfkill/rfkill*; do
+    [[ -r $_r/type ]] || continue
+    [[ $(cat "$_r/type" 2>/dev/null) == wlan ]] && { WLAN_SOFT="$_r/soft"; break; }
+done
+
+# Modem state.
+#
+# The first attempt used the wwan netdev's operstate as a cheap proxy. It cannot
+# work: a QMI raw_ip interface reports "unknown" whether the radio is on or off,
+# so the column read usb:unknown in every phase and proved nothing.
+#
+# ModemManager's own power state is the real answer, and mmcli is far too heavy
+# to call once per sample on a machine drawing three watts. So call it ONCE per
+# phase and cache it -- the state cannot change mid-phase, since the descent
+# happens between phases. Two invocations per run instead of twenty-four.
+PHASE_MODEM="?"
+modem_state() {
+    grep -qs 1e0e /sys/bus/usb/devices/*/idVendor || { echo "off-bus"; return; }
+    local idx st
+    idx=$(mmcli -L 2>/dev/null | grep -o '/Modem/[0-9]*' | head -1 | tr -d '/A-Za-z')
+    [[ -n $idx ]] || { echo "usb:no-mm"; return; }
+    st=$(mmcli -m "$idx" 2>/dev/null | awk -F': *' '/power state/{print $2; exit}')
+    echo "${st:-unknown}"
+}
+
+read_sample() {  # epoch label uV uA cap status cores gov maxfreq wlanSoft modem backlight
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$(date +%s)" "$1" \
+        "$(cat "$B/voltage_now" 2>/dev/null || echo 0)" \
+        "$(cat "$B/current_now" 2>/dev/null || echo 0)" \
+        "$(cat "$B/capacity"    2>/dev/null || echo 0)" \
+        "$(cat "$B/status"      2>/dev/null || echo unknown)" \
+        "$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 0)" \
+        "$(cat "$POL/scaling_governor" 2>/dev/null || echo '?')" \
+        "$(cat "$POL/scaling_max_freq" 2>/dev/null || echo 0)" \
+        "$(cat "$WLAN_SOFT" 2>/dev/null || echo '?')" \
+        "$PHASE_MODEM" \
+        "$(cat "$BL" 2>/dev/null || echo '?')"
+}
+
+# Buffer in RAM, flush once a minute. Appending to the SD card every interval is
+# itself a measurable load on a machine drawing under a watt.
+sample_phase() {   # $1 label  $2 seconds  $3 outfile
+    local label="$1" secs="$2" out="$3" end buf=() n=0
+    PHASE_MODEM=$(modem_state)
+    end=$(( $(date +%s) + secs ))
+    while (( $(date +%s) < end )); do
+        buf+=("$(read_sample "$label")")
+        n=$((n+1))
+        if (( n % 12 == 0 )); then printf '%s\n' "${buf[@]}" >> "$out"; buf=(); fi
+        sleep "$INTERVAL"
+    done
+    (( ${#buf[@]} )) && printf '%s\n' "${buf[@]}" >> "$out"
+    return 0
+}
+
+### report ------------------------------------------------------------------
+do_report() {
+    local f="${1:-}"
+    [[ -n $f ]] || f=$(ls -1t "$OUTDIR"/*.tsv 2>/dev/null | head -1)
+    [[ -n $f && -r $f ]] || die "no log to report on (looked in $OUTDIR)"
+    echo "== $f"
+    grep '^#' "$f" | sed 's/^# /  /'
+    echo
+    grep -v '^#' "$f" | PACK_WH="$PACK_WH" python3 -c '
+import os, sys, statistics as st
+
+PACK_WH = float(os.environ["PACK_WH"])
+phases = {}
+states = {}
+order = []
+for line in sys.stdin:
+    p = line.rstrip("\n").split("\t")
+    if len(p) < 6:
+        continue
+    label, uv, ua = p[1], p[2], p[3]
+    try:
+        uv, ua = int(uv), abs(int(ua))
+    except ValueError:
+        continue
+    if label not in phases:
+        phases[label] = []
+        states.setdefault(label, [])
+        order.append(label)
+    phases[label].append((uv / 1e6, ua / 1e6))
+    # cores / governor / max-freq / wifi-blocked, when the log carries them
+    if len(p) >= 10:
+        states[label].append((p[6], p[7], p[8], p[9],
+                              p[10] if len(p) >= 11 else "?",
+                              p[11] if len(p) >= 12 else "?"))
+
+if not phases:
+    print("  no usable samples")
+    sys.exit(0)
+
+rows = []
+for label in order:
+    s = phases[label]
+    volts = [v for v, _ in s]
+    amps  = [i for _, i in s]
+    watts = [v * i for v, i in s]
+    # Median, not mean: a single LTE transmit burst pulls 4.4A peak-to-peak on
+    # this hardware and would drag a mean well off the steady-state figure.
+    rows.append((label, len(s), st.mean(volts), st.mean(amps) * 1000,
+                 st.median(watts), min(watts), max(watts)))
+
+pad = max(len(r[0]) for r in rows)
+hdr = "  %s  %4s  %6s  %7s  %7s  %15s  %9s" % (
+    "phase".ljust(pad), "n", "volts", "mA", "watts", "range (W)", "runtime")
+print(hdr)
+print("  " + "-" * (len(hdr) - 2))
+FOOT = "  runtime assumes a %.1f Wh pack and is an UPPER BOUND -- the guard cuts at 3.40V." % PACK_WH
+for label, n, v, ma, wt, lo, hi in rows:
+    # Upper bound: the low-voltage guard cuts at 3.40V, so a few percent of the
+    # nominal energy is never actually available.
+    rt = "%6.1f h" % (PACK_WH / wt) if wt > 0.01 else "   n/a"
+    print("  %s  %4d  %6.3f  %7.1f  %7.3f  %6.3f-%7.3f  %9s"
+          % (label.ljust(pad), n, v, ma, wt, lo, hi, rt))
+
+# The comparison is the point. Absolute figures carry the sampler overhead;
+# differences between phases largely cancel it.
+base = next((r for r in rows if r[0] == "screen-on"), None)
+if base and base[4] > 0:
+    print()
+    base_rt = PACK_WH / base[4]
+    for r in rows:
+        if r[0] == "screen-on" or r[4] <= 0:
+            continue
+        delta = base[4] - r[4]
+        pct = 100 * delta / base[4]
+        print("  %s vs screen-on: %+.3f W (%+.0f%%), runtime %.1f h -> %.1f h"
+              % (r[0], -delta, -pct, base_rt, PACK_WH / r[4]))
+
+# What state was the machine actually IN during each phase? A blank that saved
+# little because it never engaged looks identical, in watts alone, to one that
+# engaged and had little to give. This table tells them apart.
+if any(states.get(l) for l in order):
+    def modal(rows, i):
+        vals = [r[i] for r in rows]
+        return max(set(vals), key=vals.count) if vals else "?"
+    print()
+    pad2 = max(len(l) for l in order)
+    hdr2 = ("  %s  %5s  %-10s  %9s  %-8s  %-14s  %s"
+            % ("phase".ljust(pad2), "cores", "governor", "max kHz", "wifi",
+               "modem", "backlight"))
+    print(hdr2)
+    print("  " + "-" * (len(hdr2) - 2))
+    seen = {}
+    for label in order:
+        rows = states.get(label) or []
+        if not rows:
+            continue
+        c, g, m, w, md, bl = (modal(rows, i) for i in range(6))
+        seen[label] = (c, g, m, w, md, bl)
+        wtxt = {"1": "blocked", "0": "up"}.get(w, w)
+        # usb:up = on the bus and the wwan link is up; usb:down = radio asleep
+        # (ModemManager low-power keeps the module enumerated); off-bus = rail cut.
+        mtxt = {"on": "radio on", "low": "low power", "off": "radio off",
+                "off-bus": "rail cut", "usb:no-mm": "no ModemManager"}.get(md, md)
+        print("  %s  %5s  %-10s  %9s  %-8s  %-14s  %s"
+              % (label.ljust(pad2), c, g, m, wtxt, mtxt, bl))
+
+    on, off = seen.get("screen-on"), seen.get("blanked")
+    if on and off:
+        print()
+        if on == off:
+            print("  *** THE LOW-POWER DESCENT DID NOT ENGAGE ***")
+            print("      The blanked phase ran in exactly the same state as screen-on:")
+            print("      same core count, same governor, same clock ceiling, same radio.")
+            print("      Only the backlight was switched off, so the saving above is the")
+            print("      backlight alone and says nothing about the rest.")
+            print("      Check:  journalctl -t uconsole-screen-toggle -b | tail")
+            print("              sudo -n /usr/local/bin/uconsole-lowpower status")
+        else:
+            changed = [n for n, a, b in
+                       zip(("cores", "governor", "max-freq", "wifi", "modem",
+                            "backlight"), on, off)
+                       if a != b]
+            print("  low-power engaged: " + ", ".join(changed) + " all changed on blank.")
+
+print()
+print(FOOT)
+' || die "report failed"
+}
+
+### watch -------------------------------------------------------------------
+do_watch() {
+    preflight
+    echo "interval ${INTERVAL}s, Ctrl-C to stop"
+    printf '%-9s %8s %9s %8s %5s  %s\n' time volts mA watts cap status
+    while true; do
+        IFS=$'\t' read -r _ _ uv ua cap status < <(read_sample watch)
+        awk -v uv="$uv" -v ua="$ua" -v c="$cap" -v s="$status" -v t="$(date +%H:%M:%S)" \
+            'BEGIN{v=uv/1e6; i=(ua<0?-ua:ua)/1e6; printf "%-9s %8.3f %9.1f %8.3f %4s%%  %s\n", t, v, i*1000, v*i, c, s}'
+        sleep "$INTERVAL"
+    done
+}
+
+### run ---------------------------------------------------------------------
+do_run() {
+    local base_s=60 blank_s=60
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --baseline) base_s="${2:?}"; shift ;;
+            --blank)    blank_s="${2:?}"; shift ;;
+            --interval) INTERVAL="${2:?}"; shift ;;
+            *) die "unknown option to run: $1" ;;
+        esac
+        shift
+    done
+
+    # Blanking kills Wi-Fi, so a session watching over SSH is exactly the one
+    # that cannot survive its own measurement.
+    [[ -n ${SSH_CONNECTION:-} ]] && die "run this from the uConsole's own terminal, not SSH -- the blank switches Wi-Fi off"
+    [[ -n ${SWAYSOCK:-} ]] || die "no sway session (SWAYSOCK unset); run this from a terminal inside sway"
+    preflight
+
+    install -d -m700 "$OUTDIR"
+    local out; out="$OUTDIR/$(date +%Y%m%d-%H%M%S).tsv"
+
+    {
+        echo "# uconsole-power-probe $(date -Is)"
+        echo "# kernel        $(uname -r)"
+        echo "# interval      ${INTERVAL}s   settle ${SETTLE}s   pack ${PACK_WH}Wh"
+        echo "# baseline      ${base_s}s     blanked ${blank_s}s"
+        echo "# modem         $(mmcli -L 2>/dev/null | grep -qc Modem && echo present || echo absent)"
+        echo "# wifi rfkill   $(rfkill list wifi 2>/dev/null | grep -m1 'Soft blocked' | tr -d '\t')"
+        grep -hE '^[A-Z_]+=' /etc/uconsole/lowpower.conf 2>/dev/null | sed 's/^/# policy       /'
+    } > "$out"
+
+    local total=$(( base_s + blank_s + SETTLE * 2 ))
+    echo "Measuring for about $(( total / 60 )) min $(( total % 60 ))s. Log: $out"
+    echo
+    echo "The screen will blank and lock partway through. LEAVE IT ALONE -- pressing"
+    echo "the power key mid-run wakes the machine early and the blanked phase is lost."
+    echo "When it wakes by itself, unlock and the report prints here."
+    echo
+    note "phase 1/2: screen on, idle (${base_s}s)"
+    sample_phase screen-on "$base_s" "$out"
+
+    # Snapshot what the wake has to give back, so the check below compares
+    # against reality rather than against an assumption about defaults.
+    local bl_before mute_before
+    bl_before=$(cat "$BL" 2>/dev/null || echo '?')
+    mute_before=$(wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null | grep -c MUTED || true)
+
+    note "blanking now"
+    /usr/local/bin/uconsole-screen-toggle
+    sleep "$SETTLE"                       # discard the descent transient
+
+    sample_phase blanked "$blank_s" "$out"
+
+    note "waking"
+    /usr/local/bin/uconsole-screen-toggle
+    sleep "$SETTLE"
+
+    echo
+    do_report "$out"
+
+    echo
+    echo "Wake-path check"
+    local wfail=0
+
+    # Backlight. Not just "non-zero": a wake that comes back at some arbitrary
+    # fallback level is still a bug, and on a 0-9 panel the difference between
+    # 5 and 1 is the difference between usable and unreadable.
+    local bl_after
+    bl_after=$(cat "$BL" 2>/dev/null || echo '?')
+    if [[ $bl_after == "$bl_before" ]]; then
+        printf '  ok    backlight restored to %s (of %s), matching before the blank\n' \
+            "$bl_after" "$(cat "$BLMAX" 2>/dev/null || echo '?')"
+    elif [[ $bl_after =~ ^[0-9]+$ ]] && (( bl_after > 0 )); then
+        printf '  WARN  backlight came back at %s but was %s before the blank\n' "$bl_after" "$bl_before"
+        wfail=1
+    else
+        printf '  FAIL  backlight is %s after wake -- the screen did not come back\n' "$bl_after"
+        wfail=1
+    fi
+
+    # Audio. The mute flag latched once already; check it rather than assume.
+    if command -v wpctl >/dev/null 2>&1; then
+        local mute_after
+        mute_after=$(wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null | grep -c MUTED || true)
+        if [[ $mute_after == "$mute_before" ]]; then
+            printf '  ok    audio mute state unchanged across the cycle (%s)\n' \
+                "$([[ $mute_after -gt 0 ]] && echo muted || echo unmuted)"
+        else
+            printf '  FAIL  audio was %s before and is %s after\n' \
+                "$([[ $mute_before -gt 0 ]] && echo muted || echo unmuted)" \
+                "$([[ $mute_after  -gt 0 ]] && echo muted || echo unmuted)"
+            wfail=1
+        fi
+    fi
+
+    echo "  --    cores, governor and radios:"
+    { /usr/local/bin/uconsole-lowpower status 2>/dev/null \
+        || sudo -n /usr/local/bin/uconsole-lowpower status 2>/dev/null \
+        || echo "(could not read lowpower status)"; } | sed 's/^/        /'
+
+    echo
+    if (( wfail )); then
+        echo "  One or more wake checks did not pass -- see above."
+        echo "  journalctl -t uconsole-screen-toggle -t uconsole-lowpower -b | tail -20"
+    else
+        echo "  Wake path restored the screen and audio correctly."
+    fi
+}
+
+### pack --------------------------------------------------------------------
+# Cell swaps should not mean redoing arithmetic in your head and hand-editing a
+# config file. `pack 2x3500` is the whole interface.
+do_pack() {
+    local arg="${1:-}" n mah wh
+
+    if [[ -z $arg ]]; then
+        printf 'PACK_WH = %s   (from %s)\n' "$PACK_WH" \
+            "$([[ -r $CONF ]] && grep -q '^PACK_WH=' "$CONF" && echo "$CONF" || echo "built-in default")"
+        printf 'implies  %.0f mAh at 3.7V nominal\n' "$(awk -v w="$PACK_WH" 'BEGIN{print w/3.7*1000}')"
+        echo
+        echo "set it with, e.g.:  sudo uconsole-power-probe pack 2x3500"
+        return 0
+    fi
+
+    if [[ $arg =~ ^([0-9]+)[xX]([0-9]+)$ ]]; then
+        n="${BASH_REMATCH[1]}"; mah="${BASH_REMATCH[2]}"
+        wh=$(awk -v n="$n" -v m="$mah" 'BEGIN{printf "%.1f", 3.7*n*m/1000}')
+        echo "${n} x ${mah}mAh in parallel at 3.7V = ${wh} Wh"
+        # The AXP223 sees one cell and balances nothing, so a mismatched pair
+        # drifts apart every cycle -- and on 18650s that is a real hazard, not a
+        # tidiness point. Say so where someone is actually changing the value.
+        (( n > 1 )) && echo "NOTE: all ${n} cells must be the same capacity, age and charge level."
+    elif [[ $arg =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        wh="$arg"
+        echo "setting pack to ${wh} Wh directly"
+    else
+        die "usage: uconsole-power-probe pack [<count>x<mAh> | <watt-hours>]"
+    fi
+
+    [[ $EUID -eq 0 ]] || die "writing $CONF needs root -- re-run with sudo"
+    [[ -w $CONF ]] || die "$CONF is not writable"
+    if grep -q '^PACK_WH=' "$CONF"; then
+        sed -i "s/^PACK_WH=.*/PACK_WH=${wh}/" "$CONF"
+    else
+        printf 'PACK_WH=%s\n' "$wh" >> "$CONF"
+    fi
+    # Read back rather than trusting sed -- a silent no-op here would leave every
+    # future runtime estimate quietly wrong with nothing to notice.
+    local got; got=$(grep -m1 '^PACK_WH=' "$CONF" | cut -d= -f2)
+    [[ $got == "$wh" ]] || die "write did not take: $CONF still reads PACK_WH=$got"
+    echo "$CONF now reads PACK_WH=${wh}"
+    echo
+    echo "Nameplate capacity is optimistic, especially on used cells. To measure what"
+    echo "the pack actually delivers:  sudo uconsole-battery-calibrate run"
+}
+
+### dispatch ----------------------------------------------------------------
+case "${1:-}" in
+    pack)   shift; do_pack "${1:-}" ;;
+    run)    shift; do_run "$@" ;;
+    watch)  shift; [[ ${1:-} == --interval ]] && INTERVAL="${2:?}"; do_watch ;;
+    report) shift; do_report "${1:-}" ;;
+    sample)
+        shift
+        label="${1:?usage: uconsole-power-probe sample LABEL SECONDS [FILE]}"
+        secs="${2:?usage: uconsole-power-probe sample LABEL SECONDS [FILE]}"
+        preflight
+        install -d -m700 "$OUTDIR"
+        out="${3:-$OUTDIR/$(date +%Y%m%d-%H%M%S).tsv}"
+        echo "sampling '$label' for ${secs}s -> $out"
+        sample_phase "$label" "$secs" "$out"
+        echo "done: $(grep -vc '^#' "$out") samples"
+        ;;
+    *)
+        sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'
+        echo
+        echo "Options: --baseline SEC  --blank SEC  --interval SEC"
+        exit 2 ;;
+esac

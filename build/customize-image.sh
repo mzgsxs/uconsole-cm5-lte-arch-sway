@@ -33,6 +33,15 @@ cp -a /work/overlay/. "$MNT/"
 # scripts that are not root-owned. Depending on the mount's behaviour would make
 # the image correct on one host and quietly broken on another.
 chown -R root:root "$MNT/usr/local/bin" "$MNT/etc/systemd" "$MNT/etc/skel" 2>/dev/null || true
+[[ -d $MNT/etc/uconsole ]] && chown -R root:root "$MNT/etc/uconsole"
+# sudo silently IGNORES a drop-in that is group- or world-writable, or not owned
+# by root -- it warns to syslog and carries on without the rule. That failure is
+# invisible until a key binding quietly stops being able to switch the radios
+# off, so set both explicitly rather than trusting what cp -a happened to carry.
+if [[ -f $MNT/etc/sudoers.d/uconsole-lowpower ]]; then
+    chown root:root "$MNT/etc/sudoers.d/uconsole-lowpower"
+    chmod 440       "$MNT/etc/sudoers.d/uconsole-lowpower"
+fi
 [[ -d $MNT/etc/NetworkManager ]] && chown -R root:root "$MNT/etc/NetworkManager"
 chmod 755 "$MNT/usr/local/bin"/uconsole-* 2>/dev/null || true
 if [[ -d $MNT/etc/NetworkManager/dispatcher.d ]]; then
@@ -112,6 +121,30 @@ systemctl enable uconsole-powerkey-tune.service
 systemctl enable nftables.service
 # zram needs no unit enabled: zram-generator reads /etc/systemd/zram-generator.conf
 # at boot and synthesises systemd-zram-setup@zram0.service itself.
+
+# S3.9: make suspend unreachable.
+#
+# Not a preference -- a hazard. Both sleep states register on this build and
+# BOTH hang the machine: `deep` is a PSCI firmware stub (BCM2712 has no DDR
+# self-refresh sequences) and `s2idle` wedges the SDIO Wi-Fi chip so hard that
+# only a reboot recovers it. Five attempts, five hard hangs, two dirty
+# filesystems. Masking is what stops a stray `systemctl suspend`, a desktop menu
+# item or a future logind default from reaching it.
+#
+# The kernel command line carries mem_sleep_default=s2idle as well, for anything
+# that writes /sys/power/state directly and bypasses systemd entirely -- which is
+# exactly what rtcwake does. mem_sleep resets to `deep` on every boot.
+systemctl mask sleep.target suspend.target hibernate.target \
+               hybrid-sleep.target suspend-then-hibernate.target
+
+# systemd-rfkill persists rfkill state to /var/lib/systemd/rfkill and restores it
+# at boot. The low-power blank can block Wi-Fi and Bluetooth; if the machine dies
+# while blanked, that persistence carries the block into the next boot and you
+# come up with no radios, no SSH, and nothing on screen saying why. Masked so a
+# block can never outlive the boot that set it.
+systemctl mask systemd-rfkill.service systemd-rfkill.socket || true
+# NetworkManager keeps its own radio flag, which masking above does not touch.
+systemctl enable uconsole-radio-restore.service
 
 # Tailscale: the daemon runs but does nothing until someone authenticates with
 # `tailscale up`. No auth key, no state and no identity is baked into the image

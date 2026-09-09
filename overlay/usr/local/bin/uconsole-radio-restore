@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Undo a low-power radio shutdown that never got its wake.
+#
+# The low-power blank (uconsole-screen-toggle) can take Wi-Fi and Bluetooth down
+# with `rfkill block`. Normally the wake branch brings them back. If the machine
+# instead dies while blanked -- battery pull, undervoltage cut, crash -- the wake
+# branch never runs, and TWO separate pieces of state can carry the block into
+# the next boot:
+#
+#   1. systemd-rfkill saves rfkill state to /var/lib/systemd/rfkill and restores
+#      it at boot. That service is masked in this image precisely so a block
+#      cannot survive a reboot; this script is the belt to that braces.
+#   2. NetworkManager persists its OWN radio flag (WirelessEnabled) in
+#      /var/lib/NetworkManager/NetworkManager.state, independently of rfkill.
+#      Masking systemd-rfkill does nothing about it.
+#
+# The failure mode this prevents is specific and nasty: you boot to a machine
+# with no Wi-Fi, no Bluetooth and therefore no SSH, with nothing on screen
+# explaining why, and the recovery tool you would reach for is on the other end
+# of the network that is switched off.
+#
+# It acts only when the stamp is present, so a DELIBERATE `rfkill block wifi`
+# by the user is left alone -- this is not a policy that forces radios on.
+set -uo pipefail
+
+STAMP=/var/lib/uconsole/radios-off-by-lowpower
+
+log() { logger -t uconsole-radio-restore "$*"; printf '[uconsole-radio-restore] %s\n' "$*"; }
+
+[[ -f $STAMP ]] || { log "no stamp; radios left exactly as they are"; exit 0; }
+
+log "stamp present -- the last blank never woke; restoring radios"
+
+if command -v rfkill >/dev/null 2>&1; then
+    rfkill unblock all 2>/dev/null && log "rfkill: all unblocked"
+fi
+
+# NetworkManager's flag is separate from rfkill and survives on its own.
+if command -v nmcli >/dev/null 2>&1; then
+    nmcli radio wifi on      >/dev/null 2>&1 && log "nmcli: wifi radio on"
+    nmcli radio wwan on      >/dev/null 2>&1 || true
+fi
+
+rm -f "$STAMP"
+log "done"

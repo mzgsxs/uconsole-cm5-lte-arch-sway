@@ -12,6 +12,11 @@
 set -uo pipefail
 
 ENV_FILE=/run/uconsole/lte.env
+# /run is tmpfs, so the routing MODE used to vanish on every reboot -- and, now
+# that the low-power blank cycles the modem, on every wake too. Persist it so
+# uconsole-lowpower can put the routing back the way the user left it.
+MODE_FILE=/var/lib/uconsole/wan-mode
+save_mode() { mkdir -p "$(dirname "$MODE_FILE")" 2>/dev/null; printf '%s\n' "$1" > "$MODE_FILE" 2>/dev/null || true; }
 WIFI_METRIC_ASSUMED=600
 LTE_METRIC_PREFER=100
 LTE_METRIC_AUTO=700
@@ -111,6 +116,7 @@ show_status() {
 case "${1-status}" in
 lte)
     need_root lte
+    save_mode lte
     lte_route_add "$LTE_METRIC_PREFER"
     lte_dns_on
     tailscale_follow lte
@@ -120,6 +126,7 @@ lte)
     ;;
 wifi)
     need_root wifi
+    save_mode wifi
     IFACE=$(ls /sys/class/net | grep -E '^(wwu|wwan)' | head -1)
     [[ -n $IFACE ]] && ip route del default dev "$IFACE" 2>/dev/null
     lte_dns_off "$IFACE"
@@ -129,6 +136,7 @@ wifi)
     ;;
 auto)
     need_root auto
+    save_mode auto
     lte_route_add "$LTE_METRIC_AUTO"
     lte_dns_off "$IFACE"
     tailscale_follow auto

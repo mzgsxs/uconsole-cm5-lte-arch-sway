@@ -1,5 +1,127 @@
 # Changelog
 
+## Power management: suspend closed off, a real low-power blank, and measurement
+
+Everything in this entry was driven by measuring the machine rather than reasoning about
+it. Six defects were found that way, and every one of them looked correct from the
+outside.
+
+### Suspend is a hazard, and is now unreachable
+
+`/sys/power/state` reads `freeze mem` on this build, so suspend looks available. It is
+not, and using it hard-hangs the machine — five attempts, five hangs, four battery pulls,
+two dirty filesystems.
+
+- **`deep`** is a PSCI firmware stub. Broadcom never shipped BCM2712's DDR self-refresh
+  sequences; what the firmware advertises parks the ARM core for about a second.
+  `mem_sleep` resets to `deep` on every boot, so a bare `echo mem` silently takes it.
+- **`s2idle`** is real but wedges the SDIO Wi-Fi chip with `-110` backplane timeouts. The
+  chip does not come back — a module reload fails on all three SDIO functions; only a
+  reboot recovers it.
+
+The five sleep targets are masked, `mem_sleep_default=s2idle` is pinned on the kernel
+command line for anything that writes `/sys/power/state` directly, and `systemd-rfkill` is
+masked so a radio block cannot outlive the boot that set it. The stale "the kernel
+registers no sleep states" comments — which described CM4 and invited every one of those
+five attempts — are corrected wherever they appeared.
+
+### A short press now does more than blank the screen
+
+`uconsole-lowpower {down|up|status}` handles what needs root: Wi-Fi and Bluetooth
+`rfkill`, the LTE radio via ModemManager's low-power state, the cpufreq governor and clock
+ceiling. `uconsole-screen-toggle` keeps the user-context half — backlight, lock, pointer
+silencing, mute. A sudoers drop-in grants `wheel` NOPASSWD for that one binary: not a
+shell, not `systemctl`, not a wildcard.
+
+Policy lives in `/etc/uconsole/lowpower.conf`. Every knob is individually switchable.
+
+### Recovery that does not need the network
+
+Switching Wi-Fi off during a blank made the documented "SSH in and fix it" advice
+self-defeating. `uconsole-unstick` is the replacement, run from `Ctrl`+`Alt`+`F2`: VT
+switching is handled by the kernel and logind, so it works when sway has stopped
+responding to input, when its inputs were left disabled, and when the network is off.
+Confirmed on hardware.
+
+`uconsole-radio-restore` covers the other half — a machine that dies mid-blank comes back
+with radios, because the stamp it keys on is written *before* anything is blocked.
+
+### Measurement
+
+`uconsole-power-probe run` measures a baseline, blanks, measures again, wakes and reports
+watts, mA and estimated runtime. It refuses to run on AC (charger current swamps the load)
+and over SSH (blanking switches off the network carrying the session).
+
+Every sample records the machine's *state* — cores, governor, clock ceiling, Wi-Fi block,
+modem power state, backlight — because a descent that silently failed to engage is
+indistinguishable, in watts alone, from one that engaged and had nothing to give. The
+report says `THE LOW-POWER DESCENT DID NOT ENGAGE` outright when the blanked phase ran in
+the same state as the baseline. That is not hypothetical; it caught exactly that.
+
+`uconsole-power-probe pack 2x3500` records which cells are fitted, so a swap is not an
+arithmetic exercise. The pack figure was corrected from an inherited 24.79 Wh (wrong for
+this hardware) to a measured 14.8 Wh.
+
+### What the measurements actually said
+
+| | |
+|---|---|
+| Screen on, idle | ~4.1 W measured, not the ~5–7 W previously assumed |
+| Backlight | **~0.7 W — about 18 %**, not the "dominant" share the design assumed |
+| Governor + clock ceiling + radios | ~0.2 W |
+| CPU core parking | unavailable — see below |
+| **Remaining floor** | **~3.2 W: SoC, DSI panel, RP1/USB — unreachable from userspace** |
+
+The claim that the backlight dominates idle draw, which justified stopping at the panel,
+is false on this hardware and has been corrected in `docs/HARDWARE.md`.
+
+### Six defects found by measuring
+
+- **The entire descent was skipped.** The toggle guarded its privileged call with
+  `sudo -n true`, but the sudoers rule grants one binary and nothing else, so sudo
+  answered "a password is required" and the guard failed. The screen still blanked and
+  locked, so it looked correct while saving only the backlight. **Never probe with a
+  different command than the one you intend to run.**
+- **CPU cores never came back.** Offlining is one-way on this board: `psci: CPU1 killed`
+  succeeds, bring-up fails with `CPU1: failed in unknown state : 0x0`, and only a reboot
+  recovers. The machine ran at 1 of 4 cores indefinitely — a later "idle" measurement was
+  recorded that way without anyone noticing, because the write on the way *down* returns
+  success. Core parking now defaults off, bring-up is verified, and
+  `uconsole-lowpower selftest-cores` tests it safely on other boards.
+- **Mute latched permanently.** Saving the *prior* mute state and replaying it means that
+  once anything leaves the sink muted, every later cycle faithfully re-mutes it. It now
+  records its own action; a missing state file means unmute.
+- **The modem was never switched off.** Releasing the GPIO power rail is not a power-down
+  sequence — the SIM7600 stayed enumerated and nothing checked. Now uses ModemManager's
+  low-power state, verified by reading it back.
+- **The modem wake was killed every time.** It ran as `( … ) &` inside a script invoked
+  through `sudo -n`; since 1.9.14 sudo runs commands in a pty and kills what remains in
+  that session on exit. Everything synchronous restored correctly and only the one
+  asynchronous step silently never happened. It is now a transient systemd unit.
+- **Restoring power state does not enable the modem.** Coming back from low power leaves
+  ModemManager's modem `disabled`, which never searches and never registers, so the bearer
+  burned its full 90-second wait and gave up. One missing `--enable`.
+
+### Other fixes
+
+- `uconsole-wan` now persists its routing mode to `/var/lib/uconsole/wan-mode`. It lived
+  in `/run`, so cycling the modem — or any reboot — silently dropped you back to the boot
+  default.
+- `verify-image.sh` could not run standalone: it called `partprobe`, which the base
+  container does not ship, and parsed JSON with a `python3` it does not have. Both
+  dependencies are gone; the documented build steps now work from a fresh clone.
+- A fourth and fifth instance of **`grep -q` under `pipefail`** were found and fixed.
+
+### Verification
+
+265 → **344 checks**. The new ones assert the locks (sleep targets masked, `mem_sleep`
+pinned), the wake path (governor, mute, radios, backlight *to the same value*, standby
+timer), the privilege boundary (sudoers drop-in root-owned and 0440 — sudo silently
+ignores it otherwise), and each specific defect above so it cannot return.
+
+Structural verification still proves only that files are in place. Every behavioural claim
+here was confirmed on hardware.
+
 ## Initial release
 
 A working Arch Linux ARM + Sway image for the uConsole with Raspberry Pi CM5, built and

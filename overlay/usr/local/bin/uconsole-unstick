@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+# Recover a machine stranded by a low-power blank. Run it from a text console.
+#
+#   Ctrl+Alt+F2  ->  log in  ->  uconsole-unstick
+#
+# WHY THIS EXISTS
+#
+# The documented recovery for a black screen used to be "SSH in and re-enable
+# things". Once the low-power blank starts switching radios off, that advice is
+# self-defeating: the network you would use to recover is the thing that got
+# switched off. A second virtual terminal does not depend on the network, and
+# does not depend on sway either -- VT switching is handled by the kernel and
+# logind, so Ctrl+Alt+F2 still works when the compositor has stopped responding
+# to input and when sway's own inputs have been left disabled.
+#
+# Everything here is UNCONDITIONAL and idempotent. This is the path that has to
+# clean up after a descent that went wrong halfway, so it never asks "did we set
+# this?" -- it restores the safe value regardless, and a missing state file
+# means "use the sane default", never "do nothing".
+#
+#   uconsole-unstick             restore screen, input, CPU and radios
+#   uconsole-unstick --unlock    also dismiss swaylock (see the note below)
+#
+# --unlock is not a security hole: reaching this script at all requires a
+# successful login on a local virtual terminal, which is the same credential
+# swaylock is asking for. It is off by default so that the ordinary case --
+# rescuing a blanked screen -- still leaves you at a password prompt.
+set -uo pipefail
+
+UNLOCK=0
+TARGET_USER=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --unlock)     UNLOCK=1 ;;
+        --user)       TARGET_USER="${2:-}"; shift ;;
+        -h|--help)    awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; exit 0 ;;
+        *)            echo "uconsole-unstick: unknown option: $1" >&2; exit 2 ;;
+    esac
+    shift
+done
+
+ok()   { printf '  ok    %s\n' "$*"; }
+skip() { printf '  --    %s\n' "$*"; }
+warn() { printf '  WARN  %s\n' "$*"; }
+
+# Run a privileged action, escalating only if we are not already root. `sudo -n`
+# rather than `sudo`: if a password would be required we want to say so plainly
+# rather than block on a prompt in the middle of a recovery.
+# Root or nothing, for the RAW sysfs pokes below.
+#
+# There used to be a `sudo -n <some other command>` probe here. It was wrong in
+# principle and wrong in fact: the sudoers drop-in grants one binary and nothing
+# else, so probing with anything else reports "no privilege" even when the thing
+# you actually wanted to run was permitted. The privileged work now goes through
+# uconsole-lowpower (delegated above, and permitted without a password); these
+# direct writes are the root-only fallback for when that binary is broken or
+# missing, which is exactly the situation a rescue tool has to survive.
+HAVE_PRIV=0
+[[ $EUID -eq 0 ]] && HAVE_PRIV=1
+
+priv() {
+    (( HAVE_PRIV )) || return 127
+    "$@"
+}
+
+### 1. Find the sway session ------------------------------------------------
+# SWAYSOCK is not set on a different VT, so locate the socket directly. sway
+# names it sway-ipc.<uid>.<pid>.sock under the user's runtime directory.
+find_swaysock() {
+    [[ -n ${SWAYSOCK:-} && -S ${SWAYSOCK:-} ]] && { printf '%s' "$SWAYSOCK"; return 0; }
+    local uid pat s
+    if [[ -n $TARGET_USER ]]; then
+        uid=$(id -u "$TARGET_USER" 2>/dev/null) || return 1
+        pat="/run/user/$uid/sway-ipc.*.sock"
+    else
+        pat="/run/user/*/sway-ipc.*.sock"
+    fi
+    # Newest first: if a previous sway left a stale socket behind, the live one
+    # is the most recently created.
+    for s in $(ls -1t $pat 2>/dev/null); do
+        [[ -S $s ]] && { printf '%s' "$s"; return 0; }
+    done
+    return 1
+}
+
+# Before falling back to raw sysfs pokes, try the one privileged path an ordinary
+# wheel user is actually granted: the sudoers drop-in permits uconsole-lowpower
+# and nothing else. So `sudo -n rfkill ...` needs a password while
+# `sudo -n uconsole-lowpower up` does not -- and the latter restores the same
+# cores, governor, clock ceiling and radios. Attempt it and judge by its exit
+# status; never probe with a different command than the one you mean to run.
+DELEGATED=0
+if [[ -x /usr/local/bin/uconsole-lowpower ]]; then
+    if [[ $EUID -eq 0 ]]; then
+        /usr/local/bin/uconsole-lowpower up >/dev/null 2>&1 && DELEGATED=1
+    else
+        sudo -n /usr/local/bin/uconsole-lowpower up >/dev/null 2>&1 && DELEGATED=1
+    fi
+    (( DELEGATED )) && echo "== delegated CPU and radio restore to uconsole-lowpower up"
+fi
+
+if (( HAVE_PRIV == 0 && DELEGATED == 0 )); then
+    echo "NOTE: no root, no passwordless sudo, and uconsole-lowpower could not be"
+    echo "      reached -- the screen and input steps will still run, but CPU and"
+    echo "      radio state cannot be restored."
+    echo "      Re-run as: sudo uconsole-unstick${UNLOCK:+ --unlock}"
+    echo
+fi
+
+echo "== sway session"
+if SOCK=$(find_swaysock); then
+    export SWAYSOCK="$SOCK"
+    ok "socket: $SWAYSOCK"
+
+    if swaymsg input '*' events enabled >/dev/null 2>&1; then
+        ok "all input devices re-enabled"
+    else
+        warn "could not re-enable input via swaymsg (is this sway still alive?)"
+    fi
+
+    if (( UNLOCK )); then
+        if pkill -x swaylock 2>/dev/null; then ok "swaylock dismissed"
+        else skip "swaylock was not running"; fi
+    else
+        pgrep -x swaylock >/dev/null 2>&1 \
+            && skip "swaylock left running (re-run with --unlock to dismiss it)"
+    fi
+else
+    skip "no sway socket found -- restoring hardware state only"
+fi
+
+### 2. Backlight ------------------------------------------------------------
+echo "== backlight"
+if command -v brightnessctl >/dev/null 2>&1; then
+    cur=$(brightnessctl get 2>/dev/null || echo 0)
+    max=$(brightnessctl max 2>/dev/null || echo 0)
+    if [[ ${cur:-0} -eq 0 ]]; then
+        # Prefer the value the blank saved, but never trust it to exist or to be
+        # sane -- a saved 0 would restore a black screen, which is the exact
+        # situation we are recovering from.
+        want=""
+        for f in /run/user/*/uconsole-backlight.save; do
+            [[ -r $f ]] && want=$(cat "$f" 2>/dev/null) && break
+        done
+        [[ ${want:-0} =~ ^[0-9]+$ ]] && (( want > 0 )) || want=$(( max * 40 / 100 ))
+        (( want > 0 )) || want=1
+        brightnessctl set "$want" >/dev/null 2>&1 && ok "restored to $want (of $max)"
+    else
+        skip "already lit ($cur of $max)"
+    fi
+else
+    warn "brightnessctl not installed"
+fi
+
+### 2b. Audio ---------------------------------------------------------------
+# The blank mutes the sink. If its wake branch did not run, the machine is left
+# silent with nothing on screen explaining why -- so unmute unconditionally here
+# and clear the saved flag, which is what latched the mute in the first place.
+echo "== audio"
+if command -v wpctl >/dev/null 2>&1; then
+    if wpctl set-mute @DEFAULT_AUDIO_SINK@ 0 >/dev/null 2>&1; then
+        ok "sink unmuted"
+    else
+        warn "wpctl could not reach the audio sink (is PipeWire running for this user?)"
+    fi
+    rm -f /run/user/*/uconsole-mute.save 2>/dev/null
+else
+    skip "wpctl not installed"
+fi
+
+### 3. CPU ------------------------------------------------------------------
+# Cores first, then frequency policy: a core that comes online adopts the
+# current policy, so ordering it the other way would leave cores 1-3 clamped.
+echo "== cpu"
+was_offline=0; brought=0
+for c in /sys/devices/system/cpu/cpu[0-9]*/online; do
+    [[ -r $c ]] || continue
+    [[ $(cat "$c" 2>/dev/null) == 0 ]] || continue
+    was_offline=$((was_offline+1))
+    priv sh -c "echo 1 > '$c'" 2>/dev/null && brought=$((brought+1))
+done
+if   (( was_offline == 0 ));      then skip "all cores already online"
+elif (( brought == was_offline ));then ok   "brought $brought core(s) back online"
+else warn "$was_offline core(s) offline, restored only $brought -- needs root"; fi
+
+policies=0; restored=0
+for p in /sys/devices/system/cpu/cpufreq/policy*; do
+    [[ -d $p ]] || continue
+    policies=$((policies+1))
+    if [[ -r $p/cpuinfo_max_freq ]]; then
+        priv sh -c "cat '$p/cpuinfo_max_freq' > '$p/scaling_max_freq'" 2>/dev/null || true
+        # Read back rather than trusting the write. raspberrypi-cpufreq goes
+        # through the firmware, so a write here is not guaranteed to take -- the
+        # same class of silent no-op that made `parted -s resizepart` look fine
+        # while leaving 52 GB unallocated (S3.1).
+        want=$(cat "$p/cpuinfo_max_freq" 2>/dev/null)
+        got=$(cat "$p/scaling_max_freq"  2>/dev/null)
+        if [[ $want == "$got" ]]; then restored=$((restored+1))
+        else warn "$(basename "$p"): scaling_max_freq is ${got:-?}, wanted ${want:-?}"; fi
+    fi
+    if [[ -r $p/scaling_available_governors ]]; then
+        avail=" $(cat "$p/scaling_available_governors" 2>/dev/null) "
+        for g in schedutil ondemand performance; do
+            if [[ $avail == *" $g "* ]]; then
+                priv sh -c "echo $g > '$p/scaling_governor'" 2>/dev/null || true
+                break
+            fi
+        done
+    fi
+done
+if   (( policies == 0 ));           then skip "no cpufreq policy on this machine"
+elif (( restored == policies ));    then ok   "frequency clamp cleared on $restored policy/policies"
+else warn "cleared $restored of $policies cpufreq policies -- needs root"; fi
+
+### 4. Radios ---------------------------------------------------------------
+echo "== radios"
+if command -v rfkill >/dev/null 2>&1; then
+    priv rfkill unblock all 2>/dev/null && ok "rfkill: all unblocked" || warn "rfkill unblock needs root"
+fi
+if command -v nmcli >/dev/null 2>&1; then
+    nmcli radio wifi on >/dev/null 2>&1 && ok "NetworkManager wifi radio on"
+fi
+priv rm -f /var/lib/uconsole/radios-off-by-lowpower 2>/dev/null || true
+
+# The modem is deliberately last and deliberately backgrounded: powering it up
+# and re-registering can take up to the unit's 180s timeout, and nothing above
+# should wait on a radio to come back.
+# As a transient unit, not a background job: this script is normally run under
+# sudo, and sudo kills what is left in its pty session when it exits. A
+# backgrounded modem restore here would be reaped exactly as it was in
+# uconsole-lowpower, leaving the radio asleep with nothing to say so.
+if [[ -x /usr/local/bin/uconsole-modem-wake ]]; then
+    priv systemctl stop uconsole-modem-wake.service >/dev/null 2>&1
+    priv systemctl reset-failed uconsole-modem-wake.service >/dev/null 2>&1
+    if priv systemd-run --unit=uconsole-modem-wake --collect \
+         --description="Restore the uConsole LTE modem" \
+         /usr/local/bin/uconsole-modem-wake >/dev/null 2>&1; then
+        ok "modem wake started (journalctl -t uconsole-modem-wake -b to follow)"
+    else
+        warn "could not start the modem wake -- needs root"
+    fi
+fi
+
+echo
+echo "Done. Switch back with Ctrl+Alt+F1."

@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# uconsole-modem-wake [--rail-cut] [--wan-mode lte|wifi|auto]
+#
+# Bring the LTE modem back after a low-power blank: radio out of ModemManager's
+# low-power state, bearer reconnected, routing mode restored.
+#
+# WHY THIS IS A SEPARATE PROGRAM AND NOT A BACKGROUND SUBSHELL
+#
+# It used to be `( ... ) &` inside uconsole-lowpower. That silently did nothing.
+# uconsole-lowpower is invoked through `sudo -n` from a sway key binding, and
+# since 1.9.14 sudo runs commands in a pty by default and kills whatever is left
+# in that session when the command exits. `up` returns in well under a second;
+# the modem sequence needs tens of seconds. It was being killed every time,
+# which is why the radio stayed in low power after every wake while the
+# synchronous parts -- governor, cores, rfkill -- all restored correctly.
+#
+# Running as a transient systemd unit fixes that properly: nothing reaps it, it
+# survives the caller by design, and its progress lands in the journal where it
+# can be read after the fact (`journalctl -t uconsole-modem-wake -b`).
+#
+# Every step is VERIFIED rather than assumed. `mmcli --set-power-state-on`
+# returning 0 does not mean the radio came back.
+set -uo pipefail
+
+RAIL_CUT=0
+WAN_MODE=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --rail-cut) RAIL_CUT=1 ;;
+        --wan-mode) WAN_MODE="${2:-}"; shift ;;
+        *) echo "uconsole-modem-wake: unknown option: $1" >&2; exit 2 ;;
+    esac
+    shift
+done
+
+# Only echo to stdout on a terminal. Under systemd-run, stdout is captured into
+# the journal too, so an unguarded printf logs every line twice.
+log() {
+    logger -t uconsole-modem-wake "$*"
+    [[ -t 1 ]] && printf '[uconsole-modem-wake] %s\n' "$*"
+    return 0
+}
+
+on_bus()      { grep -qs 1e0e /sys/bus/usb/devices/*/idVendor; }
+modem_index() { mmcli -L 2>/dev/null | grep -o '/Modem/[0-9]*' | head -1 | tr -d '/A-Za-z'; }
+
+# JSON, not text scraping: `mmcli -m N` prints both "state:" and "power state:",
+# so a line-oriented match on /state:/ picks up whichever comes first.
+mm_field() {
+    mmcli -m "$1" -J 2>/dev/null \
+        | python3 -c "import sys,json;print(json.load(sys.stdin)['modem']['generic']['$2'])" 2>/dev/null
+}
+power_state() { mm_field "$1" power-state; }
+modem_state() { mm_field "$1" state; }
+
+### 1. The supply rail, only if it was actually cut ---------------------------
+if (( RAIL_CUT )) || ! on_bus; then
+    log "modem is off the USB bus; restoring the power rail"
+    systemctl restart uconsole-modem-power.service >/dev/null 2>&1
+    for _ in $(seq 1 30); do on_bus && break; sleep 2; done
+    on_bus || { log "ERROR: modem never returned to the USB bus"; exit 1; }
+    log "modem back on the bus"
+fi
+
+### 2. Wait for ModemManager to see it ----------------------------------------
+IDX=""
+for _ in $(seq 1 30); do
+    IDX="$(modem_index)"
+    [[ -n $IDX ]] && break
+    sleep 2
+done
+[[ -n $IDX ]] || { log "ERROR: ModemManager never listed a modem"; exit 1; }
+
+### 3. Out of low power, verified ---------------------------------------------
+st="$(power_state "$IDX")"
+if [[ $st != on ]]; then
+    for attempt in 1 2 3; do
+        log "power state is '${st:-unknown}'; requesting 'on' (attempt $attempt)"
+        mmcli -m "$IDX" --set-power-state-on >/dev/null 2>&1
+        # The radio needs a moment to come up and re-register; polling beats a
+        # fixed sleep, and three attempts covers a modem that was mid-transition.
+        for _ in $(seq 1 10); do
+            sleep 1
+            st="$(power_state "$IDX")"
+            [[ $st == on ]] && break
+        done
+        [[ $st == on ]] && break
+    done
+fi
+
+if [[ $st == on ]]; then
+    log "radio powered on"
+else
+    log "ERROR: modem stuck in power state '${st:-unknown}' after 3 attempts"
+    log "recover with: sudo mmcli -m $IDX --set-power-state-on"
+    exit 1
+fi
+
+### 4. Enable the modem, then wait for it to register -------------------------
+#
+# This step was missing, and it is why every reconnect failed for 90 seconds and
+# then gave up. Restoring the POWER state does not ENABLE the modem: coming back
+# from low power leaves ModemManager's modem in "disabled", and a disabled modem
+# never searches, never registers, and never accepts a bearer. At cold boot MM
+# enables it for us, which is why this only ever broke after a blank.
+#
+# uconsole-modem-connect waits up to 90s for registered|connected and then exits
+# 2 -- exactly the failure that was being reported as "failed to start".
+ms="$(modem_state "$IDX")"
+log "modem state after power-on: ${ms:-unknown}"
+if [[ $ms == disabled || $ms == locked ]]; then
+    log "enabling the modem"
+    mmcli -m "$IDX" --enable >/dev/null 2>&1 || log "WARNING: --enable was rejected"
+fi
+
+# Registration over LTE is typically 10-30s, longer while roaming.
+for _ in $(seq 1 45); do
+    ms="$(modem_state "$IDX")"
+    [[ $ms =~ ^(registered|connected)$ ]] && break
+    sleep 2
+done
+if [[ $ms =~ ^(registered|connected)$ ]]; then
+    log "modem registered (state=$ms)"
+else
+    log "WARNING: modem did not register (state=${ms:-unknown}); trying the bearer anyway"
+fi
+
+### 5. Bearer -----------------------------------------------------------------
+if systemctl restart uconsole-modem-connect.service >/dev/null 2>&1; then
+    log "bearer reconnected"
+else
+    # Say WHY, so the next failure is diagnosable from the journal alone rather
+    # than needing a second round trip.
+    log "WARNING: uconsole-modem-connect.service failed (modem state=$(modem_state "$IDX"), power=$(power_state "$IDX"))"
+    systemctl status --no-pager -n 10 uconsole-modem-connect.service 2>&1 \
+        | sed 's/^/  /' | while read -r l; do logger -t uconsole-modem-wake "$l"; done
+fi
+
+### 6. Routing ----------------------------------------------------------------
+# Cycling the modem tears down its default route. Without this, a wake silently
+# drops you from `uconsole-wan lte` back to whatever the boot default happens to
+# be -- the mode itself lives in /run and does not survive.
+[[ -z $WAN_MODE ]] && WAN_MODE="$(cat /var/lib/uconsole/wan-mode 2>/dev/null)"
+case "$WAN_MODE" in
+    lte|wifi|auto)
+        if /usr/local/bin/uconsole-wan "$WAN_MODE" >/dev/null 2>&1; then
+            log "wan mode restored: $WAN_MODE"
+        else
+            log "WARNING: could not restore wan mode '$WAN_MODE'"
+        fi
+        ;;
+esac
+
+log "done"
