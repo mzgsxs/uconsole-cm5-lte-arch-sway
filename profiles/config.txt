@@ -30,6 +30,35 @@ usb_max_current_enable=1
 dtparam=audio=on
 dtoverlay=audremap-pi5,pins_12_13
 
+# ramoops: keep the tail of the kernel log in a RAM region that a warm reset does
+# not clear, so it can be read from /sys/fs/pstore on the next boot.
+#
+# This exists because of a specific, repeated failure: every hard hang on this
+# machine destroys the journal, so the one thing we most need -- what the kernel
+# was doing in the instant before it stopped -- has never once been recoverable.
+# Trying to read it from the console does not work either: cmdline.txt sets
+# console=tty1, which is where sway runs, so switching to tty2 to watch a suspend
+# means the printk output goes to the terminal you just left.
+#
+# With the watchdog now rebooting a wedged machine automatically, a RAM console is
+# what turns that reboot into evidence rather than just a recovery.
+# console-size is the load-bearing parameter, and it defaults to ZERO.
+#
+# ramoops' record-size buffer only receives an oops or panic dump -- kmsg_dump()
+# has to actually run to write it. A HANG produces neither, and neither does a
+# watchdog reset: the CPU is simply restarted, so no code runs to save anything.
+# Set up with record-size alone, /sys/fs/pstore comes back empty after exactly
+# the failure we are trying to diagnose. It did.
+#
+# console-size creates a second ring that receives the kernel console
+# CONTINUOUSLY, so whatever printk emitted right up to the instant the machine
+# stopped is still in RAM after a warm reset -- including pm_print_times naming
+# the last device to suspend.
+#
+# The reserved region is 64 KiB total (base 0xb000000). 32 KiB of console plus
+# the 16 KiB record buffer fits with room to spare.
+dtoverlay=ramoops-pi5,console-size=0x8000
+
 [all]
 # Stop the firmware bringing up its own default DSI display so that the
 # clockworkpi overlay owns the panel. Omitting this leaves the screen dark.

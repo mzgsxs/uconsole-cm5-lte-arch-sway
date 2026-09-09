@@ -1,0 +1,51 @@
+Subject: [PATCH] drm/panel: cwu50: clear "prepared" even when DCS shutdown fails
+
+cwu50_unprepare() returns early if either DCS command fails, leaving
+ctx->prepared set. cwu50_prepare() then short-circuits on
+
+	if (ctx->prepared)
+		return 0;
+
+so cwu50_prepare_cm45() is never called again and the panel is never
+re-initialised for the rest of the boot. The display stays dark through
+every subsequent modeset.
+
+Those DCS writes do fail in practice: on RP1 the bridge's post_disable
+runs rp1dsi_dsi_stop() before the panel's unprepare, so there is no live
+DSI link left to carry them. The panel is being powered down either way,
+so a failed courtesy shutdown must not prevent the driver from admitting
+that it happened.
+
+The CM3 branch in this same function already handles it correctly -- it
+warns, jumps to the hardware reset, and always clears the flag. Give the
+CM4/CM5 branch the same structure. cwu50_prepare_cm45() re-runs the full
+sequence (regulators, optional RESX cycle, TE, SLPOUT and the init table),
+so clearing the flag is sufficient to make the panel recoverable.
+
+Observed on a ClockworkPi uConsole with CM5: `drm_panel` disable, whether
+from DPMS off or from an s2idle resume, left the panel permanently dark
+while the rest of the system kept running.
+
+--- a/drivers/gpu/drm/panel/panel-cwu50.c
++++ b/drivers/gpu/drm/panel/panel-cwu50.c
+@@ -610,15 +610,16 @@
+ 	/* CM4/CM5 path (unchanged from the original multi-panel driver) */
+ 	ret = mipi_dsi_dcs_set_display_off(dsi);
+ 	if (ret) {
+-		dev_err(ctx->dev, "failed to turn display off (%d)\n", ret);
+-		return ret;
++		dev_warn(ctx->dev, "failed to turn display off (%d)\n", ret);
++		goto cm45_done;
+ 	}
+ 
+ 	ret = mipi_dsi_dcs_enter_sleep_mode(dsi);
+ 	if (ret) {
+-		dev_err(ctx->dev, "failed to enter sleep mode (%d)\n", ret);
+-		return ret;
++		dev_warn(ctx->dev, "failed to enter sleep mode (%d)\n", ret);
++		goto cm45_done;
+ 	}
+ 	msleep(120);
+ 
++cm45_done:
+ 	if (!ctx->is_new_panel) {

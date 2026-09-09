@@ -11,8 +11,21 @@
 #   shutdown   how long a hold takes for the PMIC to cut power in HARDWARE.
 #              That is an unclean cut -- the kind that previously corrupted the
 #              journal and left the FAT boot partition dirty. Push it to the
-#              maximum so systemd's clean shutdown always wins the race, leaving
-#              the hardware cut as a genuine last resort.
+#              maximum so systemd's clean shutdown always wins the race.
+#
+#              DO NOT rely on this as an emergency force-off ON CM5. An earlier
+#              version of this comment described it as a dependable emergency
+#              cutoff. It is not one here. Raspberry Pi changed the power pins
+#              between CM4 and CM5, and on CM5 the button only works while the
+#              KERNEL IS STILL RESPONDING -- confirmed on the ClockworkPi forums
+#              and reproduced on this unit, where a long hold on a hung machine
+#              cleared the screen but never actually powered the module off.
+#              The AXP223 accepts the register write regardless, which is what
+#              makes this misleading.
+#
+#              For a machine that is genuinely wedged, the recovery is the
+#              hardware watchdog (see /etc/systemd/system.conf.d/uconsole-
+#              watchdog.conf), not this.
 #
 # Values are written in milliseconds; the driver accepts only a fixed set, so we
 # try candidates in order and keep the first the kernel accepts.

@@ -120,6 +120,21 @@ property, measured on a long-lived test machine carrying hand-copied files. The 
 retracted that as "accumulated state, cause unknown". Both were too confident. The cause
 was two causes, and only one of them was ours.
 
+**The power button cannot force-off a hung CM5.** On CM4 a long hold triggers a hardware
+cutoff. On CM5 it does not: Raspberry Pi changed the power-control pins between the
+modules, so the button only works *while the kernel is still responding*. A hard hang
+leaves battery removal as the only documented recovery — which means taking the back panel
+off. Observed here: a long hold on a wedged machine cleared the screen (a rail dropped)
+but never powered the module off. The AXP223's `shutdown` register accepts a value
+regardless, so `uconsole-powerkey-tune` reporting success proves nothing about whether a
+force-off will work.
+
+Mitigated, not fixed, by arming the **hardware watchdog** (`RuntimeWatchdogSec=15`) so a
+wedged kernel resets itself in ~15 s. That is still an unclean reset — it saves the
+disassembly, not the `fsck`. A true hardware cutoff needs the aftermarket battery board's
+J6 pads wired to a microswitch, which the community routes out through the existing
+antenna-cable hole rather than drilling.
+
 **CPU offlining is one-way — the firmware can park a core but cannot restart it.**
 Offlining succeeds; bringing the core back fails, and only a reboot recovers it. Measured
 on this board 2026-09-08 on all of cpu1–cpu3:

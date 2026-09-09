@@ -399,6 +399,7 @@ check "powerkey tuner present"         "[[ -x $MNT/usr/local/bin/uconsole-powerk
 check "powerkey tuner enabled"         "[[ -L $MNT/etc/systemd/system/multi-user.target.wants/uconsole-powerkey-tune.service ]]"
 check "tuner shortens press detection" "grep -q 'set_first_accepted \"\$f\" 128' $MNT/usr/local/bin/uconsole-powerkey-tune"
 check "tuner defers the hardware cut"  "grep -q 'set_first_accepted \"\$f\" 10000' $MNT/usr/local/bin/uconsole-powerkey-tune"
+gzip -dc "$MNT/boot/vmlinuz-linux-uconsole-cm5-git" > /tmp/vmlinux-wd.raw 2>/dev/null || true
 echo "-- suspend is a hazard, not a feature (S3.9) --"
 # The kernel still has suspend compiled in, and that is fine -- what matters is
 # that nothing can REACH it. Both registered states hang this machine: `deep` is
@@ -525,6 +526,59 @@ check "cleanup enabled"                "[[ -L $MNT/etc/systemd/system/multi-user
 # this one only on the real system.
 check "cleanup is real-system-only"    "grep -q 'ConditionPathExists=!/etc/initrd-release' $MNT/usr/lib/systemd/system/uconsole-ota-cleanup.service"
 
+echo "-- hang recovery without a screwdriver --"
+# On CM5 the power button only works while the kernel responds, so a hard hang
+# otherwise means opening the back panel and pulling the 18650s. The watchdog is
+# the only software recovery that exists.
+check "watchdog drop-in ships"         "[[ -f $MNT/etc/systemd/system.conf.d/uconsole-watchdog.conf ]]"
+check "runtime watchdog armed"         "grep -qE '^RuntimeWatchdogSec=[1-9]' $MNT/etc/systemd/system.conf.d/uconsole-watchdog.conf"
+check "reboot watchdog armed"          "grep -qE '^RebootWatchdogSec=' $MNT/etc/systemd/system.conf.d/uconsole-watchdog.conf"
+check "watchdog driver is built in"    "[[ \$(strings /tmp/vmlinux-wd.raw 2>/dev/null | grep -c bcm2835-wdt) -gt 0 ]]"
+check "sysrq drop-in ships"            "[[ -f $MNT/etc/sysctl.d/99-uconsole-sysrq.conf ]]"
+# A watchdog reboot is only useful if it leaves evidence. Every hard hang so far
+# destroyed the journal, and console=tty1 means printk goes to the VT sway is on,
+# so watching from tty2 shows nothing. ramoops survives a warm reset.
+check "ramoops overlay enabled"        "grep -qE '^dtoverlay=ramoops' $MNT/boot/config.txt"
+# console-size defaults to 0, and without it ramoops only captures oops/panic
+# dumps -- which a hang never produces. The first attempt shipped with the
+# default and /sys/fs/pstore came back empty after exactly the failure it was
+# added to diagnose.
+check "ramoops console ring enabled"   "grep -qE '^dtoverlay=ramoops-pi5,console-size=0x[0-9a-f]+' $MNT/boot/config.txt"
+check "ramoops overlay present"        "[[ -s $MNT/boot/overlays/ramoops-pi5.dtbo ]]"
+check "s2idle test can read pstore"    "grep -q 'do_pstore()' $MNT/usr/local/bin/uconsole-s2idle-test"
+# `rtcwake` arms an RTC alarm. If the alarm cannot fire, the machine suspends
+# correctly and is simply never woken -- systemd stops petting the watchdog and
+# the board resets, which looks exactly like a hang. This board's RTC is the one
+# documented as unusable, so that has to be ruled out before calling it a hang.
+check "wake path is testable"          "grep -q 'do_wake_check()' $MNT/usr/local/bin/uconsole-s2idle-test"
+check "wake-check never suspends"      "grep -q 'this never suspends' $MNT/usr/local/bin/uconsole-s2idle-test"
+check "button wake is available"       "grep -q 'WAKE_BUTTON' $MNT/usr/local/bin/uconsole-s2idle-test"
+# NetworkManager persists WirelessEnabled=false in its own state file. Masking
+# systemd-rfkill does nothing about that, so `nmcli radio wifi off` in a test
+# helper leaves the machine with no Wi-Fi after the next reboot -- which it did.
+check "unload-wifi does not persist a NM radio off" \
+      "[[ \$(grep -v '^[[:space:]]*#' $MNT/usr/local/bin/uconsole-s2idle-test | grep -c 'nmcli radio wifi off') -eq 0 ]]"
+check "unload-wifi stamps for boot recovery" \
+      "grep -q 'radios-off-by-lowpower' $MNT/usr/local/bin/uconsole-s2idle-test"
+check "s2idle test can restore wifi"   "grep -q 'do_restore_wifi()' $MNT/usr/local/bin/uconsole-s2idle-test"
+# pm_test=devices returns BEFORE suspend_enter(), so it never runs suspend_noirq
+# -- the phase the brcmstb GPIO bug lives in. A ladder that stops at `devices`
+# passes on a machine that cannot suspend at all, which it did, twice.
+check "bisect ladder reaches platform" "grep -q 'for level in freezer devices platform;' $MNT/usr/local/bin/uconsole-s2idle-test"
+# ...and stops there. suspend_test() matches on EQUALITY, and under s2idle
+# suspend_enter() takes the s2idle branch before the TEST_CPUS/TEST_CORE checks,
+# so selecting `processors` or `core` performs a REAL suspend while pretending to
+# be a safe test.
+check "bisect stops before the real thing" "[[ \$(grep -c 'for level in freezer devices platform processors core' $MNT/usr/local/bin/uconsole-s2idle-test) -eq 0 ]]"
+# 244 = unraw + signalling + sync + remount-ro + reboot, i.e. exactly REISUB.
+check "sysrq enables REISUB"           "grep -qE '^kernel.sysrq = 244$' $MNT/etc/sysctl.d/99-uconsole-sysrq.conf"
+# The AXP223 accepts the shutdown register write on CM5 even though the hardware
+# cutoff does not work, so the old "genuine last resort" claim was misleading.
+check "powerkey tuner does not promise a force-off" \
+      "[[ \$(tr '\n' ' ' < $MNT/usr/local/bin/uconsole-powerkey-tune | grep -c 'genuine last resort') -eq 0 ]]"
+check "powerkey tuner names the CM5 limitation" \
+      "grep -q 'KERNEL IS STILL RESPONDING' $MNT/usr/local/bin/uconsole-powerkey-tune"
+
 echo "-- low-power blank (Stage 1) --"
 check "lowpower policy ships"          "[[ -f $MNT/etc/uconsole/lowpower.conf ]]"
 check "lowpower policy parses"         "bash -n $MNT/etc/uconsole/lowpower.conf"
@@ -552,6 +606,27 @@ check "sudoers drop-in parses"         "chroot $MNT /usr/bin/visudo -c -f /etc/s
 # Scoped to one binary: no shell, no systemctl, no wildcard.
 check "sudoers grants only the helper" "[[ \$(grep -c 'NOPASSWD: /usr/local/bin/uconsole-lowpower$' $MNT/etc/sudoers.d/uconsole-lowpower) -eq 1 ]]"
 check "toggle calls lowpower down"     "grep -q 'lowpower down' $MNT/usr/local/bin/uconsole-screen-toggle"
+# The panel is 0.70 W beyond its backlight, and the blank left it running for
+# the entire life of this project on the strength of a report (S3.8) that turned
+# out to be wrong. Powering it down is now the largest single saving here.
+check "blank powers the panel down"    "grep -q 'power off' $MNT/usr/local/bin/uconsole-screen-toggle"
+check "panel policy is configurable"   "grep -qE '^PANEL_OFF_ON_BLANK=[01]$' $MNT/etc/uconsole/lowpower.conf"
+# OFF by default: the 0.70 W is real but the VT-bounce restore wedged the
+# compositor on its first unattended wake and cost a session. A restore that
+# does not need a VT switch is the blocker.
+check "panel power-down off by default" "grep -qE '^PANEL_OFF_ON_BLANK=0$' $MNT/etc/uconsole/lowpower.conf"
+# chvt returning 0 does not mean the switch completed -- the compositor must ack.
+check "VT bounce verifies it returned"  "grep -q 'foreground console is' $MNT/usr/local/bin/uconsole-lowpower"
+# sway CANNOT re-enable this output -- power on / enable / mode all return
+# success and leave it dark. Only a VT bounce works, and it needs root.
+check "wake restores the panel"        "grep -q 'lowpower panel-on' $MNT/usr/local/bin/uconsole-screen-toggle"
+check "panel restore is a VT bounce"   "grep -q 'chvt' $MNT/usr/local/bin/uconsole-lowpower"
+check "panel restore is verified"      "grep -q 'panel_is_on' $MNT/usr/local/bin/uconsole-screen-toggle"
+# The output name is read back rather than hardcoded, so a renamed connector
+# does not silently disable the whole feature.
+check "panel output is detected"       "grep -q 'panel_output()' $MNT/usr/local/bin/uconsole-screen-toggle"
+# S3.8 is disproved; the old rationale must not survive in the shipped script.
+check "no stale S3.8 dpms rationale"   "[[ \$(tr '\n' ' ' < $MNT/usr/local/bin/uconsole-screen-toggle | grep -c 'Deliberately drives the BACKLIGHT') -eq 0 ]]"
 # The sudoers rule grants NOPASSWD for uconsole-lowpower and NOTHING ELSE, so
 # probing with any other command ("sudo -n true") gets "a password is required"
 # and silently skips the whole descent -- on a machine whose screen is off, so
@@ -739,6 +814,11 @@ check "power probe refuses over SSH"   "grep -q 'SSH_CONNECTION' $MNT/usr/local/
 # The probe must read it from the config rather than carrying its own copy, or
 # the two drift apart and the runtime figures quietly become wrong.
 check "pack size is configurable"      "grep -qE '^PACK_WH=[0-9.]+$' $MNT/etc/uconsole/lowpower.conf"
+# Pin the shipped default to the cells actually fitted (2x 18650 3500mAh in
+# parallel = 3.7V * 7.0Ah = 25.9 Wh). Without this the config and the docs drift
+# apart silently and every runtime estimate is quietly wrong.
+check "pack matches the fitted cells"  "grep -qE '^PACK_WH=25.9$' $MNT/etc/uconsole/lowpower.conf"
+check "probe fallback matches the config" "grep -qE '^PACK_WH=25.9$' $MNT/usr/local/bin/uconsole-power-probe"
 check "probe reads pack size from conf" "grep -q 'lowpower.conf' $MNT/usr/local/bin/uconsole-power-probe"
 # Cell swaps should not mean hand-editing a config file and redoing arithmetic.
 check "pack has a setter"              "grep -q 'do_pack()' $MNT/usr/local/bin/uconsole-power-probe"
