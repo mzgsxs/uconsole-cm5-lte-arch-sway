@@ -1,0 +1,50 @@
+Subject: [PATCH] gpio: brcmstb: only abort suspend when a parent IRQ exists
+
+brcmstb_gpio_suspend_noirq() aborts with -EBUSY whenever priv->suspended is
+false, to catch a wakeup arriving between ->suspend() and ->suspend_noirq().
+
+But ->suspend() only ever sets that flag when the controller has a parent IRQ:
+
+	static int brcmstb_gpio_suspend(struct device *dev)
+	{
+		if (priv->parent_irq > 0)
+			priv->suspended = true;
+		return 0;
+	}
+
+A GPIO bank with no parent IRQ therefore can never satisfy the noirq test, and
+fails every single suspend with -EBUSY -- not because anything is busy, but
+because the flag it checks is never armed. Since the flag is also what the bank
+IRQ handler clears to signal "a wake fired mid-suspend", a bank with no parent
+IRQ has nothing to catch in the first place.
+
+BCM2712 (Raspberry Pi 5 / CM5) hits this: gpio@7d517c00 has no `interrupts`
+property in the device tree, so s2idle aborts 100% of the time with
+
+  brcmstb-gpio 107d517c00.gpio: PM: dpm_run_callback(): brcmstb_gpio_suspend_noirq returns -16
+  brcmstb-gpio 107d517c00.gpio: PM: failed to suspend noirq: error -16
+  PM: noirq suspend of devices failed
+
+while the sibling bank gpio@7d508500, which does have a parent IRQ, suspends
+fine. Make the guard symmetric with the condition that arms it.
+
+--- a/drivers/gpio/gpio-brcmstb.c
++++ b/drivers/gpio/gpio-brcmstb.c
+@@ -603,8 +603,15 @@ static int brcmstb_gpio_suspend_noirq(struct device *dev)
+ {
+ 	struct brcmstb_gpio_priv *priv = dev_get_drvdata(dev);
+ 
+-	/* Catch any wakeup sources occurring between suspend and noirq */
+-	if (!priv->suspended)
++	/*
++	 * Catch any wakeup sources occurring between suspend and noirq.
++	 *
++	 * ->suspend() only arms priv->suspended when a parent IRQ exists, and
++	 * only the bank IRQ handler clears it. A controller without a parent
++	 * IRQ has no wake to catch, so testing the flag there would reject
++	 * every suspend with -EBUSY. Keep the guard symmetric with ->suspend().
++	 */
++	if (priv->parent_irq > 0 && !priv->suspended)
+ 		return -EBUSY;
+ 
+ 	if (priv->parent_irq > 0)
