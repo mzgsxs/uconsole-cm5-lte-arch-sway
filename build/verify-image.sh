@@ -522,6 +522,12 @@ check "restore is exec'd before snapshot" \
       "[[ \$(grep -n 'uconsole-session-restore' $MNT/etc/skel/.config/sway/config | head -1 | cut -d: -f1) -lt \$(grep -n 'uconsole-session-snapshot' $MNT/etc/skel/.config/sway/config | head -1 | cut -d: -f1) ]]"
 check "snapshotter honours the lock"   "grep -q 'os.path.exists(LOCK)' $MNT/usr/local/bin/uconsole-session-snapshot"
 check "restore takes the lock"         "grep -q 'O_CREAT | os.O_EXCL' $MNT/usr/local/bin/uconsole-session-restore"
+# A restore killed before its `finally` runs used to leave the lock behind, and
+# the snapshotter skips writing whenever it exists -- a session that silently
+# stopped recording, and a next boot with nothing to restore from.
+check "restore reclaims a stale lock"  "grep -q 'clearing a stale restore lock' $MNT/usr/local/bin/uconsole-session-restore"
+# Otherwise an uninstalled app costs the full window timeout, per app, at login.
+check "restore skips missing apps"     "grep -q 'not installed any more' $MNT/usr/local/bin/uconsole-session-restore"
 # The boot id is what distinguishes a resume from an ordinary re-login. Without
 # it a logout and login would duplicate every window.
 check "restore is gated on boot id"    "grep -q 'snap.get(\"boot_id\") == now_boot' $MNT/usr/local/bin/uconsole-session-restore"

@@ -54,7 +54,6 @@ DONE = os.path.join(STATE_DIR, "session.restored")
 LOCK = os.path.join(RUNTIME, "uconsole-session.lock")
 
 WINDOW_TIMEOUT_S = 25.0     # first window of a launched process
-EXTRA_TIMEOUT_S = 8.0       # each additional window of the same process
 POLL_S = 0.25
 
 
@@ -203,6 +202,37 @@ def place(con_id, want):
         sway_cmd(f"{sel} fullscreen disable")
 
 
+def take_lock():
+    """Claim the restore lock, reclaiming it if the holder is gone.
+
+    The pid inside the lock is not decoration. A restore killed before its
+    `finally` runs -- SIGKILL, or sway dying mid-restore -- used to leave the file
+    behind forever, and the snapshotter skips writing whenever it exists. The
+    result was a session that silently stopped recording, and a next boot with
+    nothing to restore from. Check the holder rather than trusting the file.
+    """
+    for attempt in (1, 2):
+        try:
+            fd = os.open(LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            return True
+        except OSError:
+            if attempt == 2:
+                return False
+            try:
+                holder = int(open(LOCK).read().strip() or 0)
+                os.kill(holder, 0)      # raises if the holder is gone
+                return False            # a real restore is running
+            except (OSError, ValueError):
+                log("clearing a stale restore lock")
+                try:
+                    os.unlink(LOCK)
+                except OSError:
+                    return False
+    return False
+
+
 def main():
     if not os.environ.get("SWAYSOCK"):
         return 0
@@ -241,11 +271,7 @@ def main():
     # exists, so it cannot capture the half-restored desktop we are building and
     # overwrite the thing we are reading from.
     os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
-    try:
-        fd = os.open(LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        os.write(fd, str(os.getpid()).encode())
-        os.close(fd)
-    except OSError:
+    if not take_lock():
         log("another restore holds the lock; doing nothing")
         return 0
 
@@ -259,6 +285,13 @@ def main():
         for proc in procs:
             cmd = launch_command(proc)
             if not cmd:
+                continue
+            # Skip an application that has since been uninstalled, rather than
+            # spending the full window timeout waiting for a window that cannot
+            # appear -- 25s of a login, per missing app.
+            exe = proc.get("app_id") or (proc.get("cmdline") or [""])[0]
+            if not shutil.which(exe) and not os.path.exists(exe):
+                log(f"{proc.get('app_id')}: not installed any more; skipping")
                 continue
             wins = proc.get("windows") or []
             first = wins[0] if wins else {}
@@ -290,9 +323,9 @@ def main():
                 continue
             sway_cmd(f"exec /bin/sh {runner}")
 
-            # One launch per PROCESS, then place the windows it opens in order.
-            # Firefox is a single process with N windows and reopens them all
-            # itself; launching once per window would start N browsers.
+            # One launch per PROCESS. Firefox is a single process with N windows
+            # and reopens them all itself; launching once per window would start
+            # N browsers.
             got = wait_for_new(before, 1, WINDOW_TIMEOUT_S)
             try:
                 os.unlink(runner)          # sh has read it by now
@@ -301,15 +334,26 @@ def main():
             if not got:
                 log(f"{proc.get('app_id')}: no window appeared; skipping")
                 continue
-            if len(wins) > 1:
-                got += wait_for_new(before | {g["id"] for g in got},
-                                    len(wins) - 1, EXTRA_TIMEOUT_S)
 
-            for window, want in zip(got, wins):
-                place(window["id"], want)
-                if want.get("focused"):
-                    focus_target = window["id"]
-            log(f"{proc.get('app_id')}: restored {len(got)} of {len(wins)} window(s)")
+            # Place the FIRST window only.
+            #
+            # An earlier version waited for the remaining windows of a
+            # multi-window process and zip()ped them against the snapshot. That
+            # was wrong twice over: the workspace is switched once, BEFORE the
+            # launch, so windows 2..N were all born on window 1's workspace; and
+            # `got` is in arrival order while `wins` is in snapshot order, so the
+            # pairing was arbitrary. It looked correct and placed windows at
+            # random -- and was untestable here, since Firefox is not installed.
+            #
+            # Doing it properly needs placeholder containers that real windows are
+            # swallowed into -- sway's `append_layout`, closed unmerged as
+            # swaywm/sway#3022. Firefox reopens its own windows regardless, so the
+            # honest behaviour is: first window placed, the rest left to the app.
+            place(got[0]["id"], wins[0])
+            if wins[0].get("focused"):
+                focus_target = got[0]["id"]
+            extra = "" if len(wins) < 2 else f", {len(wins) - 1} more left to the app"
+            log(f"{proc.get('app_id')}: restored on workspace {ws_num}{extra}")
 
         if focus_target is not None:
             sway_cmd(f"[con_id={focus_target}] focus")

@@ -41,7 +41,7 @@ import sys
 import time
 
 DEBOUNCE_S = 2.0        # quiet period after activity before writing
-PERIODIC_S = 300.0      # write anyway this often, as a safety net
+PERIODIC_S = 1800.0     # catches a cwd change, which fires no sway event
 SCHEMA = 1
 
 RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
@@ -116,30 +116,34 @@ def tmux_clients():
         return {}
 
 
-def descendants(pid):
-    """PIDs below `pid`, so a terminal can be matched to its tmux client."""
+def ppid(pid):
     try:
-        children = {}
-        for entry in os.listdir("/proc"):
-            if not entry.isdigit():
-                continue
-            try:
-                with open(f"/proc/{entry}/stat") as f:
-                    # comm can contain spaces and parens; everything after the
-                    # final ')' is positional, and ppid is the second field there.
-                    stat = f.read()
-                ppid = int(stat[stat.rindex(")") + 2:].split()[1])
-            except (OSError, ValueError, IndexError):
-                continue
-            children.setdefault(ppid, []).append(int(entry))
-        out, stack = [], [pid]
-        while stack:
-            for child in children.get(stack.pop(), []):
-                out.append(child)
-                stack.append(child)
-        return out
-    except OSError:
-        return []
+        with open(f"/proc/{pid}/stat") as f:
+            stat = f.read()
+        # comm can contain spaces and parens; everything after the final ')' is
+        # positional, and ppid is the second field there.
+        return int(stat[stat.rindex(")") + 2:].split()[1])
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
+def tmux_session_for(pid, clients):
+    """Which tmux session, if any, is running inside this window's process.
+
+    Walks UP from each tmux client rather than enumerating every process on the
+    system. There are one or two clients and the chain is a few links long; the
+    downward search this replaces read /proc/*/stat for EVERY process, on every
+    debounced snapshot, on a machine whose whole point is not wasting power.
+    """
+    for client_pid, session in clients.items():
+        p = client_pid
+        for _ in range(10):            # depth guard against a cycle
+            if p == pid:
+                return session
+            p = ppid(p)
+            if p <= 1:
+                break
+    return None
 
 
 def walk(node, workspace, acc):
@@ -154,7 +158,6 @@ def walk(node, workspace, acc):
             acc.append({
                 "pid": pid,
                 "app_id": app_id or cls,
-                "xwayland": app_id is None,
                 "con_id": child.get("id"),
                 "workspace": workspace,
                 # 0 none, 1 fullscreen, 2 global fullscreen
@@ -183,12 +186,7 @@ def build():
             cmdline = proc_cmdline(pid)
             if not cmdline:
                 continue          # process already gone; nothing to relaunch
-            tmux_session = None
-            if clients:
-                for d in [pid] + descendants(pid):
-                    if d in clients:
-                        tmux_session = clients[d]
-                        break
+            tmux_session = tmux_session_for(pid, clients) if clients else None
             processes[pid] = {
                 "pid": pid,
                 "app_id": w["app_id"],
@@ -221,15 +219,11 @@ def build():
 
 def write(snap):
     os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    # Written to a temp file and renamed: os.replace is atomic, so an interrupted
+    # write can never leave a half-parsed snapshot behind. That, plus the lock the
+    # restore holds, is why no ".prev" generation is kept -- it protected against
+    # nothing that can actually happen.
     tmp = SNAPSHOT + ".tmp"
-    # Keep one generation. If a restore is interrupted halfway it will have
-    # rewritten the live snapshot with a partial desktop, and .prev is then the
-    # only thing that still describes the session as it was.
-    try:
-        if os.path.exists(SNAPSHOT):
-            os.replace(SNAPSHOT, SNAPSHOT + ".prev")
-    except OSError:
-        pass
     with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
         json.dump(snap, f, indent=1)
         f.flush()
