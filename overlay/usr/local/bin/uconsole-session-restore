@@ -39,6 +39,7 @@ produces a desktop where nothing is where you left it.
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -153,19 +154,36 @@ def tmux_ready(timeout=20.0):
 
 def launch_command(proc):
     """Build the shell command that recreates this process."""
-    cmd = proc.get("cmdline") or []
+    cmd = list(proc.get("cmdline") or [])
     if not cmd:
         return None
+
+    # Prefer the name the desktop knows the app by over the binary /proc
+    # reported. Firefox records as /usr/lib/firefox/firefox, and launching that
+    # directly bypasses whatever /usr/bin/firefox does -- on Arch a wrapper that
+    # sets up the environment, not necessarily a bare symlink.
+    #
+    # Only when argv[0] is an ABSOLUTE path and the app_id resolves in PATH: a
+    # command already recorded by name is left exactly as it was.
+    app_id = proc.get("app_id") or ""
+    if cmd[0].startswith("/") and app_id and shutil.which(app_id):
+        cmd[0] = app_id
+
     session = proc.get("tmux_session")
     if session:
         # Come back attached to the same tmux session rather than a bare prompt.
         # new-session -A attaches if it exists and creates it if it does not, so
         # this is safe even when continuum restored nothing.
-        term = cmd[0]
-        cmd = [term, "-e", "tmux", "new-session", "-A", "-s", session]
+        cmd = [cmd[0], "-e", "tmux", "new-session", "-A", "-s", session]
+
     line = " ".join(shlex.quote(c) for c in cmd)
+
+    # A terminal launched from sway inherits sway's cwd, which is "/". Restoring
+    # that faithfully would drop you in the root directory instead of at home,
+    # which is worse than not restoring the directory at all. Only honour a cwd
+    # that someone plausibly chose.
     cwd = proc.get("cwd") or ""
-    if cwd and os.path.isdir(cwd):
+    if cwd and cwd not in ("/", os.sep) and os.path.isdir(cwd):
         line = f"cd {shlex.quote(cwd)} && exec {line}"
     return line
 

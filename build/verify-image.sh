@@ -555,6 +555,12 @@ check "firefox policy restores session" "grep -q 'browser.startup.page' $MNT/etc
 # tmux-continuum restores into the server; attaching before it is up lands you
 # in an empty session instead of the one you left.
 check "restore waits for tmux"         "grep -q 'def tmux_ready' $MNT/usr/local/bin/uconsole-session-restore"
+# /proc reports Firefox as /usr/lib/firefox/firefox; relaunching that bypasses
+# whatever /usr/bin/firefox does. Prefer the name the desktop knows it by.
+check "restore prefers the PATH name"  "grep -q 'shutil.which(app_id)' $MNT/usr/local/bin/uconsole-session-restore"
+# A terminal launched from sway inherits sway's cwd of "/", so restoring it
+# faithfully drops you in the root directory instead of at home.
+check "restore ignores a cwd of /"     "grep -q 'cwd not in (\"/\", os.sep)' $MNT/usr/local/bin/uconsole-session-restore"
 
 echo "-- power measurement --"
 check "power probe present"            "[[ -x $MNT/usr/local/bin/uconsole-power-probe ]]"
