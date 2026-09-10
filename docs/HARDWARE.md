@@ -65,35 +65,38 @@ This matters more than it looks, because the session-restore feature deliberatel
 encourages powering off and back on — which is exactly the operation this panel is worst
 at. The ClockworkPi community documents the same cold-boot fragility.
 
-**The CPU boots capped at 1.5 GHz, and the cap cannot be lifted from sysfs.**
-`cpuinfo_max_freq` reads 2400000 and the OPP table lists every step from 1500000 to
-2400000 — but `scaling_max_freq` boots at **1500000**, equal to `scaling_min_freq`.
-Writing a higher value is accepted and reads back correctly, then silently reverts:
+**A 1.5 GHz clock ceiling is a symptom, not a hardware property.** This was briefly
+recorded here as a hardware fact and that was wrong; a clean boot disproves it.
+
+The observation was real. On a machine that had been running scp'd files through days of
+low-power testing, `scaling_max_freq` sat at 1500000 against a `cpuinfo_max_freq` of
+2400000, and writes to raise it reverted within 30 seconds. It was neither undervoltage
+(`in0_lcrit_alarm=0`) nor thermal (38 °C), and no shipped script had run.
+
+On a **freshly flashed image**, measured 2026-09-10:
 
 ```
-before        1500000
-immediately   2400000     <- write accepted
-after 10s     2400000
-after 30s     1500000     <- firmware re-imposed the cap
+scaling_max_freq   2400000     <- equal to cpuinfo_max_freq
+scaling_min_freq   1500000
+after 35s          2400000     <- holds; no revert
 ```
 
-Measured 2026-09-09. It is **not** undervoltage (`rpi_volt` `in0_lcrit_alarm=0`), **not**
-thermal (38 °C, one zone), and nothing in this image writes the value — only our own
-scripts reference it and none had run. `config.txt` sets no `arm_freq`, `arm_boost` or
-`over_voltage`, so this is the firmware's own ceiling being re-synced periodically.
+and it is still 2400000 after a full blank/wake cycle. So the cap was **accumulated state
+on that particular machine**, not something the board does. The specific cause was not
+established and is not worth chasing on a card that has since been reflashed.
 
-Two consequences worth knowing before doing any power work:
+The lesson is the transferable part: a long-lived test machine carrying hand-copied files
+is not a reference for what the hardware does. Anything claimed as a hardware property
+needs confirming on a clean boot from a built image before it goes in this file.
 
-- **The clock ceiling clamp in `CPU_CLAMP_ON_BLANK` is a no-op on this board.** Clamping
-  `scaling_max_freq` down to `cpuinfo_min_freq` changes nothing when the ceiling is
-  already at the floor. Only the governor switch does anything, which is why the CPU
-  contribution measured ≈0.
-- **Every power figure in this repository was taken with the CPU capped at 62 % of its
-  rated clock.** They are still valid for comparing states, which is what they are used
-  for, but they are not figures for a full-speed machine.
+Two corrections follow from that, both of which were briefly written down here and are
+wrong: the ceiling clamp in `CPU_CLAMP_ON_BLANK` is **not** a no-op — on a healthy machine
+the ceiling is 2400000 and the floor 1500000, so clamping does lower it; and the power
+figures in this repository were **not** taken at a reduced clock — the probe's own state
+table recorded `max kHz 2400000` for every screen-on phase.
 
-Unresolved: whether `arm_freq=2400`/`arm_boost=1` in `config.txt` lifts it, and what that
-costs in watts. Do not add either speculatively — measure with `uconsole-power-probe`.
+If you do see the ceiling stuck at the floor, treat it as a machine that needs rebooting,
+and check `uconsole-lowpower status` for a descent that never completed.
 
 **CPU offlining is one-way — the firmware can park a core but cannot restart it.**
 Offlining succeeds; bringing the core back fails, and only a reboot recovers it. Measured

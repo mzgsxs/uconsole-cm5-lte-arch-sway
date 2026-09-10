@@ -80,17 +80,23 @@ And one regression caught before it shipped: pruning
 load and takes the *disable* branch when the option is off. Unused-looking and unused are
 different things.
 
-### New hardware fact: the CPU boots capped at 1.5 GHz
+### A retracted claim: the 1.5 GHz ceiling
 
-`cpuinfo_max_freq` reads 2400000 and the OPP table lists every step up to it, but
-`scaling_max_freq` boots at 1500000 — equal to `scaling_min_freq`. Writes to raise it are
-accepted, read back correctly, and revert within 30 seconds. Not undervoltage
-(`in0_lcrit_alarm=0`), not thermal (38 °C), and nothing in this image writes it.
+This release briefly documented "the CPU boots capped at 1.5 GHz" as a hardware fact. It
+is not one, and a clean boot disproves it.
 
-Two consequences: the ceiling clamp in `CPU_CLAMP_ON_BLANK` is a **no-op** on this board,
-which is why the CPU contribution measured ≈0; and every power figure in this repository
-was taken with the CPU at 62 % of its rated clock. Whether `arm_freq`/`arm_boost` lifts it,
-and at what cost in watts, is unresolved — and deliberately not guessed at.
+The measurement was real — on the long-lived test machine, `scaling_max_freq` sat at the
+floor and writes to raise it reverted within 30 seconds, with neither undervoltage nor
+thermal throttling to explain it. But that machine had been running hand-copied files
+through days of low-power testing. On a freshly flashed image the ceiling is 2400000, it
+holds, and it survives a full blank/wake cycle.
+
+Two consequences drawn from the bad claim are withdrawn with it: the ceiling clamp in
+`CPU_CLAMP_ON_BLANK` is **not** a no-op, and the power figures here were **not** taken at
+a reduced clock — the probe's state table recorded 2400000 throughout.
+
+Recorded because the mistake is the useful part: a test device carrying scp'd files is not
+a reference for what the hardware does, and this one had been treated as one.
 
 ### Verification
 
