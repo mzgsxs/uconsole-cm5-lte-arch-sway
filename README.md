@@ -5,7 +5,7 @@ A build system that produces a bootable **Arch Linux ARM** image with a
 fitted with a **Raspberry Pi Compute Module 5**.
 
 The kernel is compiled from source; the image is assembled and then checked by an
-automated verification suite — **413 checks** for the runtime image, **417** for the dev
+automated verification suite — **432 checks** for the runtime image, **433** for the dev
 image, all passing.
 
 Inputs are pinned where upstream allows it: the kernel commit, the upstream builder, and
@@ -100,6 +100,23 @@ uconsole-selftest            # read-only; safe any time, SSH included
 uconsole-selftest --cycle    # also run a real blank/wake cycle and assert the restore
 ```
 
+The dev image also **autologs in** to a pre-created account, so a freshly flashed card
+reaches the desktop and accepts SSH with no keyboard interaction. That account, its
+password and an optional SSH public key come from `secrets/dev-account.env`:
+
+```bash
+printf 'DEV_USER=dev\nDEV_PASSWORD=pick-your-own\n' > secrets/dev-account.env
+chmod 600 secrets/dev-account.env
+```
+
+Without that file the dev image keeps the first-boot wizard like the runtime one. The
+runtime image never reads it, and verification asserts the runtime image has no autologin,
+no extra account, no passwordless-sudo drop-in and no authorised SSH key.
+
+> **The dev image is not safe outside a trusted network.** It autologs in with a known
+> password and grants that account passwordless sudo. The firewall limits SSH to LAN and
+> tailnet addresses, which is what makes it tolerable — do not widen that.
+
 **Wi-Fi for the dev image comes from `secrets/wifi.env`, which is gitignored:**
 
 ```bash
@@ -158,7 +175,7 @@ privilege with a command different from the one it intends to run — each of wh
 real defect found by measuring the machine rather than reading the code.
 
 ```
-RESULT: 413 passed, 0 failed
+RESULT: 432 passed, 0 failed
 ```
 
 Structural verification is not a boot test. Nothing here has been validated by an

@@ -157,7 +157,12 @@ check "waybar config present"            "[[ -s $MNT/home/alarm/.config/waybar/c
 check "alarm home owned by alarm"        "[[ -d $MNT/home/alarm/.config ]] && [[ \$(stat -c%U $MNT/home/alarm/.config) == alarm ]]"
 check "expand-root script executable"    "[[ -x $MNT/usr/local/bin/uconsole-expand-root ]]"
 # Autologin removed deliberately: the machine must require a login at boot.
-check "no tty1 autologin drop-in"       "[[ ! -e $MNT/etc/systemd/system/getty@tty1.service.d/autologin.conf ]]"
+# Runtime only. The dev image autologs in ON PURPOSE, and asserts that itself in
+# the profile section -- so this cannot be an unconditional check without one
+# profile or the other always failing.
+if [[ $PROFILE == runtime ]]; then
+    check "no tty1 autologin drop-in"   "[[ ! -e $MNT/etc/systemd/system/getty@tty1.service.d/autologin.conf ]]"
+fi
 check "bash_profile launches sway on vt1" "grep -q 'exec sway' $MNT/home/alarm/.bash_profile"
 
 echo
@@ -238,7 +243,11 @@ echo
 echo "### 12. first-boot account wizard"
 check "firstboot script present"      "[[ -x $MNT/usr/local/bin/uconsole-firstboot-user ]]"
 check "firstboot service present"     "[[ -s $MNT/etc/systemd/system/uconsole-firstboot-user.service ]]"
-check "firstboot service enabled"     "[[ -L $MNT/etc/systemd/system/multi-user.target.wants/uconsole-firstboot-user.service ]]"
+# Runtime only: the dev image pre-creates its account, so the wizard would prompt
+# for one that already exists and is deliberately disabled there.
+if [[ $PROFILE == runtime ]]; then
+    check "firstboot service enabled" "[[ -L $MNT/etc/systemd/system/multi-user.target.wants/uconsole-firstboot-user.service ]]"
+fi
 check "firstboot runs before the getty" "grep -q 'Before=getty@tty1.service' $MNT/etc/systemd/system/uconsole-firstboot-user.service"
 check "firstboot does not enable autologin" "! grep -q 'agetty --autologin' $MNT/usr/local/bin/uconsole-firstboot-user"
 check "firstboot clears a stale autologin"  "grep -q 'rm -f \"\$DROPIN\"' $MNT/usr/local/bin/uconsole-firstboot-user"
@@ -855,6 +864,19 @@ check "continuum automatic-start helpers intact" \
 if [[ $PROFILE == runtime ]]; then
     check "runtime ships no wifi connection" \
           "[[ -z \$(find $MNT/etc/NetworkManager/system-connections -name '*.nmconnection' -print -quit 2>/dev/null) ]]"
+    # A default account with a published password, autologin, and passwordless
+    # sudo are dev-image conveniences. Reaching the runtime image would mean
+    # shipping a machine anyone can walk up to and own.
+    check "runtime has NO autologin"   "[[ ! -e $MNT/etc/systemd/system/getty@tty1.service.d/autologin.conf ]]"
+    check "runtime has NO dev sudoers" "[[ ! -e $MNT/etc/sudoers.d/99-dev-account ]]"
+    check "runtime keeps the firstboot wizard" \
+          "[[ -L $MNT/etc/systemd/system/multi-user.target.wants/uconsole-firstboot-user.service ]]"
+    # uid >= 1000 means a human account was baked in; the stock `alarm` user is
+    # uid 1000 in the ALARM rootfs, so look above it.
+    check "runtime bakes in no extra account" \
+          "[[ \$(awk -F: '\$3 > 1000 && \$3 < 65000' $MNT/etc/passwd | wc -l) -eq 0 ]]"
+    check "runtime authorises no SSH key" \
+          "[[ -z \$(find $MNT/home -name authorized_keys -print -quit 2>/dev/null) ]]"
 else
     check "dev ships a wifi connection" \
           "[[ -n \$(find $MNT/etc/NetworkManager/system-connections -name '*.nmconnection' -print -quit 2>/dev/null) ]]"
@@ -863,6 +885,13 @@ else
     check "wifi connection is 0600 root" \
           "[[ \$(stat -c'%a %U' $MNT/etc/NetworkManager/system-connections/*.nmconnection 2>/dev/null | head -1) == '600 root' ]]"
     check "dev ships firefox"   "[[ -x $MNT/usr/bin/firefox ]]"
+    # Default account + autologin. Convenient on a test device, and exactly the
+    # thing that must never reach the runtime image.
+    check "dev has a default account"  "[[ \$(grep -c '^[^:]*:x:1[0-9][0-9][0-9]:' $MNT/etc/passwd) -ge 1 ]]"
+    check "dev autologs in on tty1"    "grep -q -- '--autologin' $MNT/etc/systemd/system/getty@tty1.service.d/autologin.conf"
+    check "dev skips the firstboot wizard" \
+          "[[ ! -L $MNT/etc/systemd/system/multi-user.target.wants/uconsole-firstboot-user.service ]]"
+    check "dev sudoers drop-in is 0440" "[[ \$(stat -c%a $MNT/etc/sudoers.d/99-dev-account) == 440 ]]"
     check "dev ships selftest"  "[[ -x $MNT/usr/local/bin/uconsole-selftest ]]"
     check "dev selftest parses" "bash -n $MNT/usr/local/bin/uconsole-selftest"
 fi

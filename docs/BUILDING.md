@@ -128,7 +128,23 @@ packages — no shipped file has a dev-only variant. The alternative, two overla
 contain the same script, means a fix can land in one and miss the other, and the tree that
 gets tested is usually not the tree that ships.
 
-Dev-only Wi-Fi credentials live in `secrets/wifi.env` (gitignored, `0600`):
+Dev-only credentials live in `secrets/` (gitignored, `0600`) — Wi-Fi in `wifi.env`, the
+default account in `dev-account.env`:
+
+```bash
+DEV_USER=dev
+DEV_PASSWORD=pick-your-own
+DEV_SSH_KEY="ssh-ed25519 AAAA... you@host"   # optional; quote it, the file is sourced
+```
+
+`DEV_SSH_KEY` is worth setting: every reflash wipes `authorized_keys`, and without it the
+key has to be reinstalled by hand before the device can be driven over SSH.
+
+Quote anything containing spaces. The file is sourced, so an unquoted `ssh-ed25519` line
+parses as an assignment followed by a command and the build dies with
+`AAAAC3Nza...: command not found`.
+
+Wi-Fi credentials:
 
 ```bash
 printf 'WIFI_SSID=your-ssid\nWIFI_PSK=your-psk\n' > secrets/wifi.env
@@ -183,7 +199,7 @@ docker run --rm --privileged --platform linux/arm64 -v "$PWD":/work -w /work \
 
 The second argument is the profile, and it is cross-checked against what is actually
 inside the image — verifying a dev image as `runtime` fails loudly rather than quietly
-running the wrong assertions. Counts: **413** for runtime, **417** for dev.
+running the wrong assertions. Counts: **432** for runtime, **433** for dev.
 
 Structural verification cannot prove behaviour. The dev image carries
 `uconsole-selftest` for that, and it must be run on the device:

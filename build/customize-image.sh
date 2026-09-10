@@ -81,6 +81,17 @@ EOF_W
         echo "dev: no $WIFI_ENV; image will have no pre-provisioned Wi-Fi"
         echo "     create it with WIFI_SSID= and WIFI_PSK= to enable this"
     fi
+
+    # Default account, same untracked-file pattern as the Wi-Fi credential.
+    # A weak password is still a password in a public repository.
+    ACCT_ENV=/work/secrets/dev-account.env
+    if [[ -r $ACCT_ENV ]]; then
+        # shellcheck source=/dev/null
+        . "$ACCT_ENV"
+        echo "dev: default account will be created (name and secret not logged)"
+    else
+        echo "dev: no $ACCT_ENV; image keeps the first-boot wizard"
+    fi
 fi
 
 # Normalise ownership and modes rather than inheriting whatever the build host
@@ -113,7 +124,13 @@ echo "--- chroot configuration ---"
 cat > "$MNT/root/uconsole-customize.sh" <<EOF_PRE
 #!/usr/bin/env bash
 PROFILE=$PROFILE
+DEV_USER=${DEV_USER:-}
+DEV_PASSWORD=${DEV_PASSWORD:-}
+DEV_SSH_KEY='${DEV_SSH_KEY:-}'
 EOF_PRE
+# This file briefly carries the dev credential inside the image; it is removed
+# again after arch-chroot returns, a few lines below.
+chmod 600 "$MNT/root/uconsole-customize.sh"
 cat >> "$MNT/root/uconsole-customize.sh" <<'EOF_C'
 set -Eeuo pipefail
 
@@ -241,6 +258,45 @@ systemctl --global enable pipewire.socket pipewire-pulse.socket wireplumber.serv
 # Start a tmux server in each user session; tmux-continuum's restore hook fires
 # on server start, which is what recovers sessions across a reboot.
 systemctl --global enable tmux.service
+
+if [[ $PROFILE == dev && -n ${DEV_USER:-} ]]; then
+    echo "[chroot] dev: creating the default account and enabling autologin"
+    # The same groups the first-boot wizard grants, so this account behaves like
+    # a normally-created one rather than a subtly different second class of user.
+    useradd -m -G wheel,video,audio,input,render,storage,network -s /bin/bash "$DEV_USER" 2>/dev/null || true
+    if [[ -n ${DEV_PASSWORD:-} ]]; then
+        printf '%s:%s\n' "$DEV_USER" "$DEV_PASSWORD" | chpasswd
+    fi
+    cp -a /etc/skel/. "/home/$DEV_USER/" 2>/dev/null || true
+    chown -R "$DEV_USER:$DEV_USER" "/home/$DEV_USER"
+
+    if [[ -n ${DEV_SSH_KEY:-} ]]; then
+        install -d -m700 -o "$DEV_USER" -g "$DEV_USER" "/home/$DEV_USER/.ssh"
+        printf '%s\n' "$DEV_SSH_KEY" > "/home/$DEV_USER/.ssh/authorized_keys"
+        chmod 600 "/home/$DEV_USER/.ssh/authorized_keys"
+        chown "$DEV_USER:$DEV_USER" "/home/$DEV_USER/.ssh/authorized_keys"
+        echo "[chroot] dev: authorised an SSH key (every reflash wiped it before)"
+    fi
+
+    # Autologin on tty1. .bash_profile execs sway there, so this lands straight
+    # on the desktop.
+    install -d /etc/systemd/system/getty@tty1.service.d
+    cat > /etc/systemd/system/getty@tty1.service.d/autologin.conf <<EOF_AL
+[Service]
+ExecStart=
+ExecStart=-/usr/bin/agetty --autologin $DEV_USER --noclear %I \$TERM
+EOF_AL
+
+    # Passwordless sudo. On an image that already autologs in with a known
+    # password this adds no meaningful exposure, and it is what lets the device
+    # be driven by a test harness with no TTY to type into.
+    printf '%s ALL=(ALL:ALL) NOPASSWD: ALL\n' "$DEV_USER" > /etc/sudoers.d/99-dev-account
+    chmod 440 /etc/sudoers.d/99-dev-account
+
+    # The wizard would prompt for an account that already exists.
+    systemctl disable uconsole-firstboot-user.service 2>/dev/null || true
+    echo "[chroot] dev: first-boot wizard disabled (account pre-created)"
+fi
 
 echo "[chroot] adding the OTA recovery check to the initramfs"
 # The hook is an INSTALL hook only -- it adds a systemd unit rather than a
