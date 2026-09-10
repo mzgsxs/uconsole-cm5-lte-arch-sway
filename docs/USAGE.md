@@ -425,6 +425,22 @@ so `sudo uconsole-battery-calibrate run` gives a truer figure than any datasheet
 > A 3500 mAh cell wired alongside a 2000 mAh one dumps current into it the moment they're
 > connected, and the pair drifts further apart with every cycle. Pair like with like.
 
+## Updating the machine
+
+Today this means writing a new image to the card from another computer. A network reflash
+is designed but not built — see [`ROADMAP.md`](ROADMAP.md), which carries the measured
+transfer figures (~3.3 minutes for a compressed 8 GB image over 5 GHz Wi-Fi).
+
+For everything short of a full image — scripts, config, even the kernel package and its
+device-tree overlay — a targeted update works over SSH today:
+
+```bash
+sudo pacman -U /tmp/linux-uconsole-cm5-4k-git-*.pkg.tar.xz
+```
+
+That covers any change except the base package set and a clean filesystem. A kernel or
+device-tree change needs a reboot to take effect.
+
 ## Suspend — do not use it
 
 `systemctl suspend` will not work, and that is deliberate. The sleep targets are masked

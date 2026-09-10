@@ -137,6 +137,7 @@ are deliberately untracked — see `.gitignore`.
 | [`docs/USAGE.md`](docs/USAGE.md) | Operator commands: LTE, WAN routing, Tailscale, battery, tmux |
 | [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) | Problems hit during development and their fixes |
 | [`docs/CHANGELOG.md`](docs/CHANGELOG.md) | What changed and why |
+| [`docs/ROADMAP.md`](docs/ROADMAP.md) | Designed but not built — incl. full OTA reflash |
 
 ## Verification
 
