@@ -56,8 +56,32 @@ worth designing around:
 - **Don't bother tuning the cipher.** `aes128-gcm` and `chacha20-poly1305` measured 12.1 and
   12.3 MB/s — identical. The CM5's crypto extensions are not the limit, the link is.
 
-So the pipeline is `gzip -1` on the workstation, `gunzip` straight into `dd` on the device,
-and the whole reflash lands inside four minutes.
+**Stage the compressed image in RAM, then write locally.** The raw image never fits in
+memory — 4.46 GB runtime against 3987 MB total — and would not even after the boot
+partition shrink in item 5. But **compressed it does**, comfortably:
+
+| | Runtime | Dev |
+|---|---|---|
+| raw | 4.46 GB | 4.83 GB |
+| `gzip -1` | **1.34 GB** | **1.53 GB** |
+| device RAM | 3987 MB total, 3664 MB available | |
+
+That is worth more than the few seconds it saves. Streaming decompressed straight to the
+block device means the network is in the critical path for the *entire* write, so a Wi-Fi
+drop at 80 % leaves a half-written card and a machine that will not boot. Staging first
+splits it into two phases where only the first can fail recoverably:
+
+1. Transfer 1.34 GB into a tmpfs — ~1.9 min at the measured 12 MB/s. A failure here costs
+   nothing; the card is still intact and bootable.
+2. `gunzip < /tmp/img.gz | dd of=/dev/mmcblk0` from RAM — ~1 min at the card's 74.7 MB/s,
+   with the network no longer involved.
+
+About three minutes either way, but only one of them has a failure mode that bricks the
+card mid-write.
+
+One detail for whoever builds it: the default tmpfs is half of RAM (1994 MB here), which
+the dev image's 1.53 GB fits but not by much. Mount it with an explicit size — `-o
+size=2500m` — rather than relying on the default.
 
 **Risks.**
 - The first attempt at a recovery boot is exactly the failure mode that leaves you at a
