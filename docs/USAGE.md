@@ -8,8 +8,8 @@ The wizard then disables itself.
 
 **There is no autologin.** Every boot presents a login prompt; sway starts once you log in
 on tty1. A short press of the power button blanks the backlight, **locks the session,
-silences the trackball, and puts the machine into low power** — radios off, CPU clamped,
-cores parked — so it can sit in a bag without stray input reaching your work and without
+silences the trackball, and puts the machine into low power** — radios off, CPU governor
+switched to powersave — so it can sit in a bag without stray input reaching your work and without
 draining the pack. Pressing it again restores everything and asks for your password. See
 [Low-power blank](#low-power-blank) for what exactly gets switched off.
 
@@ -338,6 +338,31 @@ It fires on a **timer**, but the timer does not trust the release event: when it
 it asks the kernel whether the key is still physically held. A tap therefore cannot power
 the machine off even if the release binding is missed entirely, and every failure — no
 device, `evtest` missing, key already up — lands on doing nothing.
+
+## Checking the machine actually works (dev image)
+
+The dev image ships `uconsole-selftest`. It checks what image verification cannot —
+that the machine behaves — and every check in it exists because the matching bug shipped
+once and looked correct from outside.
+
+```bash
+uconsole-selftest            # read-only; safe any time, over SSH included
+uconsole-selftest --cycle    # plus a real blank/wake cycle, asserting the restore
+```
+
+`--cycle` refuses to run over SSH when `RADIO_OFF_ON_BLANK=1`, because the blank switches
+off the Wi-Fi carrying the session. To run it remotely anyway, detach it and arm a
+dead-man's switch so a failed wake cannot strand the device:
+
+```bash
+sudo systemd-run --unit=uc-watchdog --collect --on-active=150 /usr/local/bin/uconsole-lowpower up
+```
+
+```bash
+sudo systemd-run --unit=uc-cycle --collect /bin/bash -c 'uconsole-selftest --cycle --force-ssh > /tmp/cycle.log 2>&1'
+```
+
+Then reconnect and read `/tmp/cycle.log`.
 
 ## Measuring power draw
 

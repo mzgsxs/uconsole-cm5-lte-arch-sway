@@ -36,15 +36,20 @@ if (( disk_bytes - before_bytes < 67108864 )); then
     exit 0
 fi
 
-if command -v growpart >/dev/null 2>&1; then
-    echo "growing with growpart"
-    growpart "$disk" "$part_num"
-else
-    # parted needs -a opt AND must not be given -s, or it silently declines to
-    # resize a mounted partition. Feed it an explicit Yes instead.
-    echo "growpart unavailable; falling back to parted"
-    printf 'Yes\n' | parted -a opt ---pretend-input-tty "$disk" resizepart "$part_num" 100%
+# growpart only. There used to be a parted fallback here; it is gone on purpose.
+#
+# parted IS the bug this script exists to fix (S3.1): `parted -s resizepart`
+# answers "No" to the in-use prompt, does nothing, and reports success -- which
+# stranded 52GB and looked like a working expand. Keeping it as a fallback meant
+# shipping the broken tool for a case that cannot happen, since cloud-guest-utils
+# is a hard dependency of this image.
+if ! command -v growpart >/dev/null 2>&1; then
+    echo "ERROR: growpart is missing (cloud-guest-utils not installed)" >&2
+    echo "       Not stamping, so this will retry on the next boot." >&2
+    exit 1
 fi
+echo "growing with growpart"
+growpart "$disk" "$part_num"
 
 partx -u "$disk" 2>/dev/null || partprobe "$disk" 2>/dev/null || true
 sleep 1

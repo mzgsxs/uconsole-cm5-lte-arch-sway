@@ -1,7 +1,20 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-IMG="/work/out/uconsole-arch-cm5-sway.img"
+# Two trees from one source: PROFILE=runtime ships the machine people use;
+# PROFILE=dev adds test utilities, a browser, and a pre-provisioned network so a
+# freshly flashed card is reachable without sitting at the keyboard.
+#
+# The DIFFERENCE is additive only -- dev is runtime plus overlay-dev/ plus extra
+# packages. There is no dev-only fork of any shipped file, so a fix cannot land
+# in one tree and miss the other.
+PROFILE="${BUILD_PROFILE:-runtime}"
+case "$PROFILE" in
+  runtime) IMG="/work/out/uconsole-arch-cm5-sway.img" ;;
+  dev)     IMG="/work/out/uconsole-arch-cm5-sway-dev.img" ;;
+  *) echo "BUILD_PROFILE must be 'runtime' or 'dev', got '$PROFILE'" >&2; exit 2 ;;
+esac
+echo "=== building the $PROFILE image: $(basename "$IMG") ==="
 SIZE="${IMAGE_SIZE:-8G}"
 REPO_PORT=8089
 HTTP_PID=""
@@ -107,25 +120,66 @@ grep -n 'kernel_pkg=\|mkinitcpio_preset=' scripts/build-image.sh | head
 bash /work/build/install-partprobe-shim.sh
 
 echo "=== [5/6] building image ==="
+# Runtime stack: everything here must support a shipped feature. A package that
+# is only ever useful to whoever is debugging the image belongs in PKGS_DEV.
 PKGS=(
   sway swaybg swayidle swaylock foot fuzzel waybar xorg-xwayland
   polkit ttf-dejavu mesa
-  pipewire pipewire-alsa pipewire-pulse wireplumber alsa-utils
+  pipewire pipewire-alsa pipewire-pulse wireplumber
   brightnessctl wl-clipboard grim slurp
-  bluez bluez-utils parted git htop
+  bluez bluez-utils
+  # Kept deliberately, judged on size / usefulness / background cost:
+  #   htop 480K, net-tools 955K, parted 2.8M, alsa-utils 3.4M, git 46M.
+  # None runs a daemon, so none costs battery; the only real price is SD space.
+  #
+  # parted is here as an INTERACTIVE tool. The S3.1 bug was our own script
+  # calling `parted -s resizepart`, which answers "No" to the in-use prompt and
+  # reports success -- that call is gone and growpart is the only resizer now.
+  # Run by a human, parted prompts and works.
+  #
+  # git is the outlier at 46M (it pulls perl) and earns it twice: TPM needs it to
+  # install any plugin beyond the three pre-installed here, and this is a machine
+  # people work on.
+  parted git htop alsa-utils
   # 4G/LTE: ModemManager stack plus libgpiod, which the CM5 power-on
   # script uses (gpioset) instead of CM4's pinctrl approach.
-  modemmanager libgpiod libqmi usb_modeswitch net-tools
+  #
+  # usb_modeswitch looks unused -- nothing in the overlay calls it -- but it
+  # ships udev rules that ModemManager relies on for modems that present as
+  # mass storage first. Removing it to save a megabyte risks LTE not coming up
+  # at all, on a device where that is hard to notice.
+  #
+  # net-tools is not listed: the ALARM base rootfs already ships it, so asking
+  # for it re-installs something we get regardless. It is present either way.
+  modemmanager libgpiod libqmi usb_modeswitch
   # From the on-device defect report:
-  cloud-guest-utils   # growpart, so the root filesystem actually expands (S3.1)
-  wireless-regdb iw   # regulatory.db, or brcmfmac floods the log (S3.7)
-  usbutils            # lsusb, for modem triage (S3.11)
+  cloud-guest-utils   # growpart, the ONLY partition resizer now (S3.1)
+  wireless-regdb iw   # regulatory.db, or brcmfmac floods the log (S3.7); `iw reg set` is documented
+  usbutils            # lsusb, documented for modem triage (S3.11)
   zram-generator      # compressed swap; there is none and only 4GB RAM (S3.11)
-  python              # the waybar modem module is a python3 script
+  python              # waybar modem module, session snapshot/restore, mmcli JSON parsing
   tmux                # TPM + resurrect + continuum are pre-installed in /etc/skel
   tailscale           # daemon enabled but unauthenticated; no key is baked in
-  evtest              # inspect raw input events (power key, keyboard, trackball)
+  evtest              # REQUIRED at runtime: uconsole-powerkey-hold uses `evtest --query`
+                      # to confirm the key is still physically down before powering off
 )
+
+# Dev-only. Nothing here may be referenced by a shipped script, or the runtime
+# image would break in a way the dev image hides.
+PKGS_DEV=(
+  firefox             # the browser the session-restore path is written around
+  mpv imv             # media and images, so the panel can actually be exercised
+  neovim              # editing on the device without scp round-trips
+  git htop strace     # triage
+  powertop            # wakeup counts -- the one lever left after the 3.2W floor
+  net-tools           # ifconfig/route, for comparing against the ip(8) output
+  tcpdump             # LTE vs Wi-Fi path debugging
+)
+if [[ $PROFILE == dev ]]; then
+  PKGS+=("${PKGS_DEV[@]}")
+  echo "dev profile: adding ${#PKGS_DEV[@]} extra packages"
+fi
+
 EXTRA_ARGS=()
 for p in "${PKGS[@]}"; do EXTRA_ARGS+=(--extra-package "$p"); done
 
@@ -139,7 +193,7 @@ for p in "${PKGS[@]}"; do EXTRA_ARGS+=(--extra-package "$p"); done
   "${EXTRA_ARGS[@]}"
 
 echo "=== [6/6] applying uConsole overlay ==="
-bash /work/build/customize-image.sh "$IMG"
+bash /work/build/customize-image.sh "$IMG" "$PROFILE"
 
 echo "=== [7/7] flash verification artifacts ==="
 # Generated here rather than by hand. Producing them manually risked leaving a

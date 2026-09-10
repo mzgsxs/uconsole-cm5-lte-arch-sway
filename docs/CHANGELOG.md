@@ -1,106 +1,106 @@
 # Changelog
 
-## Session restore, and a power key you can actually use
+## Two trees, a leaner runtime, and an on-device test harness
 
-Suspend is unreachable on this hardware and a blanked machine still draws ~3.2 W that
-userspace cannot switch off, so the only state that reaches zero is **off**. This release
-makes "off" tolerable: power down, come back to where you were.
+### Two images from one source
 
-### The machine remembers what was open
+`BUILD_PROFILE=runtime|dev` selects which tree is assembled. Dev is runtime **plus**
+`overlay-dev/` plus `PKGS_DEV` — additive only, so no shipped file has a dev-only variant.
+Two parallel overlays containing the same script would let a fix land in one and miss the
+other, and the tree that gets tested is usually not the tree that ships.
 
-`uconsole-session-snapshot` runs under sway and records which applications are open and
-where; `uconsole-session-restore` replays it at the next login. Workspace, fullscreen
-state, floating geometry and focus.
+Dev adds `firefox`, `mpv`, `imv`, `neovim`, `powertop`, `strace`, `tcpdump`, and
+`uconsole-selftest`. Wi-Fi comes from an untracked `secrets/wifi.env`; the build reads it
+at assembly time, logs neither value, and the runtime image ships no connection profile at
+all. This repository is public — a PSK committed here would survive any later removal.
 
-It snapshots **continuously** rather than saving at shutdown. sway is started by `exec
-sway` from `.bash_profile`, not as a systemd user unit, so the user manager cannot order a
-hook against it — at poweroff logind SIGTERMs the session scope and sway dies in a race
-with anything you write. Recording continuously removes the race, and covers a crash, a
-battery pull and the low-voltage guard for free.
+### uconsole-selftest
 
-What decides a restore is the **boot id** stamped in the snapshot. Nothing is written at
-poweroff, so there is no marker to lose and nothing to race.
+An on-device harness for what image verification structurally cannot reach: whether the
+machine behaves. Every check in it exists because the matching bug shipped once and looked
+correct from the outside — masked sleep targets, the sudoers mode sudo ignores silently,
+`evtest` being present at all, cores still online, no descent left pending, the snapshot's
+boot-id gating, the modem not left in low power.
 
-Out of scope deliberately: the split/tabbed/stacked container tree. Sway has no layout
-save/restore — `append_layout` was closed unmerged as swaywm/sway#3022 — so the mechanism
-i3-resurrect relies on does not exist here. swayrst, the only sway-native tool in this
-space, moves already-running windows rather than relaunching and says outright it knows no
-way to identify the same windows after a reboot.
+`--cycle` additionally runs a real blank/wake and asserts the restore. It refuses to run
+over SSH when `RADIO_OFF_ON_BLANK=1`, since the blank switches off the network carrying the
+session.
 
-### A 2-second power key
+### Pruned
 
-logind's long-press is a hardcoded 5 s: not a kernel setting and not a logind setting,
-just `LONG_PRESS_DURATION` in its source, with systemd#28100 the open request to change
-that. The AXP223's forced-off offers only 4/6/8/10 s and is parked at 10 s deliberately,
-because a clean shutdown takes ~8 s from the press and anything shorter cuts power
-mid-unmount.
+- **`parted`'s fallback in `uconsole-expand-root` is gone.** `parted -s resizepart` *is*
+  the S3.1 bug — it answers "No" to the in-use prompt and reports success. It was a
+  fallback for a case that cannot happen, since `cloud-guest-utils` is a hard dependency.
+  Missing growpart is now a hard error that does not stamp, so it retries next boot.
+- **The tmux plugin tree: 1.3 MB / 204 files → 288 KB / 66 files**, paid for per user
+  account since it is copied from `/etc/skel` into every home. Three full git
+  repositories, three test suites, the docs and a `video/` of PNGs — none of which a
+  running tmux reads. Pinned commits are written to `PINNED_COMMIT` so versions stay
+  knowable without `.git`.
+- **`alsa-state.service` masked.** `alsa-utils` is installed for `alsamixer` and
+  `speaker-test`; its daemon is "static", so it reads as disabled, but the package
+  symlinks it into `sound.target.wants` and udev reaches that target as soon as the card
+  appears. It would have run as a resident `alsactl` process on a battery device for no
+  benefit — WirePlumber owns mixer state here. `alsa-restore` (a oneshot) is untouched.
+- **`uconsole-power-probe sample`** removed: undocumented, called by nothing, scaffolding
+  for a bisect harness that was not built.
+- `net-tools` dropped from our package list — the Arch Linux ARM base rootfs already
+  ships it, so asking for it re-installed something we get anyway.
 
-So the hold is measured by sway, which already sees the key. Three paths now exist and the
-shorter ones do not remove the longer:
+`parted`, `git`, `htop` and `alsa-utils` are **kept**, judged on size, usefulness and
+background cost: 2.8 MB, 46 MB, 480 KB, 3.4 MB, and not one of them runs a daemon. The
+only real price is SD space. Verification now asserts them **present**, so a future
+leanness pass cannot quietly remove a tool someone reaches for.
 
-| | | |
-|---|---|---|
-| ~2 s | sway | clean |
-| 5 s | logind | clean |
-| 10 s | AXP223 hardware | unclean, for a wedged kernel |
+### Fixed
 
-It fires **while the key is still down**, on a timer — but the timer does not trust the
-release event. When it expires it asks the kernel whether the key is still physically
-held, so a tap cannot power the machine off even if the release binding is missed
-entirely. Every failure lands on doing nothing.
+- **Five `grep -q`-under-`pipefail` instances in the verification suite itself**, four of
+  them `find | grep -q` scanning a whole modules tree. They passed only because the output
+  happened to be small enough that `find` finished before `grep` exited — the exact
+  size-dependent trap the suite asserts against elsewhere. Now `find -print -quit`.
+- `grep -qc` in the power probe, where `-c` is silently ignored under `-q`.
+- A count compared with `grep -qE '[4-9]'`, which would break at 10.
+- The logind comment still described its 5 s long-press as the primary poweroff path; it
+  has been the backstop behind sway's 2 s hold for some time.
 
-### tmux state survives a poweroff
+### Found by testing on hardware
 
-`tmux.service` now forces a tmux-resurrect save in `ExecStop` before killing the server,
-and the continuum interval drops 15 → 5 minutes as the safety net for unclean stops.
+Two bugs in the new selftest, both found by running it the awkward way rather than the
+easy way:
 
-This was a real loss, not a theoretical one: a `vim` started after the last 15-minute tick
-was gone after a power-button poweroff, and the saved state still showed the pane at a
-shell.
+- `findmnt -no SIZE` prints `57.9G`; stripping the suffix leaves `57.9`, and `[[ -gt ]]`
+  aborts with an arithmetic error rather than returning a result. Now `-bno`.
+- **`HOME` is not guaranteed.** Run as a systemd unit — which is how the cycle test *has*
+  to run, since the blank drops SSH — there is no `HOME`, and `set -u` turned a bare
+  `$HOME` into an abort partway through the run.
 
-### Defects found by testing, not by reading
+And one regression caught before it shipped: pruning
+`tmux-continuum/scripts/handle_tmux_automatic_start/` looked safe — macOS-specific, and
+`@continuum-boot` is deliberately unset — but `continuum.tmux` calls that helper on every
+load and takes the *disable* branch when the option is off. Unused-looking and unused are
+different things.
 
-- **The device lookup matched nothing.** `/axp[0-9]*-pek/` cannot match `axp20x-pek` — the
-  `x` in `20x` defeats it. `press()` returned early, no timer was ever armed, and both
-  safety tests "passed" because there was nothing to fire.
-- **Multi-window placement was wrong and looked right.** The workspace is switched once,
-  before the launch, so windows 2..N were born on window 1's workspace; and arrival order
-  was zipped blindly against snapshot order. Fixed by giving `place()` the workspace move,
-  in the order that works: fullscreen off, move, geometry, fullscreen on.
-- **Window pairing worked by luck.** The snapshot recorded tree order (workspace order)
-  while Firefox reopens in creation order. Now sorted by `con_id`, which is creation order.
-- **A stale lock silently disabled snapshotting** for the whole session. The holder pid was
-  already in the file; nothing read it.
-- **An allowlist was the wrong default.** `"foot firefox"` meant anything installed later
-  silently failed to come back. Inverted to a denylist, empty by default.
-- **The uninstalled-app guard would have skipped every XWayland app**, since it checked
-  `app_id` and sway reports X11 windows by capitalised WM_CLASS, which never resolves in
-  PATH. It now checks the recorded command.
-- **Verification wrote into the image it was verifying.** `py_compile` leaves `__pycache__`
-  next to the source; now `ast.parse`, plus a check that no bytecode ships.
+### New hardware fact: the CPU boots capped at 1.5 GHz
+
+`cpuinfo_max_freq` reads 2400000 and the OPP table lists every step up to it, but
+`scaling_max_freq` boots at 1500000 — equal to `scaling_min_freq`. Writes to raise it are
+accepted, read back correctly, and revert within 30 seconds. Not undervoltage
+(`in0_lcrit_alarm=0`), not thermal (38 °C), and nothing in this image writes it.
+
+Two consequences: the ceiling clamp in `CPU_CLAMP_ON_BLANK` is a **no-op** on this board,
+which is why the CPU contribution measured ≈0; and every power figure in this repository
+was taken with the CPU at 62 % of its rated clock. Whether `arm_freq`/`arm_boost` lifts it,
+and at what cost in watts, is unresolved — and deliberately not guessed at.
 
 ### Verification
 
-344 → **385 checks**. The new ones cover the session snapshot and restore (boot-id gating,
-the lock, workspace placement, no window titles recorded, 0600 permissions), the power key
-(both bindings, the kernel key-state guard, device lookup by name), and each specific
-defect above so it cannot return.
+385 → **402 runtime / 406 dev**. The profile is now an argument and is cross-checked
+against the image contents, so verifying a dev image as `runtime` fails loudly instead of
+running the wrong assertions.
 
-Two of those checks caught real regressions during this work: the "no sleep states" one
-matched a corrected comment that quoted the old claim, and the missing-app check still
-grepped for a message that had been reworded. Both are the comment-matching trap this
-suite exists to catch.
-
-### Hardware findings
-
-**The DSI panel often fails to initialise on a cold boot** and lies about it —
-`enabled=enabled`, `fb0` present, backlight normal, nothing on screen. The tell is
-`[drm] Receive failed` in dmesg. A warm reboot fixes it; another power cycle often does
-not, which makes the instinctive recovery the wrong move. `Ctrl`+`Alt`+`F2` then
-`Ctrl`+`Alt`+`Del`.
-
-That matters here specifically, because session restore encourages powering off and back
-on — exactly the operation this panel is worst at.
+Tested on hardware: **34 passed, 0 failed** including the full blank/wake cycle, with the
+modem sequence confirmed unattended — `disabled` → `enabling` → `registered` →
+`bearer reconnected` → `done`.
 
 ## Power management: suspend closed off, a real low-power blank, and measurement
 

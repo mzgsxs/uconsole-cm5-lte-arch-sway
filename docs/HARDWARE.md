@@ -65,6 +65,36 @@ This matters more than it looks, because the session-restore feature deliberatel
 encourages powering off and back on — which is exactly the operation this panel is worst
 at. The ClockworkPi community documents the same cold-boot fragility.
 
+**The CPU boots capped at 1.5 GHz, and the cap cannot be lifted from sysfs.**
+`cpuinfo_max_freq` reads 2400000 and the OPP table lists every step from 1500000 to
+2400000 — but `scaling_max_freq` boots at **1500000**, equal to `scaling_min_freq`.
+Writing a higher value is accepted and reads back correctly, then silently reverts:
+
+```
+before        1500000
+immediately   2400000     <- write accepted
+after 10s     2400000
+after 30s     1500000     <- firmware re-imposed the cap
+```
+
+Measured 2026-09-09. It is **not** undervoltage (`rpi_volt` `in0_lcrit_alarm=0`), **not**
+thermal (38 °C, one zone), and nothing in this image writes the value — only our own
+scripts reference it and none had run. `config.txt` sets no `arm_freq`, `arm_boost` or
+`over_voltage`, so this is the firmware's own ceiling being re-synced periodically.
+
+Two consequences worth knowing before doing any power work:
+
+- **The clock ceiling clamp in `CPU_CLAMP_ON_BLANK` is a no-op on this board.** Clamping
+  `scaling_max_freq` down to `cpuinfo_min_freq` changes nothing when the ceiling is
+  already at the floor. Only the governor switch does anything, which is why the CPU
+  contribution measured ≈0.
+- **Every power figure in this repository was taken with the CPU capped at 62 % of its
+  rated clock.** They are still valid for comparing states, which is what they are used
+  for, but they are not figures for a full-speed machine.
+
+Unresolved: whether `arm_freq=2400`/`arm_boost=1` in `config.txt` lifts it, and what that
+costs in watts. Do not add either speculatively — measure with `uconsole-power-probe`.
+
 **CPU offlining is one-way — the firmware can park a core but cannot restart it.**
 Offlining succeeds; bringing the core back fails, and only a reboot recovers it. Measured
 on this board 2026-09-08 on all of cpu1–cpu3:

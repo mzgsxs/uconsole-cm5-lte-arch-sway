@@ -2,7 +2,6 @@
 # uconsole-power-probe -- measure what the machine actually draws.
 #
 #   uconsole-power-probe run          baseline -> blank -> wake -> report
-#   uconsole-power-probe sample ...   log one labelled phase
 #   uconsole-power-probe report [F]   summarise a log
 #   uconsole-power-probe watch        live readings, one line per interval
 #   uconsole-power-probe pack 2x3500  record which cells are fitted
@@ -300,7 +299,7 @@ do_run() {
         echo "# kernel        $(uname -r)"
         echo "# interval      ${INTERVAL}s   settle ${SETTLE}s   pack ${PACK_WH}Wh"
         echo "# baseline      ${base_s}s     blanked ${blank_s}s"
-        echo "# modem         $(mmcli -L 2>/dev/null | grep -qc Modem && echo present || echo absent)"
+        echo "# modem         $([[ $(mmcli -L 2>/dev/null | grep -c Modem || true) -gt 0 ]] && echo present || echo absent)"
         echo "# wifi rfkill   $(rfkill list wifi 2>/dev/null | grep -m1 'Soft blocked' | tr -d '\t')"
         grep -hE '^[A-Z_]+=' /etc/uconsole/lowpower.conf 2>/dev/null | sed 's/^/# policy       /'
     } > "$out"
@@ -436,17 +435,6 @@ case "${1:-}" in
     run)    shift; do_run "$@" ;;
     watch)  shift; [[ ${1:-} == --interval ]] && INTERVAL="${2:?}"; do_watch ;;
     report) shift; do_report "${1:-}" ;;
-    sample)
-        shift
-        label="${1:?usage: uconsole-power-probe sample LABEL SECONDS [FILE]}"
-        secs="${2:?usage: uconsole-power-probe sample LABEL SECONDS [FILE]}"
-        preflight
-        install -d -m700 "$OUTDIR"
-        out="${3:-$OUTDIR/$(date +%Y%m%d-%H%M%S).tsv}"
-        echo "sampling '$label' for ${secs}s -> $out"
-        sample_phase "$label" "$secs" "$out"
-        echo "done: $(grep -vc '^#' "$out") samples"
-        ;;
     *)
         sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'
         echo

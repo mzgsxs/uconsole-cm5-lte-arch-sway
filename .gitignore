@@ -29,3 +29,8 @@ build/*.log
 # python bytecode from local syntax checks; must never reach the image
 __pycache__/
 *.pyc
+
+# ---- Secrets ---------------------------------------------------------------
+# Wi-Fi PSK and anything else credential-shaped for the dev image. This repo is
+# public; nothing under here may ever be committed.
+secrets/

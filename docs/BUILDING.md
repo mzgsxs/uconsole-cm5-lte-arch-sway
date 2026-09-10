@@ -66,8 +66,31 @@ some Electron builds and various prebuilt binaries. Both install into the *same*
 
 ```bash
 docker run --rm --privileged --platform linux/arm64 -v "$PWD":/work -w /work \
+  -e BUILD_PROFILE=runtime \
   alarm-base:latest /bin/bash /work/build/build-image-full.sh
 ```
+
+`BUILD_PROFILE` selects which of the two trees is assembled:
+
+| Profile | Output | Adds |
+|---|---|---|
+| `runtime` (default) | `uconsole-arch-cm5-sway.img` | — |
+| `dev` | `uconsole-arch-cm5-sway-dev.img` | `overlay-dev/`, `PKGS_DEV`, Wi-Fi from `secrets/wifi.env` |
+
+**The split is additive, deliberately.** `dev` is `runtime` plus extra files and extra
+packages — no shipped file has a dev-only variant. The alternative, two overlays that both
+contain the same script, means a fix can land in one and miss the other, and the tree that
+gets tested is usually not the tree that ships.
+
+Dev-only Wi-Fi credentials live in `secrets/wifi.env` (gitignored, `0600`):
+
+```bash
+printf 'WIFI_SSID=your-ssid\nWIFI_PSK=your-psk\n' > secrets/wifi.env
+```
+
+`customize-image.sh` reads it and writes a `0600` root-owned `.nmconnection` into the dev
+image. It deliberately logs neither value — build logs get pasted into issues. Without the
+file, the dev build proceeds and says it provisioned no network.
 
 `--privileged` is required for loop devices. The script:
 
@@ -108,7 +131,19 @@ script untouched.
 
 ```bash
 docker run --rm --privileged --platform linux/arm64 -v "$PWD":/work -w /work \
-  alarm-base:latest /bin/bash /work/build/verify-image.sh /work/out/uconsole-arch-cm5-sway.img
+  alarm-base:latest /bin/bash /work/build/verify-image.sh \
+  /work/out/uconsole-arch-cm5-sway.img runtime
+```
+
+The second argument is the profile, and it is cross-checked against what is actually
+inside the image — verifying a dev image as `runtime` fails loudly rather than quietly
+running the wrong assertions. Counts: **402** for runtime, **406** for dev.
+
+Structural verification cannot prove behaviour. The dev image carries
+`uconsole-selftest` for that, and it must be run on the device:
+
+```bash
+uconsole-selftest --cycle
 ```
 
 See [`docs/TROUBLESHOOTING.md`](TROUBLESHOOTING.md) for why several checks are written the

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-IMG="${1:?usage: verify-image.sh IMAGE}"
+IMG="${1:?usage: verify-image.sh IMAGE [runtime|dev]}"
+PROFILE="${2:-runtime}"
 MNT=/mnt/verify
 LOOP=""
 FAILS=0
@@ -130,8 +131,13 @@ check "kernel is the 4K-page uConsole build" "[[ '$KVER' == *-uconsole-cm5-4k* ]
 check "modules.dep was generated"            "[[ -s $MNT/usr/lib/modules/$KVER/modules.dep ]]"
 check "stock ALARM kernel removed (one modules tree)" "[[ \$(ls -d $MNT/usr/lib/modules/*/ | wc -l) -eq 1 ]]"
 check "stock ALARM kernel image removed from /boot"   "[[ ! -e $MNT/boot/Image && ! -e $MNT/boot/Image.gz ]]"
-check "brcmfmac wifi module present"         "find $MNT/usr/lib/modules/$KVER -name 'brcmfmac.ko*' | grep -q ."
-check "clockworkpi/panel DRM modules present" "find $MNT/usr/lib/modules/$KVER -name 'vc4.ko*' | grep -q ."
+# `find | grep -q` is the documented SIGPIPE trap under `set -o pipefail`: grep
+# exits on the first match, find dies writing to a closed pipe, and pipefail
+# reports the whole pipeline as failed. It passes here only because these
+# searches happen to return before grep exits -- i.e. by luck of output size.
+# -quit makes find stop by itself, so nothing is ever SIGPIPEd.
+check "brcmfmac wifi module present"         "[[ -n \$(find $MNT/usr/lib/modules/$KVER -name 'brcmfmac.ko*' -print -quit) ]]"
+check "clockworkpi/panel DRM modules present" "[[ -n \$(find $MNT/usr/lib/modules/$KVER -name 'vc4.ko*' -print -quit) ]]"
 
 echo
 echo "### 6. userspace: sway + tooling"
@@ -225,7 +231,7 @@ for b in gpioset gpioinfo gpiodetect mmcli qmicli ifconfig lsusb iw; do
 done
 echo "--- WWAN kernel modules ---"
 for m in option usb_wwan qmi_wwan cdc_ether cdc_ncm cdc_mbim; do
-  if find "$MNT/usr/lib/modules/$KVER" -name "$m.ko*" 2>/dev/null | grep -q .; then ok "module: $m"; else bad "module MISSING: $m"; fi
+  if [[ -n $(find "$MNT/usr/lib/modules/$KVER" -name "$m.ko*" -print -quit 2>/dev/null) ]]; then ok "module: $m"; else bad "module MISSING: $m"; fi
 done
 
 echo
@@ -673,12 +679,12 @@ check "tailscale CLI installed"        "[[ -x $MNT/usr/bin/tailscale ]]"
 check "tailscaled installed"           "[[ -x $MNT/usr/bin/tailscaled || -x $MNT/usr/sbin/tailscaled ]]"
 check "tailscaled.service enabled"     "[[ -L $MNT/etc/systemd/system/multi-user.target.wants/tailscaled.service ]]"
 check "netfilter userspace present"    "[[ -x $MNT/usr/bin/nft ]]"
-check "tun module available"           "find $MNT/usr/lib/modules/$KVER -name 'tun.ko*' | grep -q ."
+check "tun module available"           "[[ -n \$(find $MNT/usr/lib/modules/$KVER -name 'tun.ko*' -print -quit) ]]"
 echo "-- no identity or credentials baked into the image --"
 check "no tailscaled state directory"  "[[ ! -e $MNT/var/lib/tailscale/tailscaled.state ]]"
 check "no auth key in any unit"        "! grep -rqiE 'tskey-|TS_AUTHKEY|--authkey' $MNT/etc/systemd/system/ 2>/dev/null"
 check "no auth key in our scripts"     "! grep -rqiE 'tskey-|TS_AUTHKEY' $MNT/usr/local/bin/ 2>/dev/null"
-check "no tailscale node key on disk"  "! find $MNT/var/lib/tailscale -type f 2>/dev/null | grep -q ."
+check "no tailscale node key on disk"  "[[ -z \$(find $MNT/var/lib/tailscale -type f -print -quit 2>/dev/null) ]]"
 echo "-- follows the WAN when it changes --"
 check "tailscale nudge script present"  "[[ -x $MNT/usr/local/bin/uconsole-tailscale-nudge ]]"
 check "nudge rebinds magicsock"         "grep -q 'debug rebind' $MNT/usr/local/bin/uconsole-tailscale-nudge"
@@ -688,7 +694,7 @@ check "NM dispatcher hook present"      "[[ -x $MNT/etc/NetworkManager/dispatche
 check "dispatcher hook is root-owned"   "[[ -f $MNT/etc/NetworkManager/dispatcher.d/50-uconsole-tailscale ]] && [[ \$(stat -c%u $MNT/etc/NetworkManager/dispatcher.d/50-uconsole-tailscale) -eq 0 ]]"
 check "dispatcher not group/world writable" "[[ \$(stat -c%a $MNT/etc/NetworkManager/dispatcher.d/50-uconsole-tailscale) =~ ^7[05][05]$ ]]"
 check "dispatcher skips tailscale's own iface" "grep -q 'tailscale\*|ts\*' $MNT/etc/NetworkManager/dispatcher.d/50-uconsole-tailscale"
-check "uconsole-wan nudges on switch"   "grep -c 'tailscale_follow' $MNT/usr/local/bin/uconsole-wan | grep -qE '[4-9]'"
+check "uconsole-wan nudges on switch"   "[[ \$(grep -c 'tailscale_follow' $MNT/usr/local/bin/uconsole-wan) -ge 4 ]]"
 check "overlay scripts are root-owned"  "[[ -f $MNT/usr/local/bin/uconsole-wan ]] && [[ \$(stat -c%u $MNT/usr/local/bin/uconsole-wan) -eq 0 ]]"
 
 echo
@@ -730,6 +736,76 @@ echo "-- kernel update path --"
 check "kernel-check helper present"    "[[ -x $MNT/usr/local/bin/uconsole-kernel-check ]]"
 check "kernel-check queries upstream"  "grep -q 'ak-rex/ClockworkPi-linux' $MNT/usr/local/bin/uconsole-kernel-check"
 check "kernel-check explains pacman will not update it" "grep -q 'never update this kernel' $MNT/usr/local/bin/uconsole-kernel-check"
+
+echo
+echo "### profile: $PROFILE"
+# Cross-check the declared profile against what is actually inside, so verifying
+# a dev image as "runtime" (or the reverse) fails loudly instead of passing the
+# wrong assertions.
+HAS_DEV=0; [[ -x $MNT/usr/local/bin/uconsole-selftest ]] && HAS_DEV=1
+check "image contents match the declared profile" \
+      "[[ ( '$PROFILE' == dev && $HAS_DEV -eq 1 ) || ( '$PROFILE' == runtime && $HAS_DEV -eq 0 ) ]]"
+
+# --- runtime stack: kept, and kept honest ----------------------------------
+# These are present on purpose, judged on size, usefulness and background cost:
+# htop 480K, net-tools 955K, parted 2.8M, alsa-utils 3.4M, git 46M. None runs a
+# daemon. Asserted PRESENT so a future "leanness" pass cannot quietly drop a
+# tool someone reaches for.
+for pkg in parted git htop alsa-utils net-tools; do
+    check "runtime ships $pkg" "chroot $MNT /usr/bin/pacman -Q $pkg >/dev/null 2>&1"
+done
+# The real criterion is background cost, not disk. alsa-utils ships alsa-state:
+# a RESIDENT alsactl daemon, "static" so it reads as disabled, but symlinked into
+# sound.target.wants -- so udev starts it the moment the card appears. Masked,
+# because WirePlumber owns mixer state here.
+#
+# Asserted via the mask symlink, not `is-enabled`: that returns 0 for "static"
+# too, so it cannot tell "will never run" from "will run via a .wants symlink".
+check "alsa-state daemon masked"       "[[ \$(readlink $MNT/etc/systemd/system/alsa-state.service) == /dev/null ]]"
+check "alsa-restore oneshot untouched" "[[ ! -L $MNT/etc/systemd/system/alsa-restore.service ]]"
+# evtest is NOT optional: uconsole-powerkey-hold uses `evtest --query` to confirm
+# the key is physically down, and without it the 2s poweroff silently never arms.
+check "evtest present (powerkey-hold needs it)" "[[ -x $MNT/usr/bin/evtest ]]"
+# growpart is now the only resizer; parted is gone and so is the fallback to it.
+check "growpart present"               "[[ -x $MNT/usr/bin/growpart ]]"
+check "expand-root has no parted fallback" \
+      "[[ \$(grep -v '^[[:space:]]*#' $MNT/usr/local/bin/uconsole-expand-root | grep -c 'parted') -eq 0 ]]"
+
+# --- tmux plugin tree ------------------------------------------------------
+# This tree is copied into /etc/skel and again into every account, so anything
+# dead in it is paid for per user.
+check "no git repos in the tmux plugins" \
+      "[[ -z \$(find $MNT/etc/skel/.tmux/plugins -name .git -print -quit 2>/dev/null) ]]"
+check "no plugin test suites shipped" \
+      "[[ -z \$(find $MNT/etc/skel/.tmux/plugins -type d -name tests -print -quit 2>/dev/null) ]]"
+check "plugin versions still knowable" \
+      "[[ \$(ls $MNT/etc/skel/.tmux/plugins/*/PINNED_COMMIT 2>/dev/null | wc -l) -eq 3 ]]"
+# The automatic-start helpers LOOK macOS-only and are not: continuum calls them
+# on every load, taking the disable branch when @continuum-boot is unset.
+check "continuum automatic-start helpers intact" \
+      "[[ -f $MNT/etc/skel/.tmux/plugins/tmux-continuum/scripts/handle_tmux_automatic_start/systemd_disable.sh ]]"
+
+# --- credentials -----------------------------------------------------------
+# The repository is public and the dev image carries a Wi-Fi PSK. The runtime
+# image must carry none, and neither may leak one anywhere but the connection
+# file itself.
+if [[ $PROFILE == runtime ]]; then
+    check "runtime ships no wifi connection" \
+          "[[ -z \$(find $MNT/etc/NetworkManager/system-connections -name '*.nmconnection' -print -quit 2>/dev/null) ]]"
+else
+    check "dev ships a wifi connection" \
+          "[[ -n \$(find $MNT/etc/NetworkManager/system-connections -name '*.nmconnection' -print -quit 2>/dev/null) ]]"
+    # NetworkManager refuses to load a connection readable by anyone but root,
+    # and says so only in its own log.
+    check "wifi connection is 0600 root" \
+          "[[ \$(stat -c'%a %U' $MNT/etc/NetworkManager/system-connections/*.nmconnection 2>/dev/null | head -1) == '600 root' ]]"
+    check "dev ships firefox"   "[[ -x $MNT/usr/bin/firefox ]]"
+    check "dev ships selftest"  "[[ -x $MNT/usr/local/bin/uconsole-selftest ]]"
+    check "dev selftest parses" "bash -n $MNT/usr/local/bin/uconsole-selftest"
+fi
+# No PSK may appear in a script, a unit, or skel -- only in the connection file.
+check "no psk= outside the connection file" \
+      "[[ \$(grep -rl 'psk=' $MNT/usr/local/bin $MNT/etc/systemd $MNT/etc/skel 2>/dev/null | wc -l) -eq 0 ]]"
 
 echo
 echo "########################################"

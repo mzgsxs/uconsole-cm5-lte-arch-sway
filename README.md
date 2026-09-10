@@ -5,7 +5,8 @@ A build system that produces a bootable **Arch Linux ARM** image with a
 fitted with a **Raspberry Pi Compute Module 5**.
 
 The kernel is compiled from source; the image is assembled and then checked by an
-automated verification suite — currently **385 checks**, all passing.
+automated verification suite — **402 checks** for the runtime image, **406** for the dev
+image, all passing.
 
 Inputs are pinned where upstream allows it: the kernel commit, the upstream builder, and
 the tmux plugins. Arch Linux ARM publishes only a rolling `latest` rootfs tarball, so
@@ -61,13 +62,15 @@ docker run --rm --platform linux/arm64 -v "$PWD":/work -w /work \
   -e PKGDIR=linux-uconsole-cm5-4k-git \
   alarm-base:latest /bin/bash /work/build/build-kernel.sh
 
-# 3. Build the image
+# 3. Build the image. BUILD_PROFILE=runtime (default) or dev -- see below.
 docker run --rm --privileged --platform linux/arm64 -v "$PWD":/work -w /work \
+  -e BUILD_PROFILE=runtime \
   alarm-base:latest /bin/bash /work/build/build-image-full.sh
 
-# 4. Verify it
+# 4. Verify it. The profile must match, or the wrong assertions run.
 docker run --rm --privileged --platform linux/arm64 -v "$PWD":/work -w /work \
-  alarm-base:latest /bin/bash /work/build/verify-image.sh /work/out/uconsole-arch-cm5-sway.img
+  alarm-base:latest /bin/bash /work/build/verify-image.sh \
+  /work/out/uconsole-arch-cm5-sway.img runtime
 
 # 5. Flash (macOS)
 sudo ./flash-to-sd.sh disk4
@@ -76,11 +79,46 @@ sudo ./flash-to-sd.sh disk4
 Full instructions, including how to create the `alarm-base` container, are in
 [`docs/BUILDING.md`](docs/BUILDING.md).
 
+## Two images from one source
+
+| | |
+|---|---|
+| `BUILD_PROFILE=runtime` | `uconsole-arch-cm5-sway.img` — the machine you use |
+| `BUILD_PROFILE=dev` | `uconsole-arch-cm5-sway-dev.img` — plus test tools, a browser, media apps, and a pre-provisioned network |
+
+The difference is **additive only**. Dev is runtime plus `overlay-dev/` plus extra
+packages; no shipped file has a dev-only variant, so a fix cannot land in one tree and
+miss the other.
+
+The dev image adds `firefox`, `mpv`, `imv`, `neovim`, `powertop`, `strace`, `tcpdump`, and
+`uconsole-selftest` — an on-device harness that checks what image verification cannot:
+that the machine actually behaves. Every check in it exists because the corresponding bug
+shipped once and looked correct from the outside.
+
+```bash
+uconsole-selftest            # read-only; safe any time, SSH included
+uconsole-selftest --cycle    # also run a real blank/wake cycle and assert the restore
+```
+
+**Wi-Fi for the dev image comes from `secrets/wifi.env`, which is gitignored:**
+
+```bash
+printf 'WIFI_SSID=your-ssid\nWIFI_PSK=your-psk\n' > secrets/wifi.env
+chmod 600 secrets/wifi.env
+```
+
+The build reads it at assembly time and writes a `0600` NetworkManager profile into the
+dev image only. Nothing is echoed to the build log, the runtime image ships no connection
+profile at all, and verification asserts both. This repository is public — a PSK committed
+here would stay in the history after any later removal.
+
 ## Repository layout
 
 ```
 build/         Build pipeline: kernel, image assembly, customisation, verification
 overlay/       Files copied into the image root (configs, scripts, systemd units)
+overlay-dev/   Additional files for the dev profile only
+secrets/       Untracked build-time credentials (dev Wi-Fi); never committed
 profiles/      Boot configuration — config.txt and cmdline.txt
 flash-to-sd.sh Write an image to an SD card (macOS)
 verify-card.sh Verify a flashed card against the image it came from
@@ -119,7 +157,7 @@ privilege with a command different from the one it intends to run — each of wh
 real defect found by measuring the machine rather than reading the code.
 
 ```
-RESULT: 385 passed, 0 failed
+RESULT: 402 passed, 0 failed
 ```
 
 Structural verification is not a boot test. Nothing here has been validated by an

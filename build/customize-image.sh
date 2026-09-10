@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-IMG="${1:?usage: customize-image.sh IMAGE}"
+IMG="${1:?usage: customize-image.sh IMAGE [runtime|dev]}"
+PROFILE="${2:-runtime}"
 MNT=/mnt/uconsole
 LOOP=""
 
@@ -26,6 +27,62 @@ mount "${LOOP}p1" "$MNT/boot"
 echo "--- copying overlay ---"
 cp -a /work/overlay/. "$MNT/"
 
+if [[ $PROFILE == dev ]]; then
+    echo "--- copying overlay-dev (dev profile) ---"
+    cp -a /work/overlay-dev/. "$MNT/"
+
+    # Wi-Fi credentials come from an UNTRACKED file, never from the repository.
+    #
+    # This repo is public. A PSK committed here would be published, and would
+    # stay in the history after any later removal. secrets/ is gitignored and the
+    # build reads it at assembly time; the runtime image never gets a connection
+    # profile at all, and verification asserts that.
+    WIFI_ENV=/work/secrets/wifi.env
+    if [[ -r $WIFI_ENV ]]; then
+        # shellcheck source=/dev/null
+        . "$WIFI_ENV"
+        if [[ -n ${WIFI_SSID:-} && -n ${WIFI_PSK:-} ]]; then
+            install -d -m700 "$MNT/etc/NetworkManager/system-connections"
+            CONN="$MNT/etc/NetworkManager/system-connections/${WIFI_SSID}.nmconnection"
+            cat > "$CONN" <<EOF_W
+[connection]
+id=${WIFI_SSID}
+type=wifi
+autoconnect=true
+autoconnect-priority=10
+
+[wifi]
+mode=infrastructure
+ssid=${WIFI_SSID}
+
+[wifi-security]
+key-mgmt=wpa-psk
+psk=${WIFI_PSK}
+
+[ipv4]
+method=auto
+
+[ipv6]
+method=auto
+addr-gen-mode=default
+EOF_W
+            # NetworkManager REFUSES to load a connection file that is readable
+            # by anyone but root, and says so only in its own log.
+            chown root:root "$CONN"
+            chmod 600 "$CONN"
+            # Deliberately does not echo the SSID or the PSK. Build logs get
+            # pasted into issues and chat; there is no reason for either value
+            # to leave the file it lives in.
+            echo "dev: pre-provisioned Wi-Fi (credentials read from $WIFI_ENV, not logged)"
+        else
+            echo "dev: $WIFI_ENV present but WIFI_SSID/WIFI_PSK unset; no Wi-Fi provisioned"
+        fi
+    else
+        echo "dev: no $WIFI_ENV; image will have no pre-provisioned Wi-Fi"
+        echo "     create it with WIFI_SSID= and WIFI_PSK= to enable this"
+    fi
+fi
+
 # Normalise ownership and modes rather than inheriting whatever the build host
 # happened to have. Docker Desktop presents bind-mounted files as root-owned, so
 # this is a no-op there -- but on a Linux build host `cp -a` preserves the
@@ -45,13 +102,19 @@ if [[ -f $MNT/etc/sudoers.d/uconsole-lowpower ]]; then
 fi
 [[ -d $MNT/etc/NetworkManager ]] && chown -R root:root "$MNT/etc/NetworkManager"
 chmod 755 "$MNT/usr/local/bin"/uconsole-* 2>/dev/null || true
+# Re-assert after the chown -R above, which would otherwise leave the connection
+# file group-readable and make NetworkManager refuse to load it.
+chmod 600 "$MNT"/etc/NetworkManager/system-connections/*.nmconnection 2>/dev/null || true
 if [[ -d $MNT/etc/NetworkManager/dispatcher.d ]]; then
     chmod 755 "$MNT/etc/NetworkManager/dispatcher.d"/* 2>/dev/null || true
 fi
 
 echo "--- chroot configuration ---"
-cat > "$MNT/root/uconsole-customize.sh" <<'EOF_C'
+cat > "$MNT/root/uconsole-customize.sh" <<EOF_PRE
 #!/usr/bin/env bash
+PROFILE=$PROFILE
+EOF_PRE
+cat >> "$MNT/root/uconsole-customize.sh" <<'EOF_C'
 set -Eeuo pipefail
 
 echo "[chroot] removing the stock Arch Linux ARM kernel"
@@ -122,6 +185,16 @@ systemctl enable uconsole-powerkey-tune.service
 systemctl enable nftables.service
 # zram needs no unit enabled: zram-generator reads /etc/systemd/zram-generator.conf
 # at boot and synthesises systemd-zram-setup@zram0.service itself.
+
+# alsa-utils is installed for its TOOLS (alsamixer, speaker-test) on a board with
+# documented audio faults -- not for its daemon. alsa-state.service is "static",
+# so it looks disabled, but alsa-utils symlinks it into sound.target.wants and
+# udev reaches sound.target as soon as the card appears: it would run as a
+# resident alsactl process on a battery device for no benefit, because
+# WirePlumber owns mixer state here, not alsactl.
+#
+# alsa-restore.service is left alone: it is a oneshot that exits.
+systemctl mask alsa-state.service || true
 
 # S3.9: make suspend unreachable.
 #

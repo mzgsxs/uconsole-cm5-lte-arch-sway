@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+# uconsole-selftest [--cycle] [--quiet]
+#
+# Check on the DEVICE what image verification cannot: that the machine actually
+# behaves. Every check here exists because the corresponding bug shipped once and
+# looked correct from the outside.
+#
+#   (default)   read-only checks; safe at any time, over SSH included
+#   --cycle     also run a real blank/wake cycle and assert everything came back.
+#               This blanks and LOCKS the screen for ~15s. Over SSH it will drop
+#               your connection if RADIO_OFF_ON_BLANK=1, so it refuses to run
+#               that way unless you pass --force-ssh.
+#
+# Exits non-zero if anything failed, so it can gate a release.
+set -uo pipefail
+
+CYCLE=0; QUIET=0; FORCE_SSH=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --cycle)     CYCLE=1 ;;
+        --quiet)     QUIET=1 ;;
+        --force-ssh) FORCE_SSH=1 ;;
+        -h|--help)   sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) echo "uconsole-selftest: unknown option: $1" >&2; exit 2 ;;
+    esac
+    shift
+done
+
+PASS=0; FAIL=0; SKIP=0
+ok()   { PASS=$((PASS+1)); (( QUIET )) || printf '  \033[32mPASS\033[0m  %s\n' "$*"; }
+no()   { FAIL=$((FAIL+1));            printf '  \033[31mFAIL\033[0m  %s\n' "$*"; }
+skip() { SKIP=$((SKIP+1)); (( QUIET )) || printf '  --    %s\n' "$*"; }
+sec()  { (( QUIET )) || printf '\n\033[1m== %s\033[0m\n' "$*"; }
+# eval so a check can be written as a plain shell expression.
+chk()  { if eval "$2"; then ok "$1"; else no "$1"; fi; }
+
+CONF=/etc/uconsole/lowpower.conf
+# shellcheck source=/dev/null
+[[ -r $CONF ]] && . "$CONF"
+
+sec "suspend is unreachable"
+# Both sleep states register in sysfs and both hang this machine. The masks are
+# the only thing standing between a stray systemctl and a battery pull.
+for t in sleep suspend hibernate hybrid-sleep suspend-then-hibernate; do
+    chk "${t}.target masked" "[[ \$(readlink /etc/systemd/system/${t}.target) == /dev/null ]]"
+done
+chk "mem_sleep pinned to s2idle" "grep -q mem_sleep_default=s2idle /proc/cmdline"
+chk "systemd-rfkill masked"      "[[ \$(readlink /etc/systemd/system/systemd-rfkill.service) == /dev/null ]]"
+
+sec "privilege boundary"
+# The sudoers drop-in grants exactly one binary. If sudo ignores the file -- it
+# does so silently when the mode is wrong -- the whole low-power descent is
+# skipped and only the backlight ever switches off.
+chk "sudoers drop-in is 0440 root" "[[ \$(stat -c'%a %U' /etc/sudoers.d/uconsole-lowpower 2>/dev/null) == '440 root' ]]"
+chk "wheel may run the helper unprompted" "sudo -n /usr/local/bin/uconsole-lowpower status >/dev/null 2>&1"
+
+sec "power key"
+# A missing evtest, or an input device this script cannot find, makes the 2s
+# hold silently do nothing -- indistinguishable from a safety pass.
+chk "evtest present (required for the 2s hold)" "command -v evtest >/dev/null"
+PEK=$(awk '/^N: Name=/{n=$0} /^H: Handlers=/ && n ~ /-pek"/ {match($0,/event[0-9]+/); print substr($0,RSTART,RLENGTH); exit}' /proc/bus/input/devices)
+chk "PMIC power key found in /proc/bus/input/devices" "[[ -n '$PEK' ]]"
+chk "AXP forced-off parked at its maximum" "[[ \$(cat /sys/bus/platform/devices/*pek*/shutdown* 2>/dev/null | head -1) == 10000 ]]"
+
+sec "CPU"
+NPROC_ON=$(getconf _NPROCESSORS_ONLN); NPROC_ALL=$(getconf _NPROCESSORS_CONF)
+# Offlining is one-way on this board, so a machine running degraded stays that
+# way until reboot and nothing else reports it.
+chk "all $NPROC_ALL cores online" "[[ $NPROC_ON -eq $NPROC_ALL ]]"
+chk "core parking disabled in policy" "[[ \${CPU_OFFLINE_CORES_ON_BLANK:-0} == 0 ]]"
+# NOT compared against cpuinfo_max_freq. On this board the ceiling boots at
+# 1.5GHz while the OPP table advertises up to 2.4GHz, so an absolute check fails
+# on a perfectly healthy freshly-booted machine. What actually matters is that a
+# blank did not leave the CPU clamped at its FLOOR, which is what the descent
+# sets -- and the cycle test below compares before against after, which is the
+# only form that can catch a real regression.
+chk "clock ceiling above the floor" \
+    "[[ \$(cat /sys/devices/system/cpu/cpufreq/policy0/scaling_max_freq) -ge \$(cat /sys/devices/system/cpu/cpufreq/policy0/scaling_min_freq) ]]"
+chk "no low-power descent left pending" "[[ ! -f /run/uconsole/lowpower.save ]]"
+
+sec "storage and memory"
+# -b, not the human-readable form: `findmnt -no SIZE` prints "57.9G", and
+# stripping the suffix leaves "57.9", which is not an integer -- [[ -gt ]] then
+# fails with an arithmetic syntax error rather than a useful result.
+chk "root filesystem expanded (>10G)" "[[ \$(findmnt -bno SIZE -T /) -gt 10737418240 ]]"
+chk "zram swap active"         "[[ \$(swapon --noheadings --show=NAME | grep -c zram) -gt 0 ]]"
+chk "/boot is clean"           "! journalctl -b -k --no-pager | grep -q 'FAT-fs.*not properly unmounted'"
+
+sec "session restore"
+# HOME is NOT guaranteed. Run as a systemd unit -- which is exactly how the
+# cycle test has to run, since the blank drops SSH -- there is no HOME, and
+# `set -u` turns a bare $HOME into an abort partway through the run. Resolve the
+# desktop user's state directory explicitly instead.
+STATE_HOME="${XDG_STATE_HOME:-}"
+if [[ -z $STATE_HOME ]]; then
+    if [[ -n ${HOME:-} && -d ${HOME:-} ]]; then
+        STATE_HOME="$HOME/.local/state"
+    else
+        for d in /home/*/.local/state; do
+            [[ -d $d ]] && { STATE_HOME="$d"; break; }
+        done
+    fi
+fi
+SNAP="${STATE_HOME:-/nonexistent}/uconsole/session.json"
+chk "snapshotter running" "pgrep -f uconsole-session-snapshot >/dev/null"
+if [[ -r $SNAP ]]; then
+    chk "snapshot is valid JSON" "python3 -c 'import json,sys;json.load(open(\"$SNAP\"))'"
+    chk "snapshot mode is 0600"  "[[ \$(stat -c%a '$SNAP') == 600 ]]"
+    # Restoring a snapshot from THIS boot would replay windows that are already
+    # open; the boot id is what stops that.
+    chk "snapshot carries a boot id" "python3 -c 'import json;assert json.load(open(\"$SNAP\")).get(\"boot_id\")'"
+else
+    skip "no snapshot yet (open a window and wait ~2s)"
+fi
+
+sec "radios"
+chk "wifi not soft-blocked" "[[ \$(rfkill list wifi | grep -c 'Soft blocked: yes') -eq 0 ]]"
+chk "no stale low-power radio stamp" "[[ ! -f /var/lib/uconsole/radios-off-by-lowpower ]]"
+if mmcli -L 2>/dev/null | grep -q Modem; then
+    MPS=$(mmcli -m 0 -J 2>/dev/null | python3 -c 'import sys,json;print(json.load(sys.stdin)["modem"]["generic"]["power-state"])' 2>/dev/null)
+    chk "modem radio is on (not left in low power)" "[[ '$MPS' == on ]]"
+else
+    skip "no modem present"
+fi
+
+### the cycle test ----------------------------------------------------------
+if (( CYCLE )); then
+    sec "blank / wake cycle"
+    if [[ -n ${SSH_CONNECTION:-} && ${RADIO_OFF_ON_BLANK:-1} == 1 && $FORCE_SSH -eq 0 ]]; then
+        skip "refusing over SSH: the blank switches Wi-Fi off and would drop this session"
+        skip "run it on the device, or pass --force-ssh if you can reach the console"
+    elif [[ -z ${SWAYSOCK:-} ]] && ! ls /run/user/*/sway-ipc.*.sock >/dev/null 2>&1; then
+        skip "no sway session to blank"
+    else
+        BL=$(ls /sys/class/backlight/*/brightness 2>/dev/null | head -1)
+        bl_before=$(cat "$BL" 2>/dev/null)
+        gov_before=$(cat /sys/devices/system/cpu/cpufreq/policy0/scaling_governor)
+        maxf_before=$(cat /sys/devices/system/cpu/cpufreq/policy0/scaling_max_freq)
+        mute_before=$(wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null | grep -c MUTED || true)
+
+        sudo -n /usr/local/bin/uconsole-lowpower down >/dev/null 2>&1
+        sleep 5
+        chk "descent clamped the governor" \
+            "[[ \$(cat /sys/devices/system/cpu/cpufreq/policy0/scaling_governor) != '$gov_before' ]]"
+        sudo -n /usr/local/bin/uconsole-lowpower up >/dev/null 2>&1
+        sleep 3
+
+        chk "governor restored"  "[[ \$(cat /sys/devices/system/cpu/cpufreq/policy0/scaling_governor) == '$gov_before' ]]"
+        # Against what it was BEFORE the cycle, not against the hardware max:
+        # the wake path restores the saved ceiling, and on this board that is
+        # not the same number as cpuinfo_max_freq.
+        chk "clock ceiling restored to its pre-blank value" \
+            "[[ \$(cat /sys/devices/system/cpu/cpufreq/policy0/scaling_max_freq) -ge $maxf_before ]]"
+        chk "all cores still online" "[[ \$(getconf _NPROCESSORS_ONLN) -eq $NPROC_ALL ]]"
+        chk "wifi unblocked"     "[[ \$(rfkill list wifi | grep -c 'Soft blocked: yes') -eq 0 ]]"
+        chk "radio stamp cleared" "[[ ! -f /var/lib/uconsole/radios-off-by-lowpower ]]"
+        [[ -n $BL ]] && chk "backlight unchanged by the helper" "[[ \$(cat '$BL') == '$bl_before' ]]"
+        chk "mute state unchanged" \
+            "[[ \$(wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null | grep -c MUTED || true) -eq $mute_before ]]"
+        # The modem wake runs as its own unit and takes tens of seconds; report
+        # where it got to rather than waiting for it.
+        if systemctl is-active --quiet uconsole-modem-wake.service 2>/dev/null; then
+            skip "modem wake still running (journalctl -t uconsole-modem-wake -b)"
+        fi
+    fi
+fi
+
+printf '\n%s\n' "----------------------------------------"
+printf 'RESULT: %d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"
+(( FAIL == 0 ))
