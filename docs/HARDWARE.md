@@ -65,38 +65,53 @@ This matters more than it looks, because the session-restore feature deliberatel
 encourages powering off and back on — which is exactly the operation this panel is worst
 at. The ClockworkPi community documents the same cold-boot fragility.
 
-**A 1.5 GHz clock ceiling is a symptom, not a hardware property.** This was briefly
-recorded here as a hardware fact and that was wrong; a clean boot disproves it.
+**The boot-time clock ceiling varies, and a software bug used to latch it.** Two separate
+things were tangled together here across three attempts at writing this down; they are
+untangled now.
 
-The observation was real. On a machine that had been running scp'd files through days of
-low-power testing, `scaling_max_freq` sat at 1500000 against a `cpuinfo_max_freq` of
-2400000, and writes to raise it reverted within 30 seconds. It was neither undervoltage
-(`in0_lcrit_alarm=0`) nor thermal (38 °C), and no shipped script had run.
-
-On a **freshly flashed image**, measured 2026-09-10:
+*The bug, which was ours and is fixed.* `uconsole-lowpower down` truncated its state file
+and recorded the **current** governor and ceiling as "pre-blank" on every descent. A second
+descent — two power-key presses in quick succession is enough — therefore saved the
+already-clamped `1500000`/`powersave` as the values to restore, and `up` faithfully put
+them back. The machine then ran at 62 % of its clock, in the powersave governor, until the
+next reboot, with `up` unable to help because it was doing exactly what it had been told.
+Demonstrated directly:
 
 ```
-scaling_max_freq   2400000     <- equal to cpuinfo_max_freq
-scaling_min_freq   1500000
-after 35s          2400000     <- holds; no revert
+start        ceiling=2400000 gov=schedutil
+after down#1 ceiling=1500000 gov=powersave     <- correct
+after down#2 ceiling=1500000 gov=powersave     <- records the CLAMPED values
+after up     ceiling=1500000 gov=powersave     <- restores the clamp, permanently
 ```
 
-and it is still 2400000 after a full blank/wake cycle. So the cap was **accumulated state
-on that particular machine**, not something the board does. The specific cause was not
-established and is not worth chasing on a card that has since been reflashed.
+`down` now refuses to re-record while a descent is already active, and `up` treats a saved
+ceiling equal to the floor as a stale clamp and restores the hardware maximum instead.
+This is the same shape as the audio-mute latch: **saving "what it was" is wrong whenever
+"what it was" might already be the state you are about to impose.**
 
-The lesson is the transferable part: a long-lived test machine carrying hand-copied files
-is not a reference for what the hardware does. Anything claimed as a hardware property
-needs confirming on a clean boot from a built image before it goes in this file.
+*The firmware behaviour, which is not ours and is not fully characterised.* Independently
+of the above, the ceiling at boot is **not consistent**. Two clean boots of the same image,
+no low-power script having run in either:
 
-Two corrections follow from that, both of which were briefly written down here and are
-wrong: the ceiling clamp in `CPU_CLAMP_ON_BLANK` is **not** a no-op — on a healthy machine
-the ceiling is 2400000 and the floor 1500000, so clamping does lower it; and the power
-figures in this repository were **not** taken at a reduced clock — the probe's own state
-table recorded `max kHz 2400000` for every screen-on phase.
+| Boot | Power source | `scaling_max_freq` at boot |
+|---|---|---|
+| 2026-09-10 02:24 | not recorded | 2400000 |
+| 2026-09-10 02:45 | **battery**, 3.675 V, `AC online 0` | 1500000 |
 
-If you do see the ceiling stuck at the floor, treat it as a machine that needs rebooting,
-and check `uconsole-lowpower status` for a descent that never completed.
+The capped boot stays capped under sustained 4-core load (41 °C, `in0_lcrit_alarm=0`), so
+it is neither thermal nor undervoltage throttling. It is also **not enforced**: writing
+2400000 raises it and the value holds.
+
+The obvious hypothesis is that the firmware picks a conservative `arm_freq` when it cannot
+confirm an adequate supply, and that booting on battery triggers it. **That is untested** —
+the power source at the 02:24 boot was not recorded. Confirming it needs one boot on AC and
+one on battery, checked immediately. Do not add `arm_freq`/`arm_boost` to `config.txt`
+speculatively; measure first.
+
+A note on how this section got written three times: the first version called it a hardware
+property, measured on a long-lived test machine carrying hand-copied files. The second
+retracted that as "accumulated state, cause unknown". Both were too confident. The cause
+was two causes, and only one of them was ours.
 
 **CPU offlining is one-way — the firmware can park a core but cannot restart it.**
 Offlining succeeds; bringing the core back fails, and only a reboot recovers it. Measured

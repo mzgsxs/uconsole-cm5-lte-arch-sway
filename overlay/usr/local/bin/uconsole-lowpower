@@ -36,14 +36,34 @@ log() { logger -t uconsole-lowpower "$*"; printf '[uconsole-lowpower] %s\n' "$*"
 
 POLICY_GLOB=(/sys/devices/system/cpu/cpufreq/policy*)
 
-save() { printf '%s=%s\n' "$1" "$2" >> "$STATE"; }
+# A descent that runs while one is already active must NOT re-record state.
+#
+# This latched, and permanently. `down` used to truncate $STATE and save the
+# CURRENT values every time; a second descent therefore saved the already-clamped
+# 1500000/powersave as the "pre-blank" state, and `up` faithfully restored the
+# clamp. The machine then sat at 62% of its clock in the powersave governor until
+# the next reboot, with `up` unable to help because it was doing exactly what it
+# was told. Two power-key presses in quick succession were enough.
+#
+# Same shape as the audio-mute latch: saving "what it was" is wrong whenever
+# "what it was" might already be the state you are about to impose. Record the
+# FIRST descent's values and keep them until a wake consumes them.
+ALREADY_DOWN=0
+save() { (( ALREADY_DOWN )) && return 0; printf '%s=%s\n' "$1" "$2" >> "$STATE"; }
 load() { [[ -r $STATE ]] && grep -m1 "^$1=" "$STATE" 2>/dev/null | cut -d= -f2- || true; }
 
 ### down ---------------------------------------------------------------------
 do_down() {
     mkdir -p /run/uconsole /var/lib/uconsole
-    : > "$STATE"          # fresh every descent; a stale file is worse than none
-    chmod 600 "$STATE"
+    if [[ -e $STATE ]]; then
+        # Already down. Re-applying the clamps is harmless and idempotent;
+        # re-recording them is what destroys the way back.
+        ALREADY_DOWN=1
+        log "descent already active; keeping the pre-blank state already saved"
+    else
+        : > "$STATE"
+        chmod 600 "$STATE"
+    fi
 
     if [[ ${CPU_CLAMP_ON_BLANK:-1} == 1 ]]; then
         for p in "${POLICY_GLOB[@]}"; do
@@ -169,6 +189,13 @@ do_up() {
         # Fall back to the hardware maximum and a sane governor rather than
         # leaving the machine clamped when the state file is missing or junk.
         [[ $m =~ ^[0-9]+$ ]] || m=$(cat "$p/cpuinfo_max_freq" 2>/dev/null)
+        # Belt and braces for the latch above: a saved ceiling equal to the floor
+        # is the clamp, not a user preference, and restoring it strands the
+        # machine at minimum clock. Prefer the hardware maximum.
+        if [[ $m == "$(cat "$p/cpuinfo_min_freq" 2>/dev/null)" ]]; then
+            log "saved ceiling equals the floor -- treating as a stale clamp, restoring hardware max"
+            m=$(cat "$p/cpuinfo_max_freq" 2>/dev/null)
+        fi
         [[ -n $m ]] && echo "$m" > "$p/scaling_max_freq" 2>/dev/null
         if [[ -z $g ]] || ! grep -qw -- "$g" "$p/scaling_available_governors" 2>/dev/null; then
             for cand in schedutil ondemand performance; do

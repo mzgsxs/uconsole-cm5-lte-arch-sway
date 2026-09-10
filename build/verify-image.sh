@@ -427,6 +427,19 @@ check "lowpower policy ships"          "[[ -f $MNT/etc/uconsole/lowpower.conf ]]
 check "lowpower policy parses"         "bash -n $MNT/etc/uconsole/lowpower.conf"
 check "lowpower helper present"        "[[ -x $MNT/usr/local/bin/uconsole-lowpower ]]"
 check "lowpower helper parses"         "bash -n $MNT/usr/local/bin/uconsole-lowpower"
+# A second descent used to truncate the state file and record the ALREADY-CLAMPED
+# values as "pre-blank", so `up` restored the clamp and the machine sat at 62% of
+# its clock in the powersave governor until reboot. Two power-key presses in
+# quick succession were enough. Same shape as the audio-mute latch.
+check "descent does not re-record state" "grep -q 'ALREADY_DOWN=1' $MNT/usr/local/bin/uconsole-lowpower"
+check "save() honours the already-down guard" \
+      "grep -q '(( ALREADY_DOWN )) && return 0' $MNT/usr/local/bin/uconsole-lowpower"
+check "state file is not truncated unconditionally" \
+      "[[ \$(grep -c '^    : > \"\$STATE\"' $MNT/usr/local/bin/uconsole-lowpower) -eq 0 ]]"
+# Belt and braces: a saved ceiling equal to the floor is a stale clamp, never a
+# preference, and restoring it strands the machine at minimum clock.
+check "wake rejects a floor-valued ceiling" \
+      "grep -q 'stale clamp, restoring hardware max' $MNT/usr/local/bin/uconsole-lowpower"
 # sudo IGNORES a drop-in that is not root-owned and 0440, warning only to syslog.
 # The symptom is a key binding that quietly stops saving power, so assert both.
 check "sudoers drop-in ships"          "[[ -f $MNT/etc/sudoers.d/uconsole-lowpower ]]"

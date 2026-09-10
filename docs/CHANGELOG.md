@@ -80,31 +80,42 @@ And one regression caught before it shipped: pruning
 load and takes the *disable* branch when the option is off. Unused-looking and unused are
 different things.
 
-### A retracted claim: the 1.5 GHz ceiling
+### Fixed: the low-power descent could latch the CPU at minimum clock
 
-This release briefly documented "the CPU boots capped at 1.5 GHz" as a hardware fact. It
-is not one, and a clean boot disproves it.
+`uconsole-lowpower down` truncated its state file and recorded the **current** governor and
+ceiling as "pre-blank" on every descent. A second descent — two power-key presses in quick
+succession — recorded the already-clamped `1500000`/`powersave` as the values to restore,
+and `up` put them back. The machine ran at 62 % of its clock in the powersave governor
+until reboot, and `up` could not help because it was doing exactly what it had been told.
 
-The measurement was real — on the long-lived test machine, `scaling_max_freq` sat at the
-floor and writes to raise it reverted within 30 seconds, with neither undervoltage nor
-thermal throttling to explain it. But that machine had been running hand-copied files
-through days of low-power testing. On a freshly flashed image the ceiling is 2400000, it
-holds, and it survives a full blank/wake cycle.
+```
+after down#1 ceiling=1500000 gov=powersave     <- correct
+after down#2 ceiling=1500000 gov=powersave     <- records the CLAMPED values
+after up     ceiling=1500000 gov=powersave     <- restores the clamp, permanently
+```
 
-Two consequences drawn from the bad claim are withdrawn with it: the ceiling clamp in
-`CPU_CLAMP_ON_BLANK` is **not** a no-op, and the power figures here were **not** taken at
-a reduced clock — the probe's state table recorded 2400000 throughout.
+`down` no longer re-records while a descent is active, and `up` treats a saved ceiling
+equal to the floor as a stale clamp. Four verification checks guard it. Same shape as the
+audio-mute latch fixed earlier: saving "what it was" is wrong whenever "what it was" might
+already be the state you are about to impose.
 
-Recorded because the mistake is the useful part: a test device carrying scp'd files is not
-a reference for what the hardware does, and this one had been treated as one.
+### Corrected twice: the 1.5 GHz ceiling
+
+An earlier release documented "the CPU boots capped at 1.5 GHz" as a hardware fact; the
+next retracted it as "accumulated state, cause unknown". Both were too confident. There
+were two causes and only one was ours — the latch above. The remainder is a firmware
+behaviour: the boot-time ceiling is inconsistent between clean boots of the same image
+(2400000 on one, 1500000 on another taken on battery), is not thermal or undervoltage, and
+is not enforced — writing the higher value raises it and it holds. The battery hypothesis
+is recorded in `HARDWARE.md` as untested.
 
 ### Verification
 
-385 → **402 runtime / 406 dev**. The profile is now an argument and is cross-checked
+385 → **406 runtime / 410 dev**. The profile is now an argument and is cross-checked
 against the image contents, so verifying a dev image as `runtime` fails loudly instead of
 running the wrong assertions.
 
-Tested on hardware: **34 passed, 0 failed** including the full blank/wake cycle, with the
+Tested on a flashed dev image: **31 passed, 0 failed** including the full blank/wake cycle, with the
 modem sequence confirmed unattended — `disabled` → `enabling` → `registered` →
 `bearer reconnected` → `done`.
 

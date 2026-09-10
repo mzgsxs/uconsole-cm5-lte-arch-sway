@@ -70,6 +70,10 @@ docker run --rm --privileged --platform linux/arm64 -v "$PWD":/work -w /work \
   alarm-base:latest /bin/bash /work/build/build-image-full.sh
 ```
 
+**Build the two profiles one at a time.** Step 2 does `rm -rf /work/repo/aarch64` to
+rebuild the local package repository, and that path is shared through the bind mount — two
+concurrent builds race over it and one fails partway with the image already deleted.
+
 `BUILD_PROFILE` selects which of the two trees is assembled:
 
 | Profile | Output | Adds |
@@ -137,7 +141,7 @@ docker run --rm --privileged --platform linux/arm64 -v "$PWD":/work -w /work \
 
 The second argument is the profile, and it is cross-checked against what is actually
 inside the image — verifying a dev image as `runtime` fails loudly rather than quietly
-running the wrong assertions. Counts: **402** for runtime, **406** for dev.
+running the wrong assertions. Counts: **406** for runtime, **410** for dev.
 
 Structural verification cannot prove behaviour. The dev image carries
 `uconsole-selftest` for that, and it must be run on the device:
