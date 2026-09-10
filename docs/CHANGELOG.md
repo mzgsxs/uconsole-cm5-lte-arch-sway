@@ -1,5 +1,64 @@
 # Changelog
 
+## Battery: a hung calibrator, a corrected device tree, and a guard that explains itself
+
+### `uconsole-battery-calibrate` hung in phase 1, on a full battery
+
+It waited for `status == "Full"`. **This driver never sets it.** Measured with the pack at
+4.213 V — above the 4.200 V design maximum — gauge at 100 % and charge current tapered to
+4–19 mA, `status` still read `Charging`, indefinitely.
+
+Phase 1 now terminates on the CV taper instead: at the voltage ceiling with the current
+fallen below `TAPER_UA` (150 mA, ~C/46 on this pack). The condition must hold across three
+samples, since charge current is noisy near the end and one low reading is not the taper
+finishing. A four-hour deadline replaces the unbounded wait, and says what it last saw
+rather than hanging silently.
+
+### The device tree described the wrong battery
+
+The uConsole CM5 overlay hardcodes ClockworkPi's stock 6700 mAh pack, and that value is
+what the driver reports as `charge_full_design`. `build-kernel.sh` now patches it at kernel
+build time from `BATTERY_MAH` (default 7000, for 2×3500 mAh in parallel), along with
+`energy-full-design-microwatt-hours`. The patch is asserted, not assumed — if the property
+moves or upstream changes it, the build fails rather than silently shipping the stock
+figure. Confirmed in the shipped `.dtbo`: contains 7000000 and 25900000, no longer 6700000
+or 24790000.
+
+This does **not** fix the fuel gauge. That reads high because it is uncalibrated
+(`calibrate` returns 0), and 6700 mAh was within 4 % of the fitted pack anyway.
+
+### The low-voltage guard now explains itself
+
+A shutdown at "30 % remaining" looks like the guard firing early. It was not: the guard
+fired at 3.38 V and 3.357 V, both genuinely flat, both clean. The gauge was wrong.
+
+Both guard messages now print the gauge's claim next to the voltage, so the journal
+distinguishes "guard fired early" from "gauge is lying" without a second investigation.
+The threshold was briefly lowered to 3.30 V and **put back to 3.40 V**: that margin exists
+for the ~8 s clean shutdown against the 305 mV rail sag an LTE burst produces, and LTE was
+connected during both events.
+
+Also recorded: after a low-voltage shutdown, charge before powering on. The same incident
+produced three boots of ~620 journal lines each, seconds apart — each one dying mid-boot
+and leaving the FAT partition dirty.
+
+### `PACK_WH` was still 14.8
+
+Every runtime estimate the probe produced was against a 14.8 Wh pack while 25.9 Wh was
+fitted — **all of them ~43 % pessimistic**. Now 25.9, and `uconsole-power-probe pack 2x3500`
+is the way to change it.
+
+### Corrected
+
+A capacity-mismatch explanation for the gauge error was published and is withdrawn: it was
+computed against 2×2000 mAh cells when 2×3500 mAh were fitted. The device tree's figure was
+within 4 %, in the direction that would make the gauge read *low*. The gauge is simply
+uncalibrated, which is what §3.5 said in the first place.
+
+### Verification
+
+406/410 → **413 runtime / 417 dev**.
+
 ## Two trees, a leaner runtime, and an on-device test harness
 
 ### Two images from one source

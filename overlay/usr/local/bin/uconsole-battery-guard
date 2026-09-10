@@ -10,25 +10,55 @@ set -uo pipefail
 B=/sys/class/power_supply/axp20x-battery
 AC=/sys/class/power_supply/axp22x-ac/online
 WARN_UV=3500000     # 3.50 V -- warn
-CRIT_UV=3400000     # 3.40 V -- shut down
+# 3.40 V -- shut down.
+#
+# Briefly lowered to 3.30 V for more runtime and put back. The threshold has to
+# leave enough margin for a CLEAN shutdown to finish, which takes roughly 8 s
+# here, and S3.10 measured LTE transmit bursts pulling the rail down by 305 mV.
+# From 3.30 V a burst mid-shutdown lands near 3.0 V -- close to where the PMIC
+# cuts by itself, and an unclean cut is what dirties the FAT boot partition.
+#
+# Note this is NOT the number to change if the gauge disagrees. The gauge reads
+# high on this hardware (S3.5: 49 % at 3.402 V), so a shutdown at what looks like
+# "30 % remaining" is the gauge being wrong, not the guard being early.
+CRIT_UV=3400000
 STATE=/run/uconsole/battery-guard.state
 
 [[ -r $B/voltage_now ]] || exit 0
+
+# Report the gauge's claim alongside the voltage in every message.
+#
+# Without this the journal says "shutting down at 3.38V" while the screen says
+# "30% remaining", and the two never meet. They disagree because the gauge is
+# UNCALIBRATED -- `calibrate` reads 0 -- and the AXP223's percentage comes from an
+# internal model that is simply wrong on this hardware (S3.5 recorded 49% at
+# 3.402V; 2026-09-10 saw ~30% at 3.38V). It is not a capacity mismatch: the device
+# tree's charge-full-design is within a few percent of a 2x3500mAh pack.
+#
+# Printing both numbers together is what lets the next person tell "the guard
+# fired early" from "the gauge is lying", which are very different problems.
+gauge() {
+    local c; c=$(cat "$B/capacity" 2>/dev/null)
+    [[ -n $c ]] && printf 'gauge says %s%% -- UNCALIBRATED, do not trust it (calibrate=%s)' \
+        "$c" "$(cat "$B/calibrate" 2>/dev/null || echo '?')"
+}
 [[ $(cat $AC 2>/dev/null || echo 0) == 1 ]] && exit 0   # on AC, nothing to do
 
 V=$(cat $B/voltage_now)
 mkdir -p /run/uconsole
 
 if (( V <= CRIT_UV )); then
-    logger -t uconsole-battery-guard "CRITICAL: ${V}uV <= ${CRIT_UV}uV, shutting down cleanly"
-    wall "Battery critically low ($(awk "BEGIN{printf \"%.2f\", $V/1000000}")V). Shutting down in 30s to avoid an unclean power cut."
+    logger -t uconsole-battery-guard "CRITICAL: ${V}uV <= ${CRIT_UV}uV, shutting down cleanly -- $(gauge)"
+    wall "Battery critically low ($(awk "BEGIN{printf \"%.2f\", $V/1000000}")V). Shutting down in 30s to avoid an unclean power cut.
+The percentage shown elsewhere is from an UNCALIBRATED gauge and reads high; trust the volts.
+Do NOT power back on until charged: each failed boot attempt dirties /boot."
     sleep 30
     # Re-check: the user may have plugged in during the grace period.
     [[ $(cat $AC 2>/dev/null || echo 0) == 1 ]] && { logger -t uconsole-battery-guard "AC restored, aborting"; exit 0; }
     systemctl poweroff
 elif (( V <= WARN_UV )); then
     if [[ ! -f $STATE ]]; then
-        logger -t uconsole-battery-guard "WARNING: ${V}uV low; LTE TX bursts can trigger an undervoltage cut"
+        logger -t uconsole-battery-guard "WARNING: ${V}uV low; LTE TX bursts can trigger an undervoltage cut -- $(gauge)"
         wall "Battery low ($(awk "BEGIN{printf \"%.2f\", $V/1000000}")V). Plug in, or disable LTE: sudo uconsole-wan wifi && sudo uconsole-modem-power disable"
         touch $STATE
     fi

@@ -4,6 +4,16 @@ set -Eeuo pipefail
 KERNEL_COMMIT="${KERNEL_COMMIT:?must be set}"
 PKGDIR="${PKGDIR:-linux-uconsole-cm5-4k-git}"
 
+# Total pack capacity in mAh, for the device-tree battery node.
+#
+# The uConsole CM5 overlay describes ClockworkPi's stock 6700mAh pack. That is a
+# property of the DTS, not of the machine, and it is what the AXP223 driver
+# reports as charge_full_design -- so on any other cells it describes hardware
+# that is not present. Parametrised so a cell swap is one variable, not a patch.
+#
+# 2x 3500mAh 18650 in parallel = 7000. For the 2x2000 pair, pass 4000.
+BATTERY_MAH="${BATTERY_MAH:-7000}"
+
 echo "=== [1/5] pacman bootstrap ==="
 # Landlock sandbox is unavailable in Docker Desktop's VM; disable it globally.
 grep -q '^DisableSandbox' /etc/pacman.conf || sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf
@@ -44,6 +54,37 @@ awk '/scripts.config --disable LOCALVERSION_AUTO/ && !done {
      } 1' /home/builder/build/PKGBUILD > /tmp/PKGBUILD.new
 mv /tmp/PKGBUILD.new /home/builder/build/PKGBUILD
 grep -n 'LANDLOCK\|SUSPEND\|PM_SLEEP\|LOCALVERSION' /home/builder/build/PKGBUILD
+
+# Correct the device-tree battery node to describe the cells actually fitted.
+#
+# This does NOT fix the fuel gauge -- that reads high because it is uncalibrated
+# (`calibrate` returns 0), and the stock 6700mAh figure is within a few percent
+# of a 2x3500 pack anyway. It is here so the DT describes real hardware, which
+# matters if anyone ever does calibrate it.
+#
+# The patch is asserted, not assumed: if the property moves or the upstream value
+# changes, the build FAILS rather than silently shipping the stock figure.
+_uah=$(( BATTERY_MAH * 1000 ))
+_uwh=$(( BATTERY_MAH * 37 * 100 ))     # mAh * 3.7V, in microwatt-hours
+awk -v uah="$_uah" -v uwh="$_uwh" '
+  /^prepare\(\) \{/ && !done {
+    print
+    print "  # Battery node: describe the cells actually fitted (see build-kernel.sh)."
+    print "  # cd first: this block is injected at the top of prepare(), before the"
+    print "  # existing cd, so without this the grep searches srcdir and finds nothing."
+    print "  cd \"${srcdir}/kernel\""
+    print "  _dts=$(grep -rl charge-full-design-microamp-hours arch/arm64/boot/dts/overlays/ 2>/dev/null | grep -i uconsole | grep -i cm5 | head -1)"
+    print "  [[ -n $_dts ]] || { echo \"ERROR: no uConsole CM5 overlay DTS carries a battery node\" >&2; exit 1; }"
+    print "  echo \"patching battery node in $_dts\""
+    print "  sed -i -E \"s/(charge-full-design-microamp-hours[[:space:]]*=[[:space:]]*<)[^>]+(>)/\\1" uah "\\2/\" \"$_dts\""
+    print "  sed -i -E \"s/(energy-full-design-microwatt-hours[[:space:]]*=[[:space:]]*<)[^>]+(>)/\\1" uwh "\\2/\" \"$_dts\""
+    print "  grep -q \"charge-full-design-microamp-hours = <" uah ">\" \"$_dts\" || { echo \"ERROR: battery capacity patch did not apply\" >&2; exit 1; }"
+    print "  grep -q \"energy-full-design-microwatt-hours = <" uwh ">\" \"$_dts\" || { echo \"ERROR: battery energy patch did not apply\" >&2; exit 1; }"
+    done=1; next
+  } 1' /home/builder/build/PKGBUILD > /tmp/PKGBUILD.bat
+mv /tmp/PKGBUILD.bat /home/builder/build/PKGBUILD
+echo "--- battery patch injected into prepare() (${BATTERY_MAH}mAh = ${_uah}uAh / ${_uwh}uWh) ---"
+grep -n 'battery node\|charge-full-design' /home/builder/build/PKGBUILD
 
 chown -R builder:builder /home/builder/build
 

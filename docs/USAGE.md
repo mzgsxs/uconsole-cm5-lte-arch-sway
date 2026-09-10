@@ -147,6 +147,16 @@ uconsole-battery-calibrate report     # results and a voltage -> charge table
 sudo uconsole-battery-calibrate apply # write calibration where the driver allows
 ```
 
+**The percentage reads high near empty — the gauge is uncalibrated** (`calibrate` reads 0)
+and the AXP223's internal model does not match this pack. It is *not* a capacity mismatch:
+the device tree's design capacity is within 4 % of a 2×3500 mAh pack. A shutdown at
+"30 % remaining" is the gauge being wrong, not the guard being early, and the journal now
+prints both numbers together so the two can be compared directly.
+
+If the guard fires, **charge before powering on again**. A pack flat enough to trigger it
+will usually die part-way through the next boot, and every attempt that does leaves the FAT
+boot partition dirty.
+
 `status` is safe any time and immediately tells you whether the gauge is lying. `run`
 measures real pack capacity by integrating current, stopping at 3.50 V so it can never
 trigger the undervoltage cut. It refuses to start quietly while the LTE modem is powered,
@@ -398,7 +408,7 @@ sudo uconsole-power-probe pack 2x3500
 | Cells (parallel) | `PACK_WH` |
 |---|---|
 | 2 × 2000 mAh | 14.8 Wh |
-| 2 × 3500 mAh | 25.9 Wh |
+| 2 × 3500 mAh — **fitted** | 25.9 Wh |
 
 `uconsole-power-probe pack` with no argument shows what's currently set. A bare number
 (`pack 20.35`) sets watt-hours directly, which is what you want after measuring the pack

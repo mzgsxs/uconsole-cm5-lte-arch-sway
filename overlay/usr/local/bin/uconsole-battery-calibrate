@@ -42,6 +42,33 @@ uv2v(){ awk -v x="$1" 'BEGIN{printf "%.3f", x/1000000}'; }
 
 modem_is_on(){ grep -qs 1e0e /sys/bus/usb/devices/*/idVendor 2>/dev/null; }
 
+# Is the pack charged? Do NOT just test status == "Full".
+#
+# This driver never reports it. Measured 2026-09-10 with the pack sitting at
+# 4.213 V (above the 4.200 V design maximum), gauge at 100 %, and charge current
+# tapered to 4-19 mA: status still read "Charging", indefinitely. Phase 1 waited
+# on that string and hung forever on a battery that was already full.
+#
+# Terminate on the physics instead, which is how a CV charger finishes anyway:
+# at the voltage ceiling with the current fallen to a trickle. TAPER_UA is
+# deliberately generous -- 150 mA is C/46 on a 7000 mAh pack, far below any real
+# charging current but well above the sensor noise floor.
+TAPER_UA=${TAPER_UA:-150000}
+fully_charged(){
+    local st v i c vmax
+    st=$(rd status)
+    [[ $st == "Full" ]] && { CHARGED_WHY="driver reports Full"; return 0; }
+    c=$(rd capacity); v=$(rd voltage_now); i=$(rd current_now); vmax=$(rd voltage_max_design)
+    [[ -z $v || -z $i ]] && return 1
+    i=${i#-}                                   # magnitude; sign convention varies
+    [[ -z $vmax ]] && vmax=4200000
+    if (( c >= 99 )) && (( v >= vmax - 50000 )) && (( i < TAPER_UA )); then
+        CHARGED_WHY="$(uv2v "$v") V at ${c}% with $((i/1000)) mA -- CV taper complete"
+        return 0
+    fi
+    return 1
+}
+
 show_status(){
     say "Fuel gauge state"
     printf '      %-22s %s\n' "voltage" "$(uv2v "$(rd voltage_now)") V"
@@ -101,12 +128,36 @@ do_run(){
         while ! on_ac; do sleep 5; done
     fi
     inf "Charging. This can take a couple of hours; leave it plugged in."
-    while [[ $(rd status) != "Full" ]]; do
-        printf '\r      %s V   %s%%   %s        ' "$(uv2v "$(rd voltage_now)")" "$(rd capacity)" "$(rd status)"
+    inf "Waiting for the CV taper to finish, not for status=Full -- this driver"
+    inf "never sets it (see fully_charged())."
+    CHARGED_WHY=""
+    # Require the condition to HOLD, not merely occur: charge current is noisy
+    # near the end and a single low sample is not the taper finishing.
+    _hold=0; _need=3
+    # And bound the wait, so a pack that will never reach the ceiling reports
+    # that rather than hanging silently the way the old loop did.
+    _deadline=$(( $(date +%s) + 4*3600 ))
+    while :; do
+        if fully_charged; then
+            _hold=$((_hold+1))
+            (( _hold >= _need )) && break
+        else
+            _hold=0
+        fi
+        printf '\r      %s V   %s%%   %s mA   %s   [%d/%d]        ' \
+            "$(uv2v "$(rd voltage_now)")" "$(rd capacity)" \
+            "$(( $(rd current_now | tr -d -) / 1000 ))" "$(rd status)" "$_hold" "$_need"
         sleep 30
         on_ac || { echo; err "AC removed during charge -- aborting"; exit 1; }
+        if (( $(date +%s) > _deadline )); then
+            echo; err "still not charged after 4 hours -- aborting"
+            inf "last seen: $(uv2v "$(rd voltage_now)") V, $(rd capacity)%, $(rd status)"
+            inf "If the pack is clearly full, the taper threshold may need raising:"
+            inf "  sudo TAPER_UA=300000 uconsole-battery-calibrate run"
+            exit 1
+        fi
     done
-    echo; ok "battery reports Full at $(uv2v "$(rd voltage_now)") V"
+    echo; ok "charged -- ${CHARGED_WHY}"
 
     # --- phase 2: measured discharge ---
     say "Phase 2 of 3 - discharge and measure"

@@ -683,7 +683,29 @@ check "has status/run/report/apply"    "grep -qE 'status\\)  *show_status' $MNT/
 check "integrates current for capacity" "grep -q 'mah+=a\\*dt/3600' $MNT/usr/local/bin/uconsole-battery-calibrate"
 check "stops above the PMU cutoff"     "grep -q 'FLOOR_UV:-3500000' $MNT/usr/local/bin/uconsole-battery-calibrate"
 check "warns when the modem is powered" "grep -q 'modem_is_on' $MNT/usr/local/bin/uconsole-battery-calibrate"
-check "floor sits above the guard's 3.40V" "[[ 3500000 -gt 3400000 ]]"
+# The AXP223 driver never sets status=Full: measured at 4.213V / 100% / 5mA it
+# still read "Charging". Waiting on that string hung phase 1 forever on a pack
+# that was already charged. Terminate on the CV taper instead.
+check "charge phase does not wait on status=Full" \
+      "[[ \$(grep -v '^[[:space:]]*#' $MNT/usr/local/bin/uconsole-battery-calibrate | grep -c 'rd status) != \"Full\"') -eq 0 ]]"
+check "charge phase detects the CV taper" "grep -q 'fully_charged()' $MNT/usr/local/bin/uconsole-battery-calibrate"
+check "charge phase requires a sustained taper" "grep -q '_need=3' $MNT/usr/local/bin/uconsole-battery-calibrate"
+check "charge phase cannot hang forever"  "grep -q 'still not charged after 4 hours' $MNT/usr/local/bin/uconsole-battery-calibrate"
+# Read BOTH numbers out of the shipped scripts and compare them. This used to be
+# `[[ 3500000 -gt 3400000 ]]` -- both sides hardcoded, so it could never fail and
+# never noticed either value changing. The calibrator must stop discharging above
+# the guard's cutoff, or a calibration run would trigger the shutdown it exists
+# to measure around.
+check "calibrator floor sits above the guard cutoff" \
+      "[[ \$(grep -oE 'FLOOR_UV:-[0-9]+' $MNT/usr/local/bin/uconsole-battery-calibrate | grep -oE '[0-9]+') -gt \$(grep -oE '^CRIT_UV=[0-9]+' $MNT/usr/local/bin/uconsole-battery-guard | grep -oE '[0-9]+') ]]"
+check "guard cutoff is 3.40V"          "grep -q '^CRIT_UV=3400000' $MNT/usr/local/bin/uconsole-battery-guard"
+# The gauge reads high near empty because it is uncalibrated, so a shutdown looks
+# premature from the percentage alone. Both numbers must appear together or the
+# journal cannot explain itself.
+check "guard logs the gauge alongside volts" "grep -q 'gauge()' $MNT/usr/local/bin/uconsole-battery-guard"
+# The warn must fire before the cut, or the warning is useless.
+check "guard warns above its cutoff" \
+      "[[ \$(grep -oE '^WARN_UV=[0-9]+' $MNT/usr/local/bin/uconsole-battery-guard | grep -oE '[0-9]+') -gt \$(grep -oE '^CRIT_UV=[0-9]+' $MNT/usr/local/bin/uconsole-battery-guard | grep -oE '[0-9]+') ]]"
 check "guard and calibrator agree on the battery path" "grep -q 'axp20x-battery' $MNT/usr/local/bin/uconsole-battery-guard && grep -q 'axp20x-battery' $MNT/usr/local/bin/uconsole-battery-calibrate"
 
 echo

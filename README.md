@@ -5,7 +5,7 @@ A build system that produces a bootable **Arch Linux ARM** image with a
 fitted with a **Raspberry Pi Compute Module 5**.
 
 The kernel is compiled from source; the image is assembled and then checked by an
-automated verification suite — **406 checks** for the runtime image, **410** for the dev
+automated verification suite — **413 checks** for the runtime image, **417** for the dev
 image, all passing.
 
 Inputs are pinned where upstream allows it: the kernel commit, the upstream builder, and
@@ -157,7 +157,7 @@ privilege with a command different from the one it intends to run — each of wh
 real defect found by measuring the machine rather than reading the code.
 
 ```
-RESULT: 406 passed, 0 failed
+RESULT: 413 passed, 0 failed
 ```
 
 Structural verification is not a boot test. Nothing here has been validated by an

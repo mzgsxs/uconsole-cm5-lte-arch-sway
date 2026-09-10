@@ -62,6 +62,20 @@ Output lands in `out/` as a `.pkg.tar.xz`.
 some Electron builds and various prebuilt binaries. Both install into the *same* boot slot
 (`vmlinuz-linux-uconsole-cm5-git`), so `config.txt` needs no change when switching.
 
+### Battery capacity in the device tree
+
+The uConsole CM5 overlay hardcodes ClockworkPi's stock 6700 mAh pack, and that value is
+what the driver reports as `charge_full_design`. `build-kernel.sh` patches it to match the
+cells actually fitted:
+
+```bash
+-e BATTERY_MAH=7000     # 2x 3500mAh 18650 in parallel; use 4000 for the 2x2000 pair
+```
+
+The patch is asserted, not assumed — if the property moves or upstream changes the value,
+the build fails rather than silently shipping the stock figure. It does not fix the fuel
+gauge, which reads high because it is uncalibrated.
+
 ## Step 3 — the image
 
 ```bash
@@ -141,7 +155,7 @@ docker run --rm --privileged --platform linux/arm64 -v "$PWD":/work -w /work \
 
 The second argument is the profile, and it is cross-checked against what is actually
 inside the image — verifying a dev image as `runtime` fails loudly rather than quietly
-running the wrong assertions. Counts: **406** for runtime, **410** for dev.
+running the wrong assertions. Counts: **413** for runtime, **417** for dev.
 
 Structural verification cannot prove behaviour. The dev image carries
 `uconsole-selftest` for that, and it must be run on the device:

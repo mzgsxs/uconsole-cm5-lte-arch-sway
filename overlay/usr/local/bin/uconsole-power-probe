@@ -35,8 +35,8 @@ B=/sys/class/power_supply/axp20x-battery
 AC=/sys/class/power_supply/axp22x-ac/online
 CONF=/etc/uconsole/lowpower.conf
 # Pack size varies with whatever cells are actually fitted, so it is policy, not
-# a constant. The fallback assumes 2x 18650 2000mAh in parallel (3.7V * 4.0Ah).
-PACK_WH=14.8
+# a constant. The fallback assumes 2x 18650 3500mAh in parallel (3.7V * 7.0Ah).
+PACK_WH=25.9
 # shellcheck source=/dev/null
 [[ -r $CONF ]] && . "$CONF"
 OUTDIR="${XDG_STATE_HOME:-$HOME/.local/state}/uconsole/power"

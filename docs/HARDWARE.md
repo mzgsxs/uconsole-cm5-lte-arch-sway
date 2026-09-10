@@ -154,13 +154,67 @@ Derived from an on-device defect report. Section numbers reference that report.
 | 3.2 | 4G power-on broken on CM5: wrong gpiochip, libgpiod v1 syntax, line released on exit, and `ExecStart=-` hiding the failure | **Fixed** — `uconsole-modem-power` detects the chip by label and holds the line; the unit no longer masks failures |
 | 3.3 | LTE defaults: QMI `raw_ip` off, roaming disallowed, MTU 1500 when the carrier advertises 1280 | **Fixed** — `uconsole-modem-connect` sets all three from the bearer |
 | 3.4 | `systemd-networkd` and NetworkManager both enabled: two-minute boot delay, and timesyncd never syncs because it follows networkd's online signal | **Fixed** — networkd disabled, wait-online masked |
-| 3.5 | No low-voltage protection; the gauge reads ~71 % about an hour before an undervoltage cut | **Guard shipped** — voltage-based, warns at 3.50 V, clean shutdown at 3.40 V. Gauge calibration available on demand |
+| 3.5 | No low-voltage protection; the gauge reads ~71 % about an hour before an undervoltage cut | **Guard shipped** — voltage-based, warns at 3.50 V, clean shutdown at 3.40 V. Root cause of the gauge error now identified — see below |
 | 3.6 | No RTC; clock wrong every boot | **Mitigated** — networkd fix lets timesyncd work; NTP servers pinned by IP so a first sync does not need DNS |
 | 3.7 | `wireless-regdb` missing — 299 brcmfmac channel errors per boot, 14.5 % of the journal | **Fixed** — `wireless-regdb` and `iw` installed |
 | 3.8 | DSI panel never wakes from `dpms off`; presents as a hung machine | **Fixed** — idle dims the backlight instead; `dpms` is never used |
 | 3.9 | No kernel suspend support (`/sys/power/state` empty) | **Superseded.** The premise was a CM4 observation. On this build both sleep states register — and both are unusable. Suspend is now masked; see below |
 | 3.10 | PWM audio picks up LTE transmit bursts as audible static | **Not fixable in software** — see below |
 | 3.11 | Missing `usbutils`/`iw`, no swap, sshd defaults | **Partly fixed** — tools and `zram-generator` added; sshd left enabled |
+
+**The fuel gauge reads high near empty, and it is NOT a capacity mismatch.** That was
+investigated and ruled out. The device tree declares:
+
+```
+/proc/device-tree/battery@0/charge-full-design-microamp-hours   6700000   (6700 mAh)
+fitted pack: 2x 18650 3500mAh in parallel                                  7000 mAh
+```
+
+Within 4 %, and in the direction that would make the gauge read *low*. The percentage is
+wrong because the gauge is simply **uncalibrated** — `calibrate` reads 0 — and the AXP223
+derives its number from an internal model that does not match this pack. §3.5 recorded
+49 % at 3.402 V; 2026-09-10 saw ~30 % at 3.38 V. Same failure, years apart.
+
+That incident is worth recording in full, because it looks from the outside like the guard
+firing early:
+
+```
+16:08:19  WARNING:  3490000uV low
+16:11:09  CRITICAL: 3380000uV <= 3400000uV, shutting down cleanly
+16:30:21  WARNING:  3402000uV low
+16:30:56  CRITICAL: 3357000uV <= 3400000uV, shutting down cleanly
+```
+
+3.38 V and 3.357 V are genuinely flat for a 18650. **The guard was right and the gauge was
+wrong**, which is why the threshold is voltage-based and why lowering it is the wrong
+response to this symptom. It was briefly lowered to 3.30 V for exactly that reason and put
+back: 3.40 V exists to leave margin for the ~8 s clean shutdown against the 305 mV rail sag
+an LTE transmit burst produces (§3.10), and LTE was connected during both events above.
+
+Both `uconsole-battery-guard` messages now print the gauge's claim next to the voltage, so
+the journal distinguishes "guard fired early" from "gauge is lying" without a second
+investigation.
+
+**The battery driver never reports `status=Full`.** Measured 2026-09-10 with the pack at
+**4.213 V** (above the 4.200 V design maximum), gauge at **100 %**, and charge current
+tapered to **4–19 mA**, `status` still read `Charging` — indefinitely.
+
+Anything that waits for that string waits forever. `uconsole-battery-calibrate` did exactly
+that and hung in phase 1 on a pack that was already charged. It now terminates on the
+physics instead — at the voltage ceiling with the current fallen to a trickle, which is how
+a CV charger finishes anyway — requires the condition to hold across three samples, and
+gives up after four hours rather than hanging silently.
+
+The device tree battery node is also patched at kernel build time to describe the fitted
+cells rather than ClockworkPi's stock pack; see `BATTERY_MAH` in `build/build-kernel.sh`.
+That does **not** fix the gauge, which is uncalibrated — it only makes
+`charge_full_design` honest.
+
+**After a low-voltage shutdown, charge before powering on again.** The same incident shows
+why: three boots of ~620 journal lines each, seconds apart, then a fourth that survived
+three minutes before the guard fired again. Each attempt that dies mid-boot leaves the FAT
+boot partition dirty — one such marker is present on the current boot, and two journal
+files have been rotated as corrupted.
 
 ## Two that cannot be fixed here
 
@@ -224,12 +278,11 @@ Measured on this hardware:
 - Idle, backlight off, nothing else changed: **3.36 W**
 - LTE connected but not routed ("hot standby"): ~0.1 W, ~4 MiB/month
 - LTE transmit burst: 4.4 A swing, 305 mV rail sag
-- Pack: **14.8 Wh nominal** on this unit -- 2x 18650 at 3.7V 2000mAh, wired in
-  **parallel** (3.7V x 4000mAh). Parallel is not an assumption: the AXP223 is a
+- Pack: **25.9 Wh nominal** on this unit -- 2x 18650 at 3.7V 3500mAh, wired in
+  **parallel** (3.7V x 7000mAh). Parallel is not an assumption: the AXP223 is a
   single-cell PMIC and the pack reads 3.4-4.2V in sysfs, where a series pair would
-  read double. An earlier figure of 24.79 Wh came from the defect report and
-  described larger cells; it is wrong for this hardware.
-  Set `PACK_WH` in `/etc/uconsole/lowpower.conf` if you fit different cells.
+  read double. Earlier figures in this repo assumed 2x2000mAh / 14.8 Wh; the cells
+  were swapped. Set it with `uconsole-power-probe pack 2x3500` rather than by hand.
 
 The gauge is uncalibrated (`calibrate` reads 0) and its percentage cannot be trusted —
 it read 49 % at 3.402 V. Use voltage, which is what `uconsole-battery-guard` does.
