@@ -1,5 +1,33 @@
 # Changelog
 
+## Images shrunk to fit: 8 GB -> 4.5 GB runtime, 4.9 GB dev
+
+The image is now built at 8 GB and shrunk as the final step, after customisation.
+
+`uconsole-expand-root` grows the root to fill whatever card it is flashed to on first boot,
+so image size constrains nothing on the device — but the old 8 GB image carried ~4.4 GB of
+zeroes and `dd` wrote every one of them to the card. Measured content is 2.9 GB (runtime)
+and 3.4 GB (dev).
+
+**Built big and shrunk, not built small.** Sizing the build to measured final usage failed:
+`Partition / too full: 299385 blocks needed, 277133 blocks free`. pacman's peak usage is
+about 1.2 GB above the finished content, because it downloads and extracts before cleaning
+up.
+
+**Shrunk after `customize-image.sh`, not inside upstream's script.** Upstream's `--minimize`
+flag does the same job but runs at the end of *its* script — before our overlay and chroot
+step — so it would shrink the filesystem we then write into.
+
+`SHRINK_FREE` (default 256 MiB) controls the free space left in the shrunk root. `tune2fs -m 1`
+and a second `resize2fs -M` pass were tried and are kept, but bought only 12 MB — reserved
+blocks turn out not to count toward the minimum.
+
+What this does *not* change: compressed transfer. The zeroes compressed away regardless, so
+a gzipped image was ~1.48 GB before and after. The win is entirely in writing to a card.
+
+The largest remaining slack is the 512 MiB boot partition holding 29 MB — see
+[`ROADMAP.md`](ROADMAP.md), which explains why it is not a two-line change.
+
 ## Battery: a hung calibrator, a corrected device tree, and a guard that explains itself
 
 ### `uconsole-battery-calibrate` hung in phase 1, on a full battery

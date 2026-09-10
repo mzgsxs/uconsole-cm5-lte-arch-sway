@@ -15,7 +15,19 @@ case "$PROFILE" in
   *) echo "BUILD_PROFILE must be 'runtime' or 'dev', got '$PROFILE'" >&2; exit 2 ;;
 esac
 echo "=== building the $PROFILE image: $(basename "$IMG") ==="
+
+# BUILD size, not shipped size. The image is shrunk to fit in step [8/8].
+#
+# It has to be generous here because pacman's PEAK usage is far above the final
+# content: it downloads and extracts before cleaning up. Sizing this to measured
+# final usage (2.9G runtime) failed with "Partition / too full: 299385 blocks
+# needed, 277133 blocks free" -- about 1.2G of transient space that the finished
+# image does not contain.
 SIZE="${IMAGE_SIZE:-8G}"
+
+# Free space to leave in the shrunk root. Enough for a `pacman -Syu` on the
+# device before uconsole-expand-root grows it on first boot.
+SHRINK_FREE="${SHRINK_FREE:-256}"      # MiB
 REPO_PORT=8089
 HTTP_PID=""
 
@@ -195,7 +207,7 @@ for p in "${PKGS[@]}"; do EXTRA_ARGS+=(--extra-package "$p"); done
 echo "=== [6/6] applying uConsole overlay ==="
 bash /work/build/customize-image.sh "$IMG" "$PROFILE"
 
-echo "=== [7/7] flash verification artifacts ==="
+echo "=== [7/8] flash verification artifacts ==="
 # Generated here rather than by hand. Producing them manually risked leaving a
 # stale manifest behind, and verify-card.sh comparing a card against the wrong
 # image is worse than not checking at all -- a stale PASS is the dangerous case.
@@ -209,6 +221,63 @@ umount /mnt/artman
 losetup -d "$ART_LOOP"
 cp /tmp/boot-manifest.sha256 /work/out/boot-manifest.sha256
 echo "boot manifest: $(wc -l < /work/out/boot-manifest.sha256) files"
+
+echo "=== [8/8] shrinking the image to fit ==="
+# Sized to the content, not to the card.
+#
+# uconsole-expand-root grows the root to fill whatever card it is flashed to on
+# first boot, so image size constrains nothing on the device -- it is purely a
+# build and transfer artifact. The 8G build image carried ~4.4G of zeroes, which
+# cost real time on every `dd` to a card.
+#
+# This runs AFTER customize-image.sh on purpose. Upstream's own --minimize flag
+# does the same job but runs at the end of ITS script, which is before our
+# overlay and chroot step -- it would shrink the filesystem we then write into.
+align_up() { echo $(( ( ($1) + ($2) - 1 ) / ($2) * ($2) )); }
+
+SH_LOOP="$(losetup -Pf --show "$IMG")"
+partprobe "$SH_LOOP" >/dev/null 2>&1 || true
+sleep 1
+SH_ROOT="${SH_LOOP}p2"
+
+e2fsck -fy "$SH_ROOT" >/dev/null 2>&1 || true
+# Reserved blocks count toward the minimum resize2fs will accept, and the ext4
+# default of 5% is 216MiB here -- pointless on an image that expands on first
+# boot. 1% is plenty of anti-fragmentation headroom for a root filesystem.
+tune2fs -m 1 "$SH_ROOT" >/dev/null 2>&1 || true
+# Twice: the first pass relocates blocks, and a second pass can usually go
+# further once they have moved.
+resize2fs -M "$SH_ROOT" >/dev/null 2>&1 || true
+e2fsck -fy "$SH_ROOT" >/dev/null 2>&1 || true
+resize2fs -M "$SH_ROOT"
+e2fsck -fy "$SH_ROOT" >/dev/null 2>&1 || true
+
+_bs=$(tune2fs -l "$SH_ROOT" | awk -F: '/Block size:/ {gsub(/ /,"",$2); print $2}')
+_min=$(tune2fs -l "$SH_ROOT" | awk -F: '/Block count:/ {gsub(/ /,"",$2); print $2}')
+_want=$(( (_min * _bs + SHRINK_FREE * 1048576 + _bs - 1) / _bs ))
+echo "root: ${_min} blocks minimum, growing to ${_want} for ${SHRINK_FREE}M free"
+resize2fs "$SH_ROOT" "$_want"
+e2fsck -fy "$SH_ROOT" >/dev/null 2>&1 || true
+
+_blocks=$(tune2fs -l "$SH_ROOT" | awk -F: '/Block count:/ {gsub(/ /,"",$2); print $2}')
+_bs=$(tune2fs -l "$SH_ROOT" | awk -F: '/Block size:/ {gsub(/ /,"",$2); print $2}')
+_fsbytes=$(( _blocks * _bs ))
+_start=$(parted -ms "$SH_LOOP" unit B print | awk -F: '$1 == "2" {sub(/B/,"",$2); print $2}')
+_partbytes=$(align_up $(( _fsbytes + 1048576 )) 1048576)
+_newsize=$(align_up $(( _start + _partbytes )) 1048576)
+
+_ss=$(blockdev --getss "$SH_LOOP")
+_sectors=$(( _partbytes / _ss ))
+sfdisk --dump "$SH_LOOP" > /tmp/sf.old
+awk -v part="$SH_ROOT" -v size="$_sectors" \
+    'index($0, part " :") == 1 { sub(/size=[[:space:]]*[0-9]+/, "size= " size) } { print }' \
+    /tmp/sf.old > /tmp/sf.new
+sfdisk "$SH_LOOP" < /tmp/sf.new >/dev/null
+partprobe "$SH_LOOP" >/dev/null 2>&1 || true
+losetup -d "$SH_LOOP"
+
+truncate -s "$_newsize" "$IMG"
+echo "image shrunk: $(( _newsize / 1048576 )) MiB (was $(( $(numfmt --from=iec "$SIZE") / 1048576 )) MiB)"
 
 img_bytes=$(stat -c%s "$IMG")
 img_mib=$(( img_bytes / 1048576 ))

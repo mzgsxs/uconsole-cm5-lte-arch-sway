@@ -62,6 +62,34 @@ Output lands in `out/` as a `.pkg.tar.xz`.
 some Electron builds and various prebuilt binaries. Both install into the *same* boot slot
 (`vmlinuz-linux-uconsole-cm5-git`), so `config.txt` needs no change when switching.
 
+### Image size
+
+The image is built at 8 GB and **shrunk to fit as the last step** — runtime lands around
+4.5 GB, dev around 4.9 GB.
+
+Both numbers matter for a different reason than you might expect. `uconsole-expand-root`
+grows the root to fill whatever card it is flashed to on first boot, so image size
+constrains nothing on the device. It is purely a build and transfer artifact — but the old
+8 GB image carried ~4.4 GB of zeroes, and `dd` writes every one of them to the card.
+
+It is built big and shrunk afterwards rather than built small, because pacman's **peak**
+usage is far above the finished content. Sizing the build to measured final usage (2.9 GB
+for runtime) fails with `Partition / too full: 299385 blocks needed, 277133 blocks free` —
+about 1.2 GB of transient space that the finished image does not contain.
+
+The shrink runs after `customize-image.sh`, not inside upstream's `build-image.sh`.
+Upstream has a `--minimize` flag that does the same job, but it runs at the end of *its*
+script — before our overlay and chroot step — so it would shrink the filesystem we then
+write into.
+
+```bash
+-e SHRINK_FREE=256      # MiB left free in the shrunk root (default)
+-e IMAGE_SIZE=8G        # build-time size before shrinking
+```
+
+Compressed transfer is unaffected: the zeroes compressed away anyway, so a gzipped image
+was ~1.48 GB either way. The win is entirely in writing to a card.
+
 ### Battery capacity in the device tree
 
 The uConsole CM5 overlay hardcodes ClockworkPi's stock 6700 mAh pack, and that value is

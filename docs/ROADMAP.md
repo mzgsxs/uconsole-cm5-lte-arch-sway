@@ -120,7 +120,28 @@ show anything, since the failure is intermittent.
 
 ---
 
-## 5. Open measurements
+## 5. Reclaim the boot partition
+
+`/boot` is 512 MiB and holds **29 MB**. That is 483 MB of the remaining slack in every
+image, and it is the largest single item left after the shrink step took the runtime image
+from 8 GB to ~4.5 GB.
+
+Upstream hardcodes the geometry:
+
+```
+parted -s "$LOOPDEV" mkpart primary fat32 1MiB 513MiB
+parted -s "$LOOPDEV" mkpart primary ext4  513MiB 100%
+```
+
+A 128 MiB boot partition still leaves 4x headroom for the kernel, initramfs and every DTB,
+and would put the runtime image just under 4 GB.
+
+Not done because it is more than a two-line `sed`: `build-image-full.sh` generates
+`region-hashes.txt` with `fat_boot 1 512` and `ext4_root 513 …` hardcoded to match, and
+`verify-card.sh` compares against those offsets. All three have to move together or a card
+verifies against the wrong regions — which is worse than a slightly larger image.
+
+## 6. Open measurements
 
 Small, and each one closes a question that is currently guessed at.
 
