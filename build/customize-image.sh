@@ -242,6 +242,27 @@ systemctl --global enable pipewire.socket pipewire-pulse.socket wireplumber.serv
 # on server start, which is what recovers sessions across a reboot.
 systemctl --global enable tmux.service
 
+echo "[chroot] adding the OTA recovery check to the initramfs"
+# The hook is an INSTALL hook only -- it adds a systemd unit rather than a
+# run_hook function, because this initramfs runs systemd in early userspace and
+# the two mechanisms are not interchangeable. Position in HOOKS is therefore
+# irrelevant to ordering; that comes from the unit's own Before=/After=.
+if ! grep -q 'uconsole-ota' /etc/mkinitcpio.conf; then
+    sed -i -E 's/^(HOOKS=\(.*)\)$/\1 uconsole-ota)/' /etc/mkinitcpio.conf
+fi
+grep -n '^HOOKS=' /etc/mkinitcpio.conf
+# Regenerate, and let a failure fail the build: an initramfs that did not pick up
+# the hook would ship a machine whose recovery path silently does not exist.
+mkinitcpio -P
+# Assert the unit actually landed. `mkinitcpio -P` exiting 0 does not prove the
+# hook ran -- an install hook that is present but not listed in HOOKS is a no-op.
+if lsinitcpio /boot/initramfs-linux-uconsole-cm5-git.img | grep -q 'uconsole-ota-recovery'; then
+    echo "[chroot] OTA recovery check is in the initramfs"
+else
+    echo "[chroot] ERROR: OTA recovery check missing from the initramfs" >&2
+    exit 1
+fi
+
 echo "[chroot] verifying pacman works end to end (the check that was missing before)"
 if pacman -Sy >/dev/null 2>&1; then
     echo "[chroot] pacman sync: OK"

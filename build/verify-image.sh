@@ -422,6 +422,34 @@ done
 # blank is what switches the network off.
 check "VT recovery tool present"       "[[ -x $MNT/usr/local/bin/uconsole-unstick ]]"
 
+echo "-- OTA recovery hook, phase 0 (initramfs) --"
+# This code runs on EVERY boot, before the real root is used. A fault here does
+# not break an update, it breaks the machine -- on a device whose panel already
+# fails silently on cold boot, so a black screen will not say which fault it is.
+# These checks exist to keep phase 0 incapable of doing harm.
+check "recovery script present"        "[[ -x $MNT/usr/local/bin/uconsole-ota-recovery ]]"
+check "recovery script parses"         "sh -n $MNT/usr/local/bin/uconsole-ota-recovery"
+# `set -e` would turn any unexpected failure into an early exit mid-way through,
+# which is the one thing this script must never do -- it has to reach its exit 0.
+check "recovery script does not set -e" "[[ \$(grep -cE '^set .*-[a-z]*e' $MNT/usr/local/bin/uconsole-ota-recovery) -eq 0 ]]"
+check "recovery script always exits 0" "[[ \$(grep -c 'exit 0' $MNT/usr/local/bin/uconsole-ota-recovery) -ge 3 ]]"
+# PHASE 0 IS OBSERVE-ONLY. No writing verb may appear until phase 2 lands.
+check "phase 0 writes nothing"         "[[ \$(grep -v '^[[:space:]]*#' $MNT/usr/local/bin/uconsole-ota-recovery | grep -cE '\\b(dd|mkfs|sfdisk|parted|gunzip)\\b') -eq 0 ]]"
+check "phase 0 mounts read-only"       "grep -q 'mount -o ro' $MNT/usr/local/bin/uconsole-ota-recovery"
+# The interlock that stops the unit ever running on the real system.
+check "unit is initramfs-only"         "grep -q 'ConditionPathExists=/etc/initrd-release' $MNT/usr/lib/systemd/system/uconsole-ota-recovery.service"
+check "unit runs before the real root" "grep -q 'Before=initrd-root-fs.target' $MNT/usr/lib/systemd/system/uconsole-ota-recovery.service"
+# Nothing may Require it, or a failure would fail the boot instead of being logged.
+check "unit has a hang timeout"        "grep -q 'TimeoutStartSec=' $MNT/usr/lib/systemd/system/uconsole-ota-recovery.service"
+check "mkinitcpio hook installed"      "[[ -x $MNT/etc/initcpio/install/uconsole-ota ]]"
+check "hook listed in HOOKS"           "grep -qE '^HOOKS=.*uconsole-ota' $MNT/etc/mkinitcpio.conf"
+# The hook being present is not the same as it having run: an install hook that
+# is not listed in HOOKS is a silent no-op, so assert the built artefact.
+for f in usr/local/bin/uconsole-ota-recovery usr/lib/systemd/system/uconsole-ota-recovery.service usr/lib/systemd/system/initrd-root-fs.target.wants/uconsole-ota-recovery.service; do
+    check "initramfs carries $(basename "$f")" \
+          "chroot $MNT /usr/bin/lsinitcpio /boot/initramfs-linux-uconsole-cm5-git.img 2>/dev/null | grep -qx '$f'"
+done
+
 echo "-- low-power blank (Stage 1) --"
 check "lowpower policy ships"          "[[ -f $MNT/etc/uconsole/lowpower.conf ]]"
 check "lowpower policy parses"         "bash -n $MNT/etc/uconsole/lowpower.conf"

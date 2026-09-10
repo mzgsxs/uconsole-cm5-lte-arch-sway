@@ -1,0 +1,20 @@
+[Unit]
+Description=uConsole OTA recovery check (initramfs)
+Documentation=file:///usr/local/bin/uconsole-ota-recovery
+DefaultDependencies=no
+# Early enough that the real root has not been used yet.
+Before=initrd-root-fs.target
+After=systemd-udev-trigger.service
+# THE safety interlock: this unit must never run on the real system, only inside
+# the initramfs. /etc/initrd-release exists only there.
+ConditionPathExists=/etc/initrd-release
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/uconsole-ota-recovery
+# Nothing Requires or Wants this unit, so a failure here is logged and ignored
+# rather than failing the boot. The timeout is the backstop for a hang, which is
+# the one failure mode that would actually stop the machine booting.
+TimeoutStartSec=45
+StandardOutput=journal+console
+StandardError=journal+console

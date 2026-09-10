@@ -1,0 +1,59 @@
+#!/bin/sh
+# Runs INSIDE the initramfs, before the real root is used. Phase 0: observe only.
+#
+# This is the most dangerous file in the repository, because it executes on every
+# single boot. A bug here does not break an update -- it breaks the machine, on a
+# device whose panel already fails silently on cold boot, so "black screen" will
+# not tell you which fault you are looking at.
+#
+# Hence one absolute rule: THIS SCRIPT ALWAYS EXITS 0 AND ALWAYS FALLS THROUGH.
+# Every failure mode -- no marker, unmountable boot partition, missing device,
+# anything unforeseen -- must end in a normal boot with the card untouched. The
+# unit that calls it is deliberately not required by anything, so even a crash
+# leaves the boot sequence intact.
+#
+# Phase 0 does no work at all: it proves the hook runs, that the boot partition
+# can be read from early userspace, and that the marker is visible. Writing to
+# the card comes later, once that much is established on real hardware.
+set -u
+
+BOOT_DEV=${BOOT_DEV:-/dev/mmcblk0p1}
+MARKER=OTA-PENDING
+MNT=/run/uconsole-ota-boot
+
+# /dev/kmsg so the message survives into the real system's journal -- there is no
+# display in early userspace and no network, so this is the only way to find out
+# afterwards what happened.
+log() {
+    echo "uconsole-ota: $*" > /dev/kmsg 2>/dev/null || echo "uconsole-ota: $*"
+}
+
+# udev may not have created the node yet at this point in the initrd.
+i=0
+while [ ! -b "$BOOT_DEV" ] && [ $i -lt 20 ]; do
+    i=$((i + 1))
+    sleep 0.25
+done
+
+if [ ! -b "$BOOT_DEV" ]; then
+    log "no $BOOT_DEV after 5s; normal boot"
+    exit 0
+fi
+
+mkdir -p "$MNT" 2>/dev/null
+
+# Read-only: phase 0 must not be able to modify anything, even by accident.
+if ! mount -o ro -t vfat "$BOOT_DEV" "$MNT" 2>/dev/null; then
+    log "could not mount $BOOT_DEV read-only; normal boot"
+    exit 0
+fi
+
+if [ -f "$MNT/$MARKER" ]; then
+    log "marker found: $(cat "$MNT/$MARKER" 2>/dev/null | head -1)"
+    log "PHASE 0 -- observing only, taking no action, continuing to normal boot"
+else
+    log "no marker; normal boot"
+fi
+
+umount "$MNT" 2>/dev/null
+exit 0
