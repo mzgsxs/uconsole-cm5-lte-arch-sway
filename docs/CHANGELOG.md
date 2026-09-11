@@ -1,5 +1,31 @@
 # Changelog
 
+## `uconsole-modem-power disable` now actually turns the modem off
+
+It never did. It killed the process holding GPIO 24 and reported success, while the SIM7600
+stayed registered and connected. That came out when a battery calibration asked for the
+modem to be off, and it was not.
+
+Two things were wrong, both measured on the device:
+
+- **GPIO 24 is the module's power key, not its supply.** The vendor calls it `POWER_MCU`,
+  and this script held it at 1 as if it were an enable. Driving it to 0 under a running
+  module does nothing. A 3 s press powers the module down: it leaves USB about 22 s later,
+  after detaching from the network. A 1.5 s press brings it back, on USB 8 s later. GPIO 15,
+  the vendor's `RESET_MCU`, is a reset: asserted, the module drops off USB and is back 8 s
+  later.
+- **Releasing a GPIO changes nothing on this kernel anyway.** `pinctrl-rp1` defaults to
+  `persist_gpio_outputs=Y`, which leaves a freed line driving its last level.
+
+Both verbs now press the key and check the result on the USB bus:
+
+- Each press releases the key first, since a key held down since power-on is not a new
+  press, and the key is held up afterwards.
+- `disable` waits for the module to finish booting before it presses. A press 9 s after
+  power-on was ignored.
+- At shutdown `disable` presses and returns, so a poweroff costs ~3.5 s rather than ~25 s.
+- `status` reports the key's level and ModemManager's power state.
+
 ## The pack is 18 Wh usable, the gauge is 35 points out, and the calibrator samples at 1 Hz
 
 **The pack.** 3828 mAh / 14.22 Wh reached the 3.50 V stop, but that stop came under a 2.3 A

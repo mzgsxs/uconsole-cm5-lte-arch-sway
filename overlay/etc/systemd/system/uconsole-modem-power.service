@@ -12,8 +12,14 @@ RemainAfterExit=yes
 # No leading '-': a failure here must be visible. The vendor unit masked a
 # hard failure for weeks by using 'ExecStart=-'.
 ExecStart=/usr/local/bin/uconsole-modem-power enable
+# Presses the module's power key and waits for it to leave USB: ~25 s, because
+# it detaches from the network first. Not at shutdown -- there it presses and
+# returns, so a poweroff costs ~3.5 s rather than 25 and the module finishes
+# alongside the machine. `systemctl restart` (uconsole-modem-wake) needs the
+# full wait, so that the start after it finds the modem actually gone.
 ExecStop=/usr/local/bin/uconsole-modem-power disable
 TimeoutStartSec=120
+TimeoutStopSec=90
 
 [Install]
 WantedBy=multi-user.target
