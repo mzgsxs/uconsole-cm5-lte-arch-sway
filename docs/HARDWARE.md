@@ -115,6 +115,21 @@ the power source at the 02:24 boot was not recorded. Confirming it needs one boo
 one on battery, checked immediately. Do not add `arm_freq`/`arm_boost` to `config.txt`
 speculatively; measure first.
 
+**A cap that comes back after you clear it is powertop** (measured, 2026-09-11). Its
+`abstract_cpu::wiggle()` runs at the start and end of every measurement, once per CPU. It
+reads `scaling_max_freq`, writes the minimum, and writes back what it read. On BCM2712 all
+four cores share one cpufreq policy. The kernel applies a new limit later, from a work item
+(`cpufreq_notifier_max()` → `schedule_work()` → `handle_update()`), while `scaling_max_freq`
+reports the last limit applied. So the next core's wiggle can read the minimum its
+predecessor has just written, and write it back as the maximum. After that, every wiggle
+preserves it.
+
+Repeating powertop's exact sequence left the ceiling at 1.5 GHz after 32 of 500 rounds, the
+first at round 3. With powertop open for four hours, the ceiling sat at 1.5 GHz and returned
+within ten minutes of being raised. Quit powertop, then restore the ceiling:
+`sudo uconsole-unstick` does it. Whether powertop also explains the capped boot above is
+unknown. It would have to have run in that boot before the reading.
+
 A note on how this section got written three times: the first version called it a hardware
 property, measured on a long-lived test machine carrying hand-copied files. The second
 retracted that as "accumulated state, cause unknown". Both were too confident. The cause

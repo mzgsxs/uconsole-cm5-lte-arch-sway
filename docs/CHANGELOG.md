@@ -1,5 +1,19 @@
 # Changelog
 
+## The CPU stuck at 1.5 GHz was powertop, not this image
+
+During a battery calibration the CPU ceiling was found at 1.5 GHz, its minimum. It came back
+within ten minutes of being raised, and nothing appeared in any log. No script in this image
+did it: every writer here logs, and none had acted.
+
+powertop was open. Its `wiggle()` drops the ceiling to the minimum and restores it on every
+refresh. On BCM2712's shared cpufreq policy the restore can read back the minimum a moment
+after it was written, and keep it. Repeating that sequence left the ceiling stuck after 32
+of 500 rounds.
+
+The fix is to quit powertop and run `sudo uconsole-unstick`. Details are in `HARDWARE.md`,
+and a draft report is in `UPSTREAM.md`.
+
 ## `uconsole-modem-power disable` now actually turns the modem off
 
 It never did. It killed the process holding GPIO 24 and reported success, while the SIM7600

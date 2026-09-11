@@ -389,6 +389,27 @@ cat /sys/class/watchdog/watchdog0/state /sys/class/watchdog/watchdog0/timeout
 If a spurious reboot ever bites you, comment out `RuntimeWatchdogSec` in
 `/etc/systemd/system.conf.d/uconsole-watchdog.conf` and run `systemctl daemon-reexec`.
 
+## The CPU is stuck at 1.5 GHz
+
+Check whether powertop is running:
+
+```bash
+pgrep -a powertop; cat /sys/devices/system/cpu/cpufreq/policy0/scaling_max_freq
+```
+
+powertop drops the CPU ceiling to its minimum and restores it on every refresh. On this board
+the restore can read back the minimum it has just written, and keep it (see
+[`HARDWARE.md`](HARDWARE.md)). From then on it holds the CPU at 1.5 GHz for as long as
+powertop stays open, and puts it back within minutes if you raise it. Quit powertop first,
+then:
+
+```bash
+sudo uconsole-unstick
+```
+
+If powertop is not running, the other thing that clamps the clock is the low-power blank. It
+sets 1.5 GHz while the screen is off and restores the previous ceiling on wake.
+
 ## Anything involving suspend hangs the machine
 
 `systemctl suspend` is masked in this image and `/sys/power/state` should not be written

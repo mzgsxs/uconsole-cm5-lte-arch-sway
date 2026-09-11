@@ -171,3 +171,25 @@ current drops 0.70 W. `power on`, `enable` and `mode 720x1280@59.901Hz` each ret
 `{"success": true}` and leave `"power": false`. Only a VT switch away and back restores it,
 by forcing a full modeset. Before filing, capture sway's own log of a failed re-enable.
 wlroots reports why it refuses a commit, and nobody has looked at that yet.
+
+## 10. powertop: `wiggle()` can leave the CPU ceiling at its minimum on a shared policy
+
+**Where:** powertop 2.16, `src/cpu/abstract_cpu.cpp`, `abstract_cpu::wiggle()`. **Measured.**
+
+`wiggle()` runs at the start and end of every measurement, once per CPU. It reads
+`scaling_max_freq`, writes the value of `scaling_min_freq` to it, then writes back what it
+read. Several CPUs can share one cpufreq policy; on BCM2712 all four do. The second CPU's
+wiggle then reads the same file straight after the first one's two writes.
+
+The kernel applies limit changes from a work item
+(`cpufreq_notifier_max()` → `schedule_work(&policy->update)`). Meanwhile `scaling_max_freq`
+shows `policy->max`, the last limit applied. So the read can return the minimum. The wiggle
+then restores that as the maximum, and every later wiggle keeps it.
+
+Reproduced with powertop's exact sequence on four CPUs sharing a policy: 81 of 2000 reads
+saw the minimum, and the ceiling was left there after 32 of 500 rounds, the first at round
+3. With powertop running, the ceiling sat at the minimum for hours and came back within ten
+minutes of being raised.
+
+**Suggested:** wiggle each policy once rather than each CPU. Read every ceiling before any
+wiggle and restore those values, instead of re-reading between writes.
