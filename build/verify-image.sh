@@ -623,6 +623,11 @@ check "s2idle test samples power while awake" \
       "grep -qF 'sample_mean power_now' $MNT/usr/local/bin/uconsole-s2idle-test"
 check "s2idle test takes a voltage edge after the sleep" \
       "grep -qF 'v_edge v2' $MNT/usr/local/bin/uconsole-s2idle-test"
+# ...and only after a long, logged settle. With two minutes, the battery's
+# recovery from the sleep's light load left the closing edge high by an amount
+# comparable to the whole drop being measured.
+check "s2idle test logs the recovery before the closing edge" \
+      "grep -qF 'v_track 600; v_edge v2 0' $MNT/usr/local/bin/uconsole-s2idle-test"
 # The config ships PANEL_OFF_ON_BLANK=0; a conf that predates the option must
 # not get the risky behaviour by default either.
 check "screen toggle defaults the panel power-down off" \

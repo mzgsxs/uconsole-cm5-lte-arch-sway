@@ -303,7 +303,20 @@ GPIO 2, and the key's press and release each reached `axp20x-pek` once after res
 boot, and nothing from `uconsole-screen-toggle` was logged afterwards, so the waking press
 did not blank the screen again.
 
-Not yet shown: a drain below the blank's. That needs a run on battery.
+**Drain, first run on battery** (2026-09-11). The setup was one low-power descent, backlight
+off, Wi-Fi unloaded and the modem radio low, then 20 minutes blanked but awake, then 20
+minutes asleep:
+
+- **Blanked, awake: 3.28 W**, from `power_now` sampled every second (measured). The fuel
+  gauge's 4 % over the same span agrees within its resolution.
+- **Asleep: less than the blank, by an amount this run cannot pin down.** The fuel gauge lost
+  3 % across the sleep. With the awake minutes taken out that is about 1.9 W, but one step
+  either way is ±0.8 W. The battery voltage, calibrated against the awake phase, says
+  0.63 W. That method reads low, because the battery recovers from the sleep's light load
+  for longer than the 2 minutes it was given before the closing reading.
+
+That puts the sleep somewhere between ~0.6 and ~2.7 W. Narrowing it needs a longer sleep and
+a longer settle before the closing reading.
 
 The last two rows change what the old "a real s2idle never returns" result means. With no
 wake source and a 15 s watchdog, a perfect suspend and a hang look identical, so that result

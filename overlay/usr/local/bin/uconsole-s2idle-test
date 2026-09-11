@@ -464,6 +464,22 @@ v_edge() {   # label settle_seconds -- settle, then record the voltage and when
     rec "${1}_t=$t"
     rec "${1}_pct=$(cat "$B/capacity" 2>/dev/null)"
 }
+# After the sleep the battery goes on recovering from its light load for many
+# minutes, which biases the closing edge upward -- and so the sleep's figure
+# downward. Measured: 2 minutes of settling left a 6 mV drop across the sleep
+# against 19 mV across the awake span, a gap the recovery alone could account
+# for. So settle longer, and log the curve, so the remaining bias can be seen
+# instead of assumed.
+v_track() {   # seconds -- voltage and power every 10 s into s2idle-vtrack
+    local f=/var/lib/uconsole/s2idle-vtrack end=$(( $(date +%s) + $1 ))
+    : > "$f"
+    while (( $(date +%s) < end )); do
+        printf '%s\t%s\t%s\n' "$(date +%s)" "$(cat "$B/voltage_now" 2>/dev/null)" \
+            "$(cat "$B/power_now" 2>/dev/null)" >> "$f"
+        sleep 10
+    done
+    sync
+}
 
 ### cleanup -------------------------------------------------------------------
 # Whatever happens, leave the machine as it was found: no pm_test level armed,
@@ -733,7 +749,8 @@ do_run() {
     rec "survived_wake=yes"
     # The sleep's closing voltage edge, under the same blanked, awake load as the
     # other two -- so nothing is brought back up until it has been taken.
-    (( on_ac )) || { say "settling 2 min after the wake, then sampling"; v_edge v2 120; }
+    # Ten minutes, logged: see v_track for why two was not enough.
+    (( on_ac )) || { say "settling 10 min after the wake, logging the recovery"; v_track 600; v_edge v2 0; }
     wd_restore
     keep_log "run"
 
