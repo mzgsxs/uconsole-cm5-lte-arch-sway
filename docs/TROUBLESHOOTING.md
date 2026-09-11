@@ -401,7 +401,10 @@ sudo umount /boot && sudo fsck.vfat -a /dev/mmcblk0p1 && sudo mount /boot
 
 `/sys/power/mem_sleep` reading `s2idle [deep]` does **not** mean suspend works — `deep` is
 a firmware stub and `s2idle` wedges the Wi-Fi chip beyond what a driver reload can fix.
-Full account in [`HARDWARE.md`](HARDWARE.md) §3.9.
+Even with Wi-Fi unloaded, a stock kernel has nothing that can wake this board from s2idle,
+and the hardware watchdog resets it about 15 s in, so an s2idle that worked would still look
+like a hang. Full account in [`HARDWARE.md`](HARDWARE.md) §3.9. The experiment's own tool
+is `uconsole-s2idle-test`; read its header before running it.
 
 ## No Wi-Fi after a blank, or after the battery died while blanked
 

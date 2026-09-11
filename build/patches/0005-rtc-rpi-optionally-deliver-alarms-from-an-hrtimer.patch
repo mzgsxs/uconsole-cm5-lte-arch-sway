@@ -1,0 +1,147 @@
+Subject: [PATCH] rtc: rpi: optionally deliver alarms from an hrtimer
+
+The firmware RTC alarm raises no interrupt. It exists to power the board up
+from halt, so the driver sets RTC_FEATURE_ALARM_WAKEUP_ONLY and Linux never
+hears about an alarm while it is running. `rtcwake -m mem` therefore arms
+nothing that can end suspend-to-idle: the system sleeps until something else
+wakes it.
+
+emulate_alarm_irq (default off) shadows each armed alarm with a CLOCK_BOOTTIME
+hrtimer, set from the firmware's own alarm and clock so the two cannot
+disagree. On expiry it reports the alarm through rtc_update_irq() and signals a
+hard wakeup on the RTC device.
+
+That ends s2idle only where timers keep running through it. They do on BCM2712:
+there is no cpuidle driver, so cpuidle_idle_call() takes the default_idle_call()
+path and the s2idle tick freeze, reached only through a cpuidle driver, never
+happens.
+
+  echo Y > /sys/module/rtc_rpi/parameters/emulate_alarm_irq
+
+UNTESTED ON HARDWARE at the time of writing.
+---
+diff --git a/drivers/rtc/rtc-rpi.c b/drivers/rtc/rtc-rpi.c
+index 0060123..6755d5c 100644
+--- a/drivers/rtc/rtc-rpi.c
++++ b/drivers/rtc/rtc-rpi.c
+@@ -10,8 +10,10 @@
+  * Copyright (c) 2023, Raspberry Pi Ltd.
+  */
+ 
++#include <linux/hrtimer.h>
+ #include <linux/module.h>
+ #include <linux/platform_device.h>
++#include <linux/pm_wakeup.h>
+ #include <linux/rtc.h>
+ #include <linux/of.h>
+ #include <soc/bcm2835/raspberrypi-firmware.h>
+@@ -20,8 +22,28 @@ struct rpi_rtc_data {
+ 	struct rtc_device *rtc;
+ 	struct rpi_firmware *fw;
+ 	u32 bbat_vchg_microvolts;
++	struct device *dev;
++	struct hrtimer alarm_timer;
+ };
+ 
++/*
++ * The firmware alarm raises no interrupt: it exists to power the board up from
++ * halt, which is why this driver sets RTC_FEATURE_ALARM_WAKEUP_ONLY. Linux
++ * therefore never hears about an alarm -- not while running, and not in
++ * suspend-to-idle, where a timed wake is exactly what `rtcwake -m mem` asks
++ * for.
++ *
++ * emulate_alarm_irq shadows each armed alarm with an hrtimer that delivers it
++ * as an alarm event and a hard wakeup. That can only end s2idle where timers
++ * keep running through it, which they do on BCM2712: with no cpuidle driver,
++ * cpuidle_idle_call() takes the default_idle_call() path, and the s2idle tick
++ * freeze (reached only through a cpuidle driver) never happens.
++ */
++static bool emulate_alarm_irq;
++module_param(emulate_alarm_irq, bool, 0644);
++MODULE_PARM_DESC(emulate_alarm_irq,
++		 "Deliver alarms from an hrtimer, so an alarm can end suspend-to-idle");
++
+ #define RPI_FIRMWARE_GET_RTC_REG 0x00030087
+ #define RPI_FIRMWARE_SET_RTC_REG 0x00038087
+ 
+@@ -69,7 +91,7 @@ static int rpi_rtc_alarm_irq_is_enabled(struct device *dev, unsigned char *enabl
+ 	return err;
+ }
+ 
+-static int rpi_rtc_alarm_irq_enable(struct device *dev, unsigned int enabled)
++static int rpi_rtc_fw_alarm_irq_enable(struct device *dev, unsigned int enabled)
+ {
+ 	struct rpi_rtc_data *vrtc = dev_get_drvdata(dev);
+ 	u32 data[2] = {RTC_ALARM_ENABLE, enabled};
+@@ -78,6 +100,58 @@ static int rpi_rtc_alarm_irq_enable(struct device *dev, unsigned int enabled)
+ 				     &data, sizeof(data));
+ }
+ 
++static enum hrtimer_restart rpi_rtc_alarm_expired(struct hrtimer *timer)
++{
++	struct rpi_rtc_data *vrtc = container_of(timer, struct rpi_rtc_data,
++						 alarm_timer);
++
++	pm_wakeup_hard_event(vrtc->dev);
++	rtc_update_irq(vrtc->rtc, 1, RTC_AF | RTC_IRQF);
++	return HRTIMER_NORESTART;
++}
++
++/*
++ * Re-arm the shadow timer from what the firmware now holds: its alarm and its
++ * clock, so the delay cannot disagree with the alarm it stands in for.
++ */
++static void rpi_rtc_emulate_alarm(struct rpi_rtc_data *vrtc, bool enabled)
++{
++	u32 alarm[2] = {RTC_ALARM};
++	struct rtc_time tm;
++	time64_t delta;
++
++	hrtimer_cancel(&vrtc->alarm_timer);
++	if (!emulate_alarm_irq || !enabled)
++		return;
++
++	if (rpi_rtc_read_time(vrtc->dev, &tm) ||
++	    rpi_firmware_property(vrtc->fw, RPI_FIRMWARE_GET_RTC_REG,
++				  &alarm, sizeof(alarm)))
++		return;
++
++	delta = (time64_t)alarm[1] - rtc_tm_to_time64(&tm);
++	hrtimer_start(&vrtc->alarm_timer, ktime_set(max_t(time64_t, delta, 0), 0),
++		      HRTIMER_MODE_REL);
++}
++
++static void rpi_rtc_cancel_alarm(void *data)
++{
++	struct rpi_rtc_data *vrtc = data;
++
++	hrtimer_cancel(&vrtc->alarm_timer);
++}
++
++static int rpi_rtc_alarm_irq_enable(struct device *dev, unsigned int enabled)
++{
++	struct rpi_rtc_data *vrtc = dev_get_drvdata(dev);
++	int err;
++
++	err = rpi_rtc_fw_alarm_irq_enable(dev, enabled);
++	if (!err)
++		rpi_rtc_emulate_alarm(vrtc, enabled);
++	return err;
++}
++
+ static int rpi_rtc_alarm_clear_pending(struct device *dev)
+ {
+ 	struct rpi_rtc_data *vrtc = dev_get_drvdata(dev);
+@@ -226,6 +300,12 @@ static int rpi_rtc_probe(struct platform_device *pdev)
+ 		return -ENOMEM;
+ 
+ 	vrtc->fw = fw;
++	vrtc->dev = dev;
++	hrtimer_setup(&vrtc->alarm_timer, rpi_rtc_alarm_expired, CLOCK_BOOTTIME,
++		      HRTIMER_MODE_REL);
++	ret = devm_add_action_or_reset(dev, rpi_rtc_cancel_alarm, vrtc);
++	if (ret)
++		return ret;
+ 
+ 	device_init_wakeup(&pdev->dev, 1);
+ 

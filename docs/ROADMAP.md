@@ -75,8 +75,10 @@ handler is the one thing that still works when sway has hung.
 
 ## 4. The cold-boot panel failure
 
-Branch `s2idle-brcmstb-gpio-fix` carries a cwu50 DCS-failure patch that may address the
-silent cold-boot black screen documented in `HARDWARE.md`. It is unverified and unbuilt.
+Branch `s2idle-brcmstb-gpio-fix` carries a cwu50 patch (0002) that clears `prepared` when
+the unprepare DCS writes fail. That is a real latent bug, but probably not this one: the
+cold-boot failure is `[drm] Receive failed`, a read-back during *prepare*, not unprepare's
+error path. Do not count 0002 as a fix for it without many cold-boot cycles.
 
 This is the highest user-facing impact item here — a machine that looks bricked is worse
 than one that drains overnight — but it needs a kernel rebuild and many cold-boot cycles to

@@ -578,6 +578,30 @@ check "powerkey tuner does not promise a force-off" \
       "[[ \$(tr '\n' ' ' < $MNT/usr/local/bin/uconsole-powerkey-tune | grep -c 'genuine last resort') -eq 0 ]]"
 check "powerkey tuner names the CM5 limitation" \
       "grep -q 'KERNEL IS STILL RESPONDING' $MNT/usr/local/bin/uconsole-powerkey-tune"
+# On the stock kernel nothing can end an s2idle here: rtc-rpi has no alarm
+# interrupt, pinctrl-rp1 cannot arm a GPIO for wake (the power key is RP1 GPIO
+# 2), and pcie-brcmstb resets RP1 in suspend_noirq. Patches 0003-0005 add one
+# switch each, all defaulting to stock -- so assert the switch exists in the
+# kernel, not that it is on. Built-in module parameters are named
+# "<module>.<param>" in the image.
+for p in pinctrl_rp1.gpio_wake pcie_brcmstb.keep_link_in_suspend rtc_rpi.emulate_alarm_irq; do
+    check "kernel carries $p" "[[ \$(strings /tmp/vmlinux-wd.raw 2>/dev/null | grep -cF '$p') -gt 0 ]]"
+done
+# bcm2835_wdt has no PM ops, so the 15 s watchdog resets the board ~15 s into
+# ANY suspend. A sleep test must raise it for the sleep, and put everything it
+# changed back however it exits.
+check "s2idle test raises the watchdog for a sleep" \
+      "grep -qF 'wd_raise \$(( secs + 180 ))' $MNT/usr/local/bin/uconsole-s2idle-test"
+check "s2idle test restores what it changes" \
+      "[[ \$(grep -c 'trap cleanup EXIT' $MNT/usr/local/bin/uconsole-s2idle-test) -ge 2 ]]"
+# rtc-rpi has no interrupt line at all, so a wake check that looks for one in
+# /proc/interrupts reports "did not fire" by construction. The first one did.
+check "wake-check does not look for an RTC interrupt" \
+      "[[ \$(grep -v '^[[:space:]]*#' $MNT/usr/local/bin/uconsole-s2idle-test | grep -c 'rtc /proc/interrupts') -eq 0 ]]"
+# The config ships PANEL_OFF_ON_BLANK=0; a conf that predates the option must
+# not get the risky behaviour by default either.
+check "screen toggle defaults the panel power-down off" \
+      "[[ \$(grep -c 'PANEL_OFF_ON_BLANK:-1' $MNT/usr/local/bin/uconsole-screen-toggle) -eq 0 ]]"
 
 echo "-- low-power blank (Stage 1) --"
 check "lowpower policy ships"          "[[ -f $MNT/etc/uconsole/lowpower.conf ]]"

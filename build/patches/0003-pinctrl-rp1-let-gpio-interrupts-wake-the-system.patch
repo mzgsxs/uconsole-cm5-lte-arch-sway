@@ -1,0 +1,66 @@
+Subject: [PATCH] pinctrl: rp1: let GPIO interrupts be armed for system wakeup
+
+rp1_gpio_irq_chip has no irq_set_wake and does not set IRQCHIP_SKIP_SET_WAKE,
+so enable_irq_wake() on any RP1 GPIO interrupt fails with -ENXIO. Nothing that
+signals through an RP1 GPIO can wake the system.
+
+On the ClockworkPi uConsole with a CM5 that includes the power key. The AXP223
+PMIC's interrupt is RP1 GPIO 2 (clockworkpi-uconsole-cm5 overlay:
+`interrupt-parent = <&rp1_gpio>; interrupts = <2 8>`). regmap-irq propagates
+axp20x-pek's enable_irq_wake() to that parent, the call fails silently, and the
+resume path's disable_irq_wake() then trips, because the failed enable left
+wake_depth at 0:
+
+  Unbalanced IRQ 185 wake disable  (regmap_irq_sync_unlock <- axp20x_pek_resume)
+
+There is nothing to program in hardware. Each bank's parent is a chained RP1
+MSI-X vector, and suspend_device_irqs() never disables a chained interrupt, so
+an armed GPIO interrupt still reaches the CPU in suspend -- provided RP1 and its
+PCIe link stay up, which is the host driver's business (0004 in this series).
+
+Gated on a new module parameter, default off, so stock behaviour is unchanged
+until it is asked for:
+
+  echo Y > /sys/module/pinctrl_rp1/parameters/gpio_wake
+
+UNTESTED ON HARDWARE at the time of writing.
+---
+diff --git a/drivers/pinctrl/pinctrl-rp1.c b/drivers/pinctrl/pinctrl-rp1.c
+index 22720e8..3d53cf5 100644
+--- a/drivers/pinctrl/pinctrl-rp1.c
++++ b/drivers/pinctrl/pinctrl-rp1.c
+@@ -971,6 +971,26 @@ static int rp1_gpio_irq_set_affinity(struct irq_data *data, const struct cpumask
+ 	return -EINVAL;
+ }
+ 
++static bool gpio_wake;
++module_param(gpio_wake, bool, 0644);
++MODULE_PARM_DESC(gpio_wake, "Allow GPIO interrupts to be armed as system wakeup sources");
++
++static int rp1_gpio_irq_set_wake(struct irq_data *data, unsigned int on)
++{
++	/*
++	 * There is nothing to program. Each bank's parent is a chained RP1
++	 * MSI-X vector, and suspend_device_irqs() never disables a chained
++	 * interrupt, so a GPIO interrupt armed here still reaches the CPU
++	 * during suspend -- as long as RP1 and its PCIe link stay up, which
++	 * is up to the PCIe host driver.
++	 *
++	 * Without this callback enable_irq_wake() fails with -ENXIO, so no
++	 * device behind an RP1 GPIO can wake the system, and its driver's
++	 * resume trips "Unbalanced IRQ n wake disable".
++	 */
++	return gpio_wake ? 0 : -ENXIO;
++}
++
+ static struct irq_chip rp1_gpio_irq_chip = {
+ 	.name = MODULE_NAME,
+ 	.irq_enable = rp1_gpio_irq_enable,
+@@ -980,6 +1000,7 @@ static struct irq_chip rp1_gpio_irq_chip = {
+ 	.irq_mask = rp1_gpio_irq_disable,
+ 	.irq_unmask = rp1_gpio_irq_enable,
+ 	.irq_set_affinity = rp1_gpio_irq_set_affinity,
++	.irq_set_wake = rp1_gpio_irq_set_wake,
+ 	.flags = IRQCHIP_IMMUTABLE,
+ };
+ 

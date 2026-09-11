@@ -1,0 +1,125 @@
+Subject: [PATCH] PCI: brcmstb: optionally leave a trained link alone across suspend
+
+brcm_pcie_suspend_noirq() calls brcm_pcie_turn_off(), which asserts PERST# --
+a fundamental reset of everything behind the link -- puts the SerDes in IDDQ
+and shuts the bridge down. On BCM2712 the link on pcie2 leads to RP1, the
+southbridge that owns the 40-pin GPIOs, USB, DSI/DPI and I2C, and nothing
+restores RP1's internal state after that reset. So:
+
+  - no RP1 interrupt can wake the system: RP1 is held in reset for the whole
+    sleep;
+  - RP1 functions whose drivers have no PM ops can come back unconfigured.
+    Consistent with that, after a pm_test=platform cycle on this board every
+    drm-rp1-dsi commit waits out its 10 s flip_done timeout.
+
+keep_link_in_suspend (default off) leaves a link that is up untouched: the
+noirq callbacks do nothing, and the PCI devices behind the link are marked
+syscore from ->prepare() to ->complete(). Without that the PCI core would still
+stop RP1 signalling: RP1's driver has no PM ops, so pci_pm_default_suspend()
+disables it and clears bus mastering (no more MSIs), and the root port could be
+put in D3hot. RP1's own children -- the xHCI, DSI, I2C platform devices -- are
+separate devices and still get their callbacks.
+
+  echo Y > /sys/module/pcie_brcmstb/parameters/keep_link_in_suspend
+
+UNTESTED ON HARDWARE at the time of writing. The flip_done observation is what
+motivates it, not a result of it.
+---
+diff --git a/drivers/pci/controller/pcie-brcmstb.c b/drivers/pci/controller/pcie-brcmstb.c
+index 6a683b5..421fa2b 100644
+--- a/drivers/pci/controller/pcie-brcmstb.c
++++ b/drivers/pci/controller/pcie-brcmstb.c
+@@ -516,6 +516,7 @@ struct brcm_pcie {
+ 	u32			hw_rev;
+ 	struct subdev_regulators *sr;
+ 	bool			ep_wakeup_capable;
++	bool			link_kept;
+ 	const struct pcie_cfg_data	*cfg;
+ 	bool			bridge_in_reset;
+ 	struct notifier_block	die_notifier;
+@@ -2116,12 +2117,66 @@ static int pci_dev_may_wakeup(struct pci_dev *dev, void *data)
+ 	return (int) *ret;
+ }
+ 
++static bool keep_link_in_suspend;
++module_param(keep_link_in_suspend, bool, 0644);
++MODULE_PARM_DESC(keep_link_in_suspend,
++		 "Leave a trained link, and everything behind it, untouched across system suspend");
++
++static int brcm_pcie_set_syscore(struct pci_dev *dev, void *data)
++{
++	dev_pm_syscore_device(&dev->dev, *(bool *)data);
++	return 0;
++}
++
++/*
++ * On BCM2712 the link on pcie2 leads to RP1, the southbridge that owns the
++ * GPIOs, USB, DSI and I2C. brcm_pcie_turn_off() asserts PERST#, which resets
++ * RP1 outright, and nothing restores its state afterwards: no RP1 interrupt
++ * (a power key behind an RP1 GPIO, say) can wake the system, and RP1
++ * functions whose drivers have no PM ops come back unconfigured.
++ *
++ * keep_link_in_suspend leaves such a link alone. The PCI devices behind it
++ * are marked syscore for the duration, because the PCI core would otherwise
++ * disable a driver that has no PM ops -- RP1's has none, and
++ * pci_pm_default_suspend() clears its bus mastering, which stops its MSIs --
++ * and could put the root port in D3hot. RP1's own children (xHCI, DSI, I2C
++ * and the rest) are separate devices and still get their callbacks.
++ */
++static int brcm_pcie_prepare(struct device *dev)
++{
++	struct brcm_pcie *pcie = dev_get_drvdata(dev);
++	struct pci_host_bridge *bridge = pci_host_bridge_from_priv(pcie);
++	bool on = true;
++
++	pcie->link_kept = keep_link_in_suspend && brcm_pcie_link_up(pcie);
++	if (pcie->link_kept) {
++		pci_walk_bus(bridge->bus, brcm_pcie_set_syscore, &on);
++		dev_info(dev, "keeping the link up across suspend\n");
++	}
++	return 0;
++}
++
++static void brcm_pcie_complete(struct device *dev)
++{
++	struct brcm_pcie *pcie = dev_get_drvdata(dev);
++	struct pci_host_bridge *bridge = pci_host_bridge_from_priv(pcie);
++	bool off = false;
++
++	if (pcie->link_kept) {
++		pci_walk_bus(bridge->bus, brcm_pcie_set_syscore, &off);
++		pcie->link_kept = false;
++	}
++}
++
+ static int brcm_pcie_suspend_noirq(struct device *dev)
+ {
+ 	struct brcm_pcie *pcie = dev_get_drvdata(dev);
+ 	struct pci_host_bridge *bridge = pci_host_bridge_from_priv(pcie);
+ 	int ret, rret;
+ 
++	if (pcie->link_kept)
++		return 0;
++
+ 	ret = brcm_pcie_turn_off(pcie);
+ 	if (ret)
+ 		return ret;
+@@ -2174,6 +2229,9 @@ static int brcm_pcie_resume_noirq(struct device *dev)
+ 	u32 tmp;
+ 	int ret, rret;
+ 
++	if (pcie->link_kept)
++		return 0;
++
+ 	base = pcie->base;
+ 	ret = clk_prepare_enable(pcie->clk);
+ 	if (ret)
+@@ -2781,6 +2839,8 @@ static int brcm_pcie_probe(struct platform_device *pdev)
+ MODULE_DEVICE_TABLE(of, brcm_pcie_match);
+ 
+ static const struct dev_pm_ops brcm_pcie_pm_ops = {
++	.prepare = brcm_pcie_prepare,
++	.complete = brcm_pcie_complete,
+ 	.suspend_noirq = brcm_pcie_suspend_noirq,
+ 	.resume_noirq = brcm_pcie_resume_noirq,
+ };

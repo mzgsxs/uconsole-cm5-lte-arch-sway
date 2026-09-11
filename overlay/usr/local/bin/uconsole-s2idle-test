@@ -4,6 +4,7 @@
 #   check    report readiness and change nothing
 #   bisect   pm_test ladder: exercise the failing phase WITHOUT calling firmware
 #   run      measure blanked-awake vs actually-suspended drain, and compare
+#   report   print the last run's results again, e.g. after a reboot
 #   pstore   read the kernel log that survived the last hang (needs ramoops)
 #   wake-check  can anything actually wake this machine? never suspends
 #
@@ -17,13 +18,51 @@
 # sleep targets are masked in this image for that reason; this script writes
 # /sys/power/state directly, which is a deliberate experiment, not an accident.
 #
-# The hypothesis being tested is specific and has never been tried: every
-# previous attempt used `rfkill block`, which does NOT unload brcmfmac, so the
-# driver's broken ->suspend() callback still ran and still wedged the SDIO
-# backplane with -110 timeouts. Unloading the module removes that callback
-# entirely -- the standard fix for this bug on every other platform it appears
-# on. If you only use the LTE modem for connectivity, losing Wi-Fi across a
-# suspend costs you nothing, which is what makes this worth testing at all.
+# brcmfmac has to be out of the kernel first. Its ->suspend() wedges the SDIO
+# backplane with -110 timeouts, and `rfkill block` leaves that callback in
+# place; unloading the module removes it. If you only use the LTE modem for
+# connectivity, losing Wi-Fi across a suspend costs you nothing.
+#
+# WHY EVERY EARLIER `run` ENDED IN A WATCHDOG RESET  (read from the source)
+#
+# On the stock kernel nothing can end an s2idle on this board, so a machine that
+# suspended perfectly was indistinguishable from one that hung:
+#
+#   - rtc-rpi has no interrupt. It declares RTC_FEATURE_ALARM_WAKEUP_ONLY: its
+#     alarm powers the board up from halt, and `rtcwake -m mem` arms nothing
+#     Linux will ever hear.
+#   - The power key is on the AXP223, whose interrupt is RP1 GPIO 2. pinctrl-rp1
+#     has no irq_set_wake, so enable_irq_wake() fails -- that is the
+#     "Unbalanced IRQ n wake disable" seen on resume. And pcie-brcmstb asserts
+#     PERST# on RP1's link in suspend_noirq, resetting RP1 outright.
+#   - bcm2835_wdt has no PM ops. Under RuntimeWatchdogSec=15 the hardware
+#     watchdog resets the board ~15 s after systemd's last ping, however well
+#     the suspend went.
+#
+# --with-fixes turns on the kernel changes in build/patches 0003-0005 for the
+# duration of the command. Each defaults to stock behaviour:
+#
+#   pinctrl_rp1.gpio_wake=Y              an RP1 GPIO (the power key) may wake it
+#   pcie_brcmstb.keep_link_in_suspend=Y  RP1's link, and RP1, are left alone
+#   rtc_rpi.emulate_alarm_irq=Y          alarms are delivered from an hrtimer,
+#                                        so rtcwake can end the sleep
+#
+# `run` and `bisect` also raise systemd's runtime watchdog for their duration.
+# The kernel's watchdogd then feeds the hardware while userspace is frozen:
+# timers keep running through s2idle here, because with no cpuidle driver the
+# s2idle loop is ordinary idle and the tick is never frozen. A hang that stops
+# the kernel's timers is still reset within ~16 s; anything else is reset at the
+# raised deadline, so a sleep that nothing wakes ends by itself.
+#
+# RUNNING IT WITHOUT A SCREEN
+#
+# Anything that suspends takes Wi-Fi with it. Do not run it inside an SSH
+# session: start it as a transient unit, which outlives the session, and read the
+# results once the network is back.
+#
+#   sudo systemd-run --unit=uconsole-s2idle --collect \
+#        /usr/local/bin/uconsole-s2idle-test bisect --cycle-wifi --with-fixes
+#   journalctl -b -u uconsole-s2idle         # afterwards; -b -1 after a reset
 #
 # WHAT TO EXPECT EVEN IF IT WORKS
 #
@@ -47,12 +86,24 @@ BREADCRUMB=/var/lib/uconsole/s2idle-attempt
 # stdout nobody could read any more. Anything learned before the hang must be on
 # disk before the hang.
 RESULTS=/var/lib/uconsole/s2idle-results
+# The kernel log of each attempt, cut at a marker and synced the same way.
+LOGDIR=/var/lib/uconsole/s2idle-dmesg
 MINUTES=20
 ALLOW_WIFI=0
+ALLOW_AC=0
+CYCLE_WIFI=0
+WITH_FIXES=0
 MODEM_LOW=0
 CONFIRM=0
 PRINT_TIMES=0
 WAKE_BUTTON=0
+PANEL_RESTORE=1
+
+# The three switches patches 0003-0005 add; all default to stock behaviour.
+KP_WAKE=/sys/module/pinctrl_rp1/parameters/gpio_wake
+KP_LINK=/sys/module/pcie_brcmstb/parameters/keep_link_in_suspend
+KP_RTC=/sys/module/rtc_rpi/parameters/emulate_alarm_irq
+PM_DELAY=/sys/module/suspend/parameters/pm_test_delay
 
 die()  { echo "uconsole-s2idle-test: $*" >&2; exit 1; }
 say()  { printf '  %s\n' "$*"; }
@@ -60,10 +111,6 @@ ok()   { printf '  ok    %s\n' "$*"; }
 no()   { printf '  NO    %s\n' "$*"; }
 
 need_root() { [[ $EUID -eq 0 ]] || die "must run as root"; }
-
-### readiness ---------------------------------------------------------------
-wifi_loaded() { lsmod 2>/dev/null | grep -qc '^brcmfmac' >/dev/null 2>&1 && \
-                [[ $(lsmod | grep -c '^brcmfmac') -gt 0 ]]; }
 
 gauge_mode() {
     # Prefer a coulomb counter: over a 20-minute window a voltage delta is mostly
@@ -81,6 +128,82 @@ read_gauge() {   # prints a single integer in the unit implied by gauge_mode
     esac
 }
 
+### kernel switches -----------------------------------------------------------
+declare -A KP_SAVED=()
+
+fixes_state() {
+    local p out=""
+    for p in "$KP_WAKE" "$KP_LINK" "$KP_RTC"; do
+        out+="$(basename "$p")=$(cat "$p" 2>/dev/null || echo absent) "
+    done
+    echo "${out% }"
+}
+
+fixes_apply() {   # Y|N -- set all three; refuse Y on a kernel without them
+    local p
+    for p in "$KP_WAKE" "$KP_LINK" "$KP_RTC"; do
+        if [[ -w $p ]]; then
+            [[ -n ${KP_SAVED[$p]:-} ]] || KP_SAVED[$p]=$(cat "$p")
+            echo "$1" > "$p" || die "could not write $p"
+        elif [[ $1 == Y ]]; then
+            die "$(basename "$p") is missing -- this kernel does not carry patches 0003-0005"
+        fi
+    done
+}
+
+fixes_restore() {
+    local p
+    for p in "${!KP_SAVED[@]}"; do echo "${KP_SAVED[$p]}" > "$p" 2>/dev/null; done
+    KP_SAVED=()
+}
+
+### watchdog ------------------------------------------------------------------
+# systemd's runtime watchdog is a writable property of the manager, so it can be
+# raised for exactly as long as a sleep lasts and put back afterwards. The header
+# explains why a sleep cannot happen at all without this.
+WD_SAVED=""
+wd_get() {
+    busctl get-property org.freedesktop.systemd1 /org/freedesktop/systemd1 \
+        org.freedesktop.systemd1.Manager RuntimeWatchdogUSec 2>/dev/null | awk '{print $2}'
+}
+wd_set() {
+    busctl set-property org.freedesktop.systemd1 /org/freedesktop/systemd1 \
+        org.freedesktop.systemd1.Manager RuntimeWatchdogUSec t "$1" 2>/dev/null
+}
+wd_raise() {   # seconds
+    [[ -n $WD_SAVED ]] || WD_SAVED=$(wd_get)
+    [[ -n $WD_SAVED ]] || die "cannot read systemd's RuntimeWatchdogUSec"
+    wd_set $(( $1 * 1000000 )) || die "could not raise the watchdog; refusing to sleep under a 15 s one"
+    rec "watchdog_raised_s=$1 was_us=$WD_SAVED"
+}
+wd_restore() {
+    [[ -n $WD_SAVED ]] || return 0
+    wd_set "$WD_SAVED" && rec "watchdog_restored_us=$WD_SAVED"
+    WD_SAVED=""
+}
+
+### kernel log -----------------------------------------------------------------
+# console=tty1 puts printk on the VT sway owns, so nobody sees it live. Mark the
+# log before each attempt and keep everything after the mark.
+mark() { echo "uconsole-s2idle-test: begin $1" > /dev/kmsg 2>/dev/null; }
+keep_log() {   # label -- save the log since `mark label`, print the lines that matter
+    local f="$LOGDIR/$1.txt"
+    mkdir -p "$LOGDIR"
+    dmesg 2>/dev/null | awk -v m="uconsole-s2idle-test: begin $1" 'index($0, m) {p=1} p' > "$f"
+    sync
+    grep -E 'failed to suspend|returns -[0-9]|Unbalanced IRQ|link up|keeping the link|flip_done|commit wait|Triggering wakeup|suspend entry|suspend exit|suspend-to-idle' "$f" \
+        | sed 's/^/        /' | tail -25 || true
+    say "wakeup irq: $(cat /sys/power/pm_wakeup_irq 2>/dev/null || echo none)   full log: $f"
+}
+
+PM_DEBUG_SAVED=""
+pm_debug_on() {   # the PM core names the wakeup IRQ and each suspend-to-idle step
+    [[ -w /sys/power/pm_debug_messages ]] || return 0
+    PM_DEBUG_SAVED=$(cat /sys/power/pm_debug_messages)
+    echo 1 > /sys/power/pm_debug_messages
+}
+
+### readiness ---------------------------------------------------------------
 do_check() {
     echo "== power source"
     if [[ $(cat "$AC" 2>/dev/null || echo 0) == 1 ]]; then
@@ -107,7 +230,7 @@ do_check() {
     echo "== the thing being tested"
     if [[ $(lsmod 2>/dev/null | grep -c '^brcmfmac') -gt 0 ]]; then
         no "brcmfmac is LOADED -- its broken ->suspend() will run and is expected to hang"
-        say "unload with: sudo uconsole-s2idle-test unload-wifi"
+        say "unload with: sudo uconsole-s2idle-test unload-wifi  (or pass --cycle-wifi)"
     else
         ok "brcmfmac not loaded -- the suspect callback cannot run"
     fi
@@ -118,9 +241,29 @@ do_check() {
         say "next most likely culprit if a wifi-free suspend still hangs."
     fi
 
-    echo "== rtc"
-    [[ -e /dev/rtc0 ]] && ok "/dev/rtc0 present (rtcwake can schedule the wake)" \
-                       || no "no /dev/rtc0 -- there would be no timed wake"
+    echo "== kernel switches (patches 0003-0005; each defaults to stock)"
+    local p
+    for p in "$KP_WAKE" "$KP_LINK" "$KP_RTC"; do
+        printf '   %-24s %s\n' "$(basename "$p")" "$(cat "$p" 2>/dev/null || echo 'absent -- kernel lacks the patch')"
+    done
+
+    echo "== what could end a sleep, as the switches stand"
+    if [[ $(cat "$KP_RTC" 2>/dev/null) == Y ]]; then
+        ok "an RTC alarm (rtcwake), delivered by emulate_alarm_irq"
+    else
+        no "an RTC alarm: rtc-rpi raises no interrupt unless emulate_alarm_irq is on"
+    fi
+    if [[ $(cat "$KP_WAKE" 2>/dev/null) == Y && $(cat "$KP_LINK" 2>/dev/null) == Y ]]; then
+        ok "the power key, through RP1 GPIO 2"
+    else
+        no "the power key: needs gpio_wake and keep_link_in_suspend"
+    fi
+    say "(run --with-fixes turns all three on for its own duration)"
+
+    echo "== watchdog"
+    say "hardware: $(cat /sys/class/watchdog/watchdog0/state 2>/dev/null || echo '?'), timeout $(cat /sys/class/watchdog/watchdog0/timeout 2>/dev/null || echo '?') s"
+    say "systemd RuntimeWatchdogUSec: $(wd_get || echo '?')"
+    say "run and bisect raise it while they work; a sleep under 15 s of it ends in a reset"
 
     echo "== previous attempts"
     if [[ -f $BREADCRUMB ]]; then
@@ -185,6 +328,53 @@ do_restore_wifi() {
     fi
 }
 
+# --cycle-wifi: take brcmfmac out for the attempt and put it back at exit, so a
+# test started over SSH brings its own network back.
+WIFI_CYCLED=0
+wifi_out() {
+    (( CYCLE_WIFI )) || return 0
+    [[ $(lsmod | grep -c '^brcmfmac') -gt 0 ]] || return 0
+    do_unload_wifi >/dev/null
+    WIFI_CYCLED=1
+    rec "wifi=unloaded"
+}
+wifi_back() {
+    (( WIFI_CYCLED )) || return 0
+    WIFI_CYCLED=0
+    do_restore_wifi
+    rec "wifi=restored $(ip -br link show 2>/dev/null | awk '/^wl/{print $1"/"$2}')"
+}
+
+### modem ---------------------------------------------------------------------
+# ModemManager's low -> on leaves the modem `disabled`, and a bearer then times
+# out; uconsole-modem-wake does the whole sequence. Started the way
+# uconsole-lowpower starts it, as a transient unit, so nothing here waits on it.
+modem_back() {
+    (( MODEM_LOW )) || return 0
+    local args=() wm
+    wm=$(cat /var/lib/uconsole/wan-mode 2>/dev/null)
+    [[ -n $wm ]] && args+=(--wan-mode "$wm")
+    systemctl stop uconsole-modem-wake.service >/dev/null 2>&1
+    systemctl reset-failed uconsole-modem-wake.service >/dev/null 2>&1
+    systemd-run --unit=uconsole-modem-wake --collect \
+        /usr/local/bin/uconsole-modem-wake "${args[@]}" >/dev/null 2>&1 \
+        && rec "modem=waking" || rec "modem=wake-failed-to-start"
+}
+
+### cleanup -------------------------------------------------------------------
+# Whatever happens, leave the machine as it was found: no pm_test level armed,
+# the watchdog back at its configured value, the kernel switches back, Wi-Fi
+# back.
+PM_DELAY_SAVED=""
+cleanup() {
+    [[ -w /sys/power/pm_test ]] && echo none > /sys/power/pm_test 2>/dev/null
+    [[ -n $PM_DELAY_SAVED ]] && echo "$PM_DELAY_SAVED" > "$PM_DELAY" 2>/dev/null
+    [[ -n $PM_DEBUG_SAVED ]] && echo "$PM_DEBUG_SAVED" > /sys/power/pm_debug_messages 2>/dev/null
+    wd_restore
+    fixes_restore
+    wifi_back
+}
+
 ### force s2idle ------------------------------------------------------------
 force_s2idle() {
     [[ -w /sys/power/mem_sleep ]] || die "cannot write /sys/power/mem_sleep"
@@ -212,6 +402,7 @@ crumb() {
     { echo "when:      $(date -Is)"; echo "phase:     $1"
       echo "mem_sleep: $(cat /sys/power/mem_sleep 2>/dev/null)"
       echo "brcmfmac:  $(lsmod | grep -c '^brcmfmac') module(s) loaded"
+      echo "switches:  $(fixes_state)"
       echo "gauge:     $(read_gauge) ($(gauge_mode))"; } > "$BREADCRUMB"
     sync
 }
@@ -241,7 +432,21 @@ level that exercises it, and under s2idle it is also the LAST level that is stil
 a test rather than the real thing. This ladder stops there deliberately.
 
 EOT
+    if [[ $(lsmod | grep -c '^brcmfmac') -gt 0 ]] && (( ! CYCLE_WIFI )); then
+        die "brcmfmac is loaded, and its suspend callback wedges the chip until a reboot. Pass --cycle-wifi, or unload-wifi first."
+    fi
     force_s2idle >/dev/null
+    (( WITH_FIXES )) && fixes_apply Y
+    rec "bisect_start $(fixes_state)"
+    say "kernel switches: $(fixes_state)"
+    wifi_out
+    pm_debug_on
+    # Userspace is frozen from `freezer` on, so every second of a level is a
+    # second nobody feeds the watchdog. Raise it for the ladder, and cut the
+    # 5 s the kernel waits at each level to 1 s -- enough to prove it returns.
+    PM_DELAY_SAVED=$(cat "$PM_DELAY" 2>/dev/null)
+    echo 1 > "$PM_DELAY" 2>/dev/null
+    wd_raise 120
     local worst=""
     # STOP AT platform. Going further is not a test -- it is a real suspend.
     #
@@ -263,7 +468,8 @@ EOT
         crumb "bisect:$level"
         rec "bisect_attempt=$level"
         echo "$level" > /sys/power/pm_test 2>/dev/null || { no "cannot select $level"; continue; }
-        if rtcwake -m mem -s 5 >/dev/null 2>&1; then
+        mark "bisect-$level"
+        if echo mem > /sys/power/state 2>/dev/null; then
             ok "$level completed and returned control"
             rec "bisect_ok=$level"
             worst="$level"
@@ -271,9 +477,13 @@ EOT
             no "$level returned an error -- something in this phase refused"
             rec "bisect_fail=$level"
             say "the failure is in the phase this level ADDS over the previous one"
+            keep_log "bisect-$level"
             break
         fi
-        say "wifi netdev: $(ip -br link show 2>/dev/null | awk '/^wl/{print $1" "$2}' || echo 'none')"
+        # A display that lost its interrupt only shows it on the next commit,
+        # which then waits out a 10 s flip_done timeout. Give it the chance.
+        [[ $level == platform ]] && sleep 15
+        keep_log "bisect-$level"
     done
     echo none > /sys/power/pm_test 2>/dev/null
     rm -f "$BREADCRUMB"
@@ -288,10 +498,25 @@ EOT
 do_run() {
     need_root
     (( CONFIRM )) || die "refusing without --yes-i-may-lose-this-boot (read the header)"
-    [[ $(cat "$AC" 2>/dev/null || echo 0) == 1 ]] && die "on AC -- unplug; charging current makes drain meaningless"
-    [[ -e /dev/rtc0 ]] || die "no /dev/rtc0 -- there would be no way back from suspend"
-    if [[ $(lsmod | grep -c '^brcmfmac') -gt 0 ]] && (( ! ALLOW_WIFI )); then
-        die "brcmfmac is loaded; that is the known hang. Run 'unload-wifi' first, or --allow-wifi to insist."
+    local on_ac=0
+    [[ $(cat "$AC" 2>/dev/null || echo 0) == 1 ]] && on_ac=1
+    if (( on_ac && ! ALLOW_AC )); then
+        die "on AC -- unplug; charging current makes drain meaningless (--allow-ac for a survival-only run)"
+    fi
+    [[ -e /dev/rtc0 ]] || die "no /dev/rtc0"
+    if [[ $(lsmod | grep -c '^brcmfmac') -gt 0 ]] && (( ! ALLOW_WIFI && ! CYCLE_WIFI )); then
+        die "brcmfmac is loaded; that is the known hang. Pass --cycle-wifi, run 'unload-wifi' first, or --allow-wifi to insist."
+    fi
+    (( WITH_FIXES )) && fixes_apply Y
+    # Refuse a sleep that nothing can end. It would not hang -- the raised
+    # watchdog resets it at the deadline -- but it would teach nothing that is
+    # not already known, at the price of an unclean reset.
+    if (( WAKE_BUTTON )); then
+        [[ $(cat "$KP_WAKE" 2>/dev/null) == Y && $(cat "$KP_LINK" 2>/dev/null) == Y ]] ||
+            die "the power key cannot wake this kernel: it needs gpio_wake and keep_link_in_suspend (--with-fixes)"
+    else
+        [[ $(cat "$KP_RTC" 2>/dev/null) == Y ]] ||
+            die "nothing would end the sleep: rtc-rpi raises no alarm interrupt. Pass --with-fixes, or --wake-button"
     fi
 
     local secs=$(( MINUTES * 60 )) mode; mode=$(gauge_mode)
@@ -299,7 +524,7 @@ do_run() {
     # window left energy_now completely unchanged, so a short run cannot produce
     # a drain figure no matter how well the suspend goes. Say so up front rather
     # than letting someone read 0.000 W as a result.
-    if (( MINUTES < 10 )) && [[ $mode != voltage ]]; then
+    if (( MINUTES < 10 )) && [[ $mode != voltage ]] && (( ! on_ac )); then
         echo "NOTE: ${MINUTES} min is too short to measure drain with the ${mode} gauge --"
         echo "      a 60s window was observed not to tick at all. Use --minutes 20 for a"
         echo "      real figure. Short runs are still useful for testing SURVIVAL."
@@ -309,26 +534,32 @@ do_run() {
     # block, and the summary must never be the thing that hangs.
     local vnow; vnow=$(cat "$B/voltage_now" 2>/dev/null || echo 0)
     : > "$RESULTS"
-    rec "start minutes=$MINUTES gauge=$mode voltage_uv=$vnow"
+    rec "start minutes=$MINUTES gauge=$mode voltage_uv=$vnow ac=$on_ac"
+    rec "kernel_switches $(fixes_state)"
+    wifi_out
     rec "brcmfmac_loaded=$(lsmod | grep -c '^brcmfmac')"
-    echo "Two phases of ${MINUTES} min each, measured with the ${mode} gauge."
+    pm_debug_on
     echo "Results are written to $RESULTS as they are taken, so a hang loses nothing."
     echo
 
-    # Phase 1: the machine as it already behaves -- blanked but awake. This is
-    # the control, and the only figure s2idle has to beat.
-    echo "== phase 1/2: blanked, awake (the current low-power blank)"
-    /usr/local/bin/uconsole-lowpower down >/dev/null 2>&1
-    local a1 a2
-    a1=$(read_gauge); rec "awake_before=$a1"
-    sleep "$secs"
-    a2=$(read_gauge); rec "awake_after=$a2"
-    /usr/local/bin/uconsole-lowpower up >/dev/null 2>&1
-    say "gauge $a1 -> $a2"
+    if (( on_ac )); then
+        echo "On AC: a survival run only. No drain figures, and no awake phase."
+    else
+        echo "Two phases of ${MINUTES} min each, measured with the ${mode} gauge."
+        # Phase 1: the machine as it already behaves -- blanked but awake. This is
+        # the control, and the only figure s2idle has to beat.
+        echo "== phase 1/2: blanked, awake (the current low-power blank)"
+        /usr/local/bin/uconsole-lowpower down >/dev/null 2>&1
+        local a1 a2
+        a1=$(read_gauge); rec "awake_before=$a1"
+        sleep "$secs"
+        a2=$(read_gauge); rec "awake_after=$a2"
+        /usr/local/bin/uconsole-lowpower up >/dev/null 2>&1
+        say "gauge $a1 -> $a2"
+        echo
+    fi
 
-    # Phase 2: actually suspended.
-    echo
-    echo "== phase 2/2: s2idle"
+    echo "== s2idle"
     (( MODEM_LOW )) && { mmcli -m 0 --set-power-state-low >/dev/null 2>&1; say "modem radio set low"; }
     /usr/local/bin/uconsole-lowpower down >/dev/null 2>&1
     say "mem_sleep forced to: $(force_s2idle)"
@@ -339,24 +570,26 @@ do_run() {
         # without a serial console, since the journal does not survive.
         echo 0 > /sys/power/pm_async 2>/dev/null
         echo 1 > /sys/power/pm_print_times 2>/dev/null
-        say "pm_print_times on, async suspend off -- watch the console for the last device"
+        say "pm_print_times on, async suspend off -- read the log for the last device"
     fi
 
     local b1 b2
     b1=$(read_gauge); rec "s2idle_before=$b1"
     crumb "run:s2idle"
+    wd_raise $(( secs + 180 ))
     # Flush everything reachable before handing control to the kernel: if this
     # hangs, the battery comes out, and anything unwritten is lost.
     systemctl kill --signal=SIGUSR1 systemd-journald 2>/dev/null
     sync; sleep 2
+    mark "run"
     say "suspending for ${MINUTES} min at $(date +%H:%M:%S) -- do not touch the machine"
 
-    local rc
+    local rc t0 t1
+    t0=$(date +%s)
     if (( WAKE_BUTTON )); then
-        # No alarm at all: suspend and wait for the power key. This separates
-        # "the loop hangs" from "nothing ever woke it" -- if the button brings it
-        # back, the transition was fine and only the RTC alarm was missing.
-        say "PRESS THE POWER BUTTON to wake it. No alarm is set; nothing else will."
+        # No alarm at all: suspend and wait for the power key.
+        say "PRESS THE POWER BUTTON to wake it. If nobody does, the watchdog resets it"
+        say "at $(date -d "+$(( secs + 180 )) sec" +%H:%M:%S)."
         sync
         echo mem > /sys/power/state 2>/dev/null
         rc=$?
@@ -364,6 +597,7 @@ do_run() {
         rtcwake -m mem -s "$secs" >/dev/null 2>&1
         rc=$?
     fi
+    t1=$(date +%s)
 
     # RECORD FIRST, restore second. Everything below this line can hang; nothing
     # above it may be lost. The previous version called `lowpower up` before
@@ -371,27 +605,38 @@ do_run() {
     b2=$(read_gauge)
     rec "s2idle_after=$b2"
     rec "rtcwake_rc=$rc"
+    # Wall time keeps running through s2idle here (timekeeping is never
+    # suspended), so this is how long it actually slept. Short of --minutes
+    # means something other than the alarm woke it; the log names the IRQ.
+    rec "slept_s=$(( t1 - t0 ))"
+    rec "wakeup_irq=$(cat /sys/power/pm_wakeup_irq 2>/dev/null || echo none)"
     rec "survived_wake=yes"
+    wd_restore
+    keep_log "run"
 
     /usr/local/bin/uconsole-lowpower up >/dev/null 2>&1
 
-    # Bounce the VT after resume.
+    # The display after resume.
     #
-    # s2idle resume leaves drm-rp1-dsi without its vblank interrupt: the driver
-    # has no PM ops at all, and nothing re-writes RPI_MIPICFG_INTE_DSI_DMA_BITS,
-    # so every atomic commit then waits out its full 10s flip_done timeout and
-    # the display is unusable even though the machine is fine.
+    # On a stock kernel RP1 is reset across the noirq cycle, and drm-rp1-dsi has
+    # no PM ops: its DMA interrupt is enabled once, in rp1dsi_platform_probe()
+    # (rp1dsi_mipicfg_setup), and never again. Every commit then waits out its
+    # 10 s flip_done timeout. A VT bounce CANNOT fix that -- the modeset it forces
+    # runs rp1dsi_dsi_setup(), which does not touch the interrupt enable. An
+    # earlier version of this comment claimed it did; the source says otherwise.
     #
-    # A VT bounce forces the compositor to redo a full modeset on regaining DRM
-    # master, which re-runs rp1dsi_dsi_setup() -> rp1dsi_mipicfg_setup() -- the
-    # function that writes that very register. It is the same mechanism that is
-    # the only way to re-enable a panel sway has powered off.
-    /usr/local/bin/uconsole-lowpower panel-on >/dev/null 2>&1
-    rec "vt_bounce=done"
+    # With keep_link_in_suspend RP1 is never reset, so there should be nothing
+    # to repair. The bounce is still what re-enables a panel sway powered off.
+    if (( PANEL_RESTORE )); then
+        /usr/local/bin/uconsole-lowpower panel-on >/dev/null 2>&1
+        rec "vt_bounce=done"
+    fi
+    modem_back
+    wifi_back
 
-    say "woke at $(date +%H:%M:%S), rtcwake rc=$rc"
+    say "woke at $(date +%H:%M:%S) after $(( t1 - t0 ))s, rtcwake rc=$rc"
     say "gauge $b1 -> $b2"
-    (( rc == 0 )) || say "NOTE: rtcwake reported an error -- the suspend core began unwinding."
+    (( rc == 0 )) || say "NOTE: the suspend returned an error -- the core began unwinding."
     rec "restored=yes"
     rm -f "$BREADCRUMB"
 
@@ -412,14 +657,20 @@ do_report_file() {
     [[ -n $mode ]] || mode=$(awk -F'gauge=' '/gauge=/{split($2,a," "); print a[1]; exit}' "$RESULTS")
     [[ -n $vnow ]] || vnow=$(awk -F'voltage_uv=' '/voltage_uv=/{split($2,a," "); print a[1]; exit}' "$RESULTS")
 
+    say "$(awk -F'\t' '$2 ~ /^kernel_switches/ {print $2}' "$RESULTS" | tail -1)"
     printf '  %-22s %12s %12s\n' phase delta "drain"
     printf '  %s\n' "----------------------------------------------"
-    local a1 a2 b1 b2
+    local a1 a2 b1 b2 slept ac
     a1=$(v awake_before); a2=$(v awake_after)
     b1=$(v s2idle_before); b2=$(v s2idle_after)
+    slept=$(v slept_s); ac=$(awk -F'ac=' '/ac=/{split($2,a," "); print a[1]; exit}' "$RESULTS")
     [[ -n $a1 && -n $a2 ]] && report_phase "blanked, awake" "$a1" "$a2" "$secs" "$mode" "$vnow"
     if [[ -n $b1 && -n $b2 ]]; then
-        report_phase "s2idle" "$b1" "$b2" "$secs" "$mode" "$vnow"
+        if [[ $ac == 1 ]]; then
+            printf '  %-22s %s\n' "s2idle" "survived ${slept:-?}s on AC -- no drain figure"
+        else
+            report_phase "s2idle" "$b1" "$b2" "${slept:-$secs}" "$mode" "$vnow"
+        fi
     else
         printf '  %-22s %s\n' "s2idle" "NO RESULT -- the machine did not survive the suspend"
     fi
@@ -452,29 +703,34 @@ report_phase() {  # label before after secs mode voltage_uv
 ### wake-check ---------------------------------------------------------------
 # Does the wake path work AT ALL? Zero risk -- this never suspends.
 #
-# `rtcwake -m mem` sets an RTC alarm and then suspends. If the alarm cannot
-# fire, the machine suspends correctly and is simply never woken, which is
-# indistinguishable from a hang: systemd stops petting the watchdog and ~15s
-# later the board resets. That is exactly the observed symptom, and this
-# hardware's RTC is the one documented as "none usable" -- so the alarm is the
-# first thing to check, and it can be checked WHILE AWAKE.
+# The first version watched /proc/interrupts for an RTC line. rtc-rpi has no
+# interrupt, so there is never a line to watch, and it would have reported "did
+# not fire" by construction. What an alarm does leave behind, once patch 0005
+# delivers it, is the RTC core clearing the alarm it has handled -- so read that.
 do_wake_check() {
     need_root
     echo "== wakeup sources the kernel has registered"
     for w in /sys/class/wakeup/*; do
         [[ -r $w/name ]] || continue
-        printf '   %-32s active_count=%s\n' "$(cat "$w/name")" \
-               "$(cat "$w/active_count" 2>/dev/null || echo '?')"
+        printf '   %-32s events=%s\n' "$(cat "$w/name")" \
+               "$(cat "$w/event_count" 2>/dev/null || echo '?')"
     done
 
-    echo "== power button armed as a wake source?"
+    echo "== power button"
     local pek found=0
-    for pek in /sys/devices/platform/*/*pek*/power/wakeup /sys/bus/platform/devices/*pek*/power/wakeup; do
+    for pek in /sys/bus/platform/devices/*pek*/power/wakeup; do
         [[ -r $pek ]] || continue
         found=1
         printf '   %s = %s\n' "$pek" "$(cat "$pek")"
     done
     (( found )) || say "no axp pek wakeup attribute found"
+    local line; line=$(awk '$NF == "axp22x_irq_chip"' /proc/interrupts | head -1)
+    say "AXP223 interrupt: ${line:-not found}"
+    if [[ $line == *pinctrl-rp1* ]]; then
+        say "an RP1 GPIO: the key can wake the machine only with gpio_wake=Y and"
+        say "keep_link_in_suspend=Y (now: $(cat "$KP_WAKE" 2>/dev/null || echo absent) /" \
+            "$(cat "$KP_LINK" 2>/dev/null || echo absent))"
+    fi
 
     echo "== RTC alarm, tested without suspending"
     local rtc=/sys/class/rtc/rtc0
@@ -482,8 +738,13 @@ do_wake_check() {
         no "no writable $rtc/wakealarm -- rtcwake cannot arm anything"
         return 1
     fi
-    local before after
-    before=$(grep -i rtc /proc/interrupts | tr -s ' ' | cut -d' ' -f2- || true)
+    if [[ -w $KP_RTC ]]; then
+        KP_SAVED[$KP_RTC]=$(cat "$KP_RTC")
+        echo Y > "$KP_RTC"
+        say "emulate_alarm_irq on for this test (was ${KP_SAVED[$KP_RTC]})"
+    else
+        say "emulate_alarm_irq absent (no patch 0005): expect nothing to fire"
+    fi
     echo 0 > "$rtc/wakealarm" 2>/dev/null
     echo "+10" > "$rtc/wakealarm" 2>/dev/null
     local armed; armed=$(cat "$rtc/wakealarm" 2>/dev/null)
@@ -493,17 +754,15 @@ do_wake_check() {
     fi
     ok "alarm armed for $armed; waiting 15s to see whether it fires"
     sleep 15
-    after=$(grep -i rtc /proc/interrupts | tr -s ' ' | cut -d' ' -f2- || true)
-    say "rtc irq before: ${before:-none}"
-    say "rtc irq after:  ${after:-none}"
-    if [[ -n $after && $after != "$before" ]]; then
-        ok "the RTC alarm FIRED -- rtcwake can wake this machine"
-        say "so a failed 'run' is a real hang, not a missing wake event"
+    # The RTC core disarms an alarm once it has DELIVERED it. An alarm that never
+    # raised anything is still sitting there, in the past.
+    local after; after=$(cat "$rtc/wakealarm" 2>/dev/null)
+    if [[ -z $after ]]; then
+        ok "the RTC alarm FIRED and was delivered -- rtcwake can end an s2idle"
     else
-        no "the RTC alarm did NOT fire"
-        say "rtcwake arms an alarm that never arrives: the machine suspends and is"
-        say "never woken, and the watchdog resets it ~15s later. That is not a hang."
-        say "Retry with:  uconsole-s2idle-test run --wake-button ..."
+        no "the RTC alarm did NOT fire (wakealarm still reads $after)"
+        say "rtcwake arms an alarm Linux never hears about: the machine suspends and"
+        say "is never woken. Nothing else need be wrong with it."
     fi
     echo 0 > "$rtc/wakealarm" 2>/dev/null
 }
@@ -552,10 +811,14 @@ CMD="${1:-}"; shift 2>/dev/null || true
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --minutes) MINUTES="${2:?}"; shift ;;
+        --with-fixes) WITH_FIXES=1 ;;
+        --cycle-wifi) CYCLE_WIFI=1 ;;
+        --wake-button) WAKE_BUTTON=1 ;;
+        --allow-ac) ALLOW_AC=1 ;;
         --allow-wifi) ALLOW_WIFI=1 ;;
         --modem-low) MODEM_LOW=1 ;;
         --print-times) PRINT_TIMES=1 ;;
-        --wake-button) WAKE_BUTTON=1 ;;
+        --no-panel-restore) PANEL_RESTORE=0 ;;
         --yes-i-may-lose-this-boot) CONFIRM=1 ;;
         *) die "unknown option: $1" ;;
     esac
@@ -563,16 +826,17 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$CMD" in
-    check)       do_check ;;
-    report)      do_report_file ;;
-    pstore)      do_pstore ;;
-    wake-check)  do_wake_check ;;
+    check)        do_check ;;
+    report)       do_report_file ;;
+    pstore)       do_pstore ;;
+    wake-check)   trap fixes_restore EXIT; do_wake_check ;;
     unload-wifi)  do_unload_wifi ;;
     restore-wifi) do_restore_wifi ;;
-    bisect)      do_bisect ;;
-    run)         do_run ;;
-    *) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'
-       echo; echo "Options: --minutes N  --allow-wifi  --modem-low  --print-times  --wake-button
+    bisect)       trap cleanup EXIT; do_bisect ;;
+    run)          trap cleanup EXIT; do_run ;;
+    *) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+       echo; echo "Options: --minutes N  --with-fixes  --cycle-wifi  --wake-button  --allow-ac
+         --modem-low  --print-times  --no-panel-restore  --allow-wifi
          --yes-i-may-lose-this-boot"
        exit 2 ;;
 esac

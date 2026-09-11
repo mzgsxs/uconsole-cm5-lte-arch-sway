@@ -266,6 +266,23 @@ so everything looks available. Neither state is:
   `Failed to force clock for F2: err -110`. **A module reload does not recover it — only
   a reboot does.**
 
+Unloading `brcmfmac` gets s2idle past the Wi-Fi chip, and then the rest of the kernel gets
+in the way. The first barrier was measured on this unit. Everything after it is read from
+the source at the pinned kernel commit, and the patches for it are **untested on hardware**
+(each is a module parameter that defaults to stock behaviour):
+
+| Barrier | Evidence | Addressed by |
+|---|---|---|
+| `brcmstb_gpio_suspend_noirq()` returns `-EBUSY` for the always-on GPIO bank, which has no parent IRQ, so every s2idle aborts | measured (`returns -16`), and in the source | patch 0001; `pm_test=platform` then returns (measured) |
+| **Nothing can wake it.** `rtc-rpi` raises no alarm interrupt at all (`RTC_FEATURE_ALARM_WAKEUP_ONLY`: its alarm powers the board up from halt), so `rtcwake` arms nothing Linux hears. The power key's AXP223 interrupt is RP1 GPIO 2, and `pinctrl-rp1` has no `irq_set_wake`, so arming it fails — that failure is the `Unbalanced IRQ n wake disable` in the resume log | source | 0005 (`rtc_rpi.emulate_alarm_irq`), 0003 (`pinctrl_rp1.gpio_wake`) |
+| **RP1 is reset by every suspend.** `brcm_pcie_suspend_noirq()` asserts PERST# on RP1's link. Before that, the PCI core disables RP1 and clears its bus mastering, because RP1's driver has no PM ops | source | 0004 (`pcie_brcmstb.keep_link_in_suspend`) |
+| **The display cannot survive that reset.** `drm-rp1-dsi` enables its DMA interrupt once, in `rp1dsi_platform_probe()`, so after `pm_test=platform` every commit waits out a 10 s `flip_done` timeout. A VT bounce does not help: the modeset it forces never re-runs that setup | timeouts measured; cause from the source | 0004, by not resetting RP1 |
+| **The watchdog resets any sleep.** `bcm2835_wdt` has no PM ops. With userspace frozen nothing feeds it, so under `RuntimeWatchdogSec=15` a suspend ends in a reset about 15 s in, however well it went | source | the test harness raises the watchdog over D-Bus for the length of the sleep |
+
+The last two rows change what the old "a real s2idle never returns" result means. With no
+wake source and a 15 s watchdog, a perfect suspend and a hang look identical, so that result
+says nothing about s2idle itself.
+
 Five suspend attempts produced five hard hangs. Four needed a battery pull; the ext4 root
 replayed its journal each time, systemd rotated corrupted journal files, and the FAT boot
 partition was left dirty twice. A sixth attempt using `/sys/power/pm_test` at the
