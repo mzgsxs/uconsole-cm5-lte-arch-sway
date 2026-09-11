@@ -189,7 +189,10 @@ mark() { echo "uconsole-s2idle-test: begin $1" > /dev/kmsg 2>/dev/null; }
 keep_log() {   # label -- save the log since `mark label`, print the lines that matter
     local f="$LOGDIR/$1.txt"
     mkdir -p "$LOGDIR"
-    dmesg 2>/dev/null | awk -v m="uconsole-s2idle-test: begin $1" 'index($0, m) {p=1} p' > "$f"
+    # From the LAST mark with this label, not the first: every attempt in a boot
+    # reuses it, and the first version saved each run behind all the earlier ones.
+    dmesg 2>/dev/null | awk -v m="uconsole-s2idle-test: begin $1" \
+        'index($0, m) {buf = ""; p = 1} p {buf = buf $0 "\n"} END {printf "%s", buf}' > "$f"
     sync
     grep -E 'failed to suspend|returns -[0-9]|Unbalanced IRQ|link up|keeping the link|flip_done|commit wait|Triggering wakeup|suspend entry|suspend exit|suspend-to-idle' "$f" \
         | sed 's/^/        /' | tail -25 || true
@@ -204,9 +207,10 @@ pm_debug_on() {   # the PM core names the wakeup IRQ and each suspend-to-idle st
 }
 
 ### wakeup sources ---------------------------------------------------------
-# /sys/power/pm_wakeup_irq names a wake only when it came through an IRQ. The
-# emulated RTC alarm is not one, so compare every wakeup source's event count
-# across the sleep as well: whatever moved is what woke it, or ran while it woke.
+# Two records, because neither covers both kinds of wake. /sys/power/pm_wakeup_irq
+# names an IRQ wake (the power key: the AXP223's line on RP1 GPIO 2) but moves no
+# wakeup source's counter. The emulated RTC alarm is not an IRQ, so it leaves
+# pm_wakeup_irq empty and moves the RTC's wakeup source instead. Both measured.
 ws_snapshot() {
     local w
     for w in /sys/class/wakeup/*; do

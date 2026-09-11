@@ -42,7 +42,8 @@ board. On waking, systemd therefore judged journald and logind hung against thei
 service watchdogs and killed both. The harness now pauses service watchdogs for the sleep. On
 a 5-minute sleep PID 1 then logged the expired timeouts and restarted nothing.
 
-Still to show: a power-key wake, and whether it draws less than the blank. The last is the one that decides whether s2idle is worth having: Pi 5 has no cpuidle
+**A press of the power key wakes it too**: `pm_wakeup_irq` named the AXP223's line on RP1
+GPIO 2. The one thing still to show is whether it draws less than the blank. The last is the one that decides whether s2idle is worth having: Pi 5 has no cpuidle
 states, so even a perfect suspend may save little.
 ## The pack is 18 Wh usable, the gauge is 35 points out, and the calibrator samples at 1 Hz
 

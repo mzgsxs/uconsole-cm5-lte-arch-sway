@@ -297,8 +297,13 @@ seconds after waking. With that in the harness, a 5-minute sleep ended with PID 
 `Watchdog disabled! Ignoring watchdog timeout` for journald and resolved, and nothing was
 restarted (measured).
 
-Not yet shown: a wake from the power key, and a drain below the blank's. The drain needs a
-run on battery.
+**Power-key wake** (measured): all three switches on, no alarm set. One press of the power
+key woke the machine after 34 s asleep. `pm_wakeup_irq` read 174, the AXP223's line on RP1
+GPIO 2, and the key's press and release each reached `axp20x-pek` once after resume. Same
+boot, and nothing from `uconsole-screen-toggle` was logged afterwards, so the waking press
+did not blank the screen again.
+
+Not yet shown: a drain below the blank's. That needs a run on battery.
 
 The last two rows change what the old "a real s2idle never returns" result means. With no
 wake source and a 15 s watchdog, a perfect suspend and a hang look identical, so that result
