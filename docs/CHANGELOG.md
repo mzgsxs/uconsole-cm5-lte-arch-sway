@@ -1,5 +1,49 @@
 # Changelog
 
+## Suspend-to-idle works on the CM5 — on a branch, and not yet worth shipping
+
+Branch `s2idle-brcmstb-gpio-fix` only. Suspend stays masked in the images.
+
+Every s2idle attempt on this machine had ended in a watchdog reset, and the handoff could
+not say whether that was a hang or a sleep nothing woke. Reading the kernel at the pinned
+commit answered it: on a stock kernel **nothing can wake this board from s2idle**, and the
+watchdog resets it about 15 s in whether the suspend worked or not. `rtc-rpi` has no alarm
+interrupt. The power key sits behind an RP1 GPIO that cannot be armed for wake. RP1 itself
+is reset by the PCIe host in every suspend, which is also what kills the display afterwards.
+The full list, with the evidence for each, is in [`HARDWARE.md`](HARDWARE.md) §3.9.
+
+Three new kernel patches address them. Each is a module parameter that defaults to stock
+behaviour:
+
+| Patch | Switch | Does |
+|---|---|---|
+| 0003 | `pinctrl_rp1.gpio_wake` | lets an RP1 GPIO interrupt — the power key — be a wake source |
+| 0004 | `pcie_brcmstb.keep_link_in_suspend` | leaves RP1's link, and RP1, alone across suspend |
+| 0005 | `rtc_rpi.emulate_alarm_irq` | delivers RTC alarms from a kernel timer, so `rtcwake` can end a sleep |
+
+`uconsole-s2idle-test` was rewritten around what the source showed:
+
+- It raises systemd's watchdog for the length of a sleep and restores it afterwards.
+- It can unload and reload Wi-Fi itself, so it can run unattended over SSH as a transient unit.
+- It records how long the machine actually slept and what woke it.
+- It refuses a sleep that nothing could end.
+
+Measured on the device, on one kernel, with the switches off and then on:
+
+- The `Unbalanced IRQ 189 wake disable` warnings on resume disappear.
+- RP1's link is kept instead of retrained.
+- The display survives: stock resume logs `vblank wait timed out` and sway stops
+  responding, while with the switches on it is clean.
+- **A real 121 s s2idle, woken by the RTC alarm, came back** with the display, keyboard,
+  modem and Wi-Fi working, and no VT switch. **So did a 20-minute one** (1202 s).
+
+The 20-minute sleep also showed that CLOCK_MONOTONIC keeps running through s2idle on this
+board. On waking, systemd therefore judged journald and logind hung against their 3-minute
+service watchdogs and killed both. The harness now pauses service watchdogs for the sleep. On
+a 5-minute sleep PID 1 then logged the expired timeouts and restarted nothing.
+
+Still to show: a power-key wake, and whether it draws less than the blank. The last is the one that decides whether s2idle is worth having: Pi 5 has no cpuidle
+states, so even a perfect suspend may save little.
 ## The pack is 18 Wh usable, the gauge is 35 points out, and the calibrator samples at 1 Hz
 
 **The pack.** 3828 mAh / 14.22 Wh reached the 3.50 V stop, but that stop came under a 2.3 A

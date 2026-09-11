@@ -203,6 +203,25 @@ pm_debug_on() {   # the PM core names the wakeup IRQ and each suspend-to-idle st
     echo 1 > /sys/power/pm_debug_messages
 }
 
+### wakeup sources ---------------------------------------------------------
+# /sys/power/pm_wakeup_irq names a wake only when it came through an IRQ. The
+# emulated RTC alarm is not one, so compare every wakeup source's event count
+# across the sleep as well: whatever moved is what woke it, or ran while it woke.
+ws_snapshot() {
+    local w
+    for w in /sys/class/wakeup/*; do
+        [[ -r $w/name ]] && printf '%s\t%s\n' "$(cat "$w/name")" "$(cat "$w/event_count" 2>/dev/null || echo 0)"
+    done
+}
+ws_fired() {   # snapshot-taken-before -- names whose count has moved since
+    local before="$1" name count old out=""
+    while IFS=$'\t' read -r name count; do
+        old=$(printf '%s\n' "$before" | awk -F'\t' -v n="$name" '$1 == n {print $2}')
+        (( count > ${old:-0} )) && out+="$name "
+    done < <(ws_snapshot)
+    echo "${out% }"
+}
+
 ### readiness ---------------------------------------------------------------
 do_check() {
     echo "== power source"
@@ -361,16 +380,67 @@ modem_back() {
         && rec "modem=waking" || rec "modem=wake-failed-to-start"
 }
 
+### backlight -------------------------------------------------------------------
+# uconsole-lowpower leaves the backlight to the user-context screen toggle, so a
+# phase that relies on it alone is measured with the screen LIT. The backlight is
+# ~2 W, several times anything s2idle can save: both phases have to be dark, or
+# the comparison is against the wrong baseline.
+BL_SAVED=""
+backlight_dev() {
+    local d
+    for d in /sys/class/backlight/*; do
+        [[ -w $d/brightness ]] && { echo "$d"; return; }
+    done
+}
+backlight_off() {
+    local d; d=$(backlight_dev)
+    [[ -n $d ]] || return 0
+    [[ -n $BL_SAVED ]] || BL_SAVED=$(cat "$d/brightness")
+    echo 0 > "$d/brightness" 2>/dev/null && rec "backlight=0 was=$BL_SAVED"
+}
+backlight_restore() {
+    local d; d=$(backlight_dev)
+    [[ -n $d && -n $BL_SAVED ]] || return 0
+    echo "$BL_SAVED" > "$d/brightness" 2>/dev/null && rec "backlight_restored=$BL_SAVED"
+    BL_SAVED=""
+}
+
+### service watchdogs -------------------------------------------------------------
+# systemd's per-service watchdogs (WatchdogSec=3min on journald, logind, udevd
+# and others) are timed in CLOCK_MONOTONIC, and here that clock keeps running
+# through s2idle -- the same fact that lets the kernel feed the hardware
+# watchdog. So to PID 1 any sleep longer than three minutes looks like every such
+# service hung. Measured: waking from a 20-minute sleep, journald was killed with
+# result 'watchdog'.
+#
+# With service watchdogs off, a timeout that expired during the sleep is logged
+# and dropped, and each service re-arms its own timer at its next ping. Turning
+# them back on must wait until PID 1 has dispatched those expired timers, or it
+# kills the service anyway -- hence the pause before swd_restore after a wake.
+SWD_SAVED=""
+swd_off() {
+    SWD_SAVED=$(systemctl service-watchdogs 2>/dev/null)
+    [[ -n $SWD_SAVED ]] || return 0
+    systemctl service-watchdogs no && rec "service_watchdogs=no was=$SWD_SAVED"
+}
+swd_restore() {
+    [[ -n $SWD_SAVED ]] || return 0
+    systemctl service-watchdogs "$SWD_SAVED" && rec "service_watchdogs_restored=$SWD_SAVED"
+    SWD_SAVED=""
+}
+
 ### cleanup -------------------------------------------------------------------
 # Whatever happens, leave the machine as it was found: no pm_test level armed,
-# the watchdog back at its configured value, the kernel switches back, Wi-Fi
-# back.
+# the screen lit again, the watchdogs back at their configured values, the kernel
+# switches back, Wi-Fi back.
 PM_DELAY_SAVED=""
 cleanup() {
     [[ -w /sys/power/pm_test ]] && echo none > /sys/power/pm_test 2>/dev/null
     [[ -n $PM_DELAY_SAVED ]] && echo "$PM_DELAY_SAVED" > "$PM_DELAY" 2>/dev/null
     [[ -n $PM_DEBUG_SAVED ]] && echo "$PM_DEBUG_SAVED" > /sys/power/pm_debug_messages 2>/dev/null
+    backlight_restore
     wd_restore
+    swd_restore
     fixes_restore
     wifi_back
 }
@@ -539,6 +609,8 @@ do_run() {
     wifi_out
     rec "brcmfmac_loaded=$(lsmod | grep -c '^brcmfmac')"
     pm_debug_on
+    # Dark for BOTH phases, so that they differ only in whether the machine sleeps.
+    backlight_off
     echo "Results are written to $RESULTS as they are taken, so a hang loses nothing."
     echo
 
@@ -577,10 +649,12 @@ do_run() {
     b1=$(read_gauge); rec "s2idle_before=$b1"
     crumb "run:s2idle"
     wd_raise $(( secs + 180 ))
+    swd_off
     # Flush everything reachable before handing control to the kernel: if this
     # hangs, the battery comes out, and anything unwritten is lost.
     systemctl kill --signal=SIGUSR1 systemd-journald 2>/dev/null
     sync; sleep 2
+    local ws0; ws0=$(ws_snapshot)
     mark "run"
     say "suspending for ${MINUTES} min at $(date +%H:%M:%S) -- do not touch the machine"
 
@@ -610,11 +684,17 @@ do_run() {
     # means something other than the alarm woke it; the log names the IRQ.
     rec "slept_s=$(( t1 - t0 ))"
     rec "wakeup_irq=$(cat /sys/power/pm_wakeup_irq 2>/dev/null || echo none)"
+    rec "wake_sources=$(ws_fired "$ws0")"
     rec "survived_wake=yes"
     wd_restore
     keep_log "run"
 
     /usr/local/bin/uconsole-lowpower up >/dev/null 2>&1
+    backlight_restore
+    # Give PID 1 time to dispatch the service-watchdog timers that expired during
+    # the sleep while they are still switched off, then switch them back on.
+    sleep 5
+    swd_restore
 
     # The display after resume.
     #

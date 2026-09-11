@@ -598,6 +598,19 @@ check "s2idle test restores what it changes" \
 # /proc/interrupts reports "did not fire" by construction. The first one did.
 check "wake-check does not look for an RTC interrupt" \
       "[[ \$(grep -v '^[[:space:]]*#' $MNT/usr/local/bin/uconsole-s2idle-test | grep -c 'rtc /proc/interrupts') -eq 0 ]]"
+# pm_wakeup_irq is empty for a wake that is not an IRQ -- the emulated RTC alarm
+# is one -- so the harness also records which wakeup sources moved.
+check "s2idle test names the wake source" \
+      "grep -qF 'wake_sources=' $MNT/usr/local/bin/uconsole-s2idle-test"
+# uconsole-lowpower leaves the backlight alone, so a drain run relying on it
+# would compare two LIT screens: ~2 W of backlight in both phases.
+check "s2idle test darkens the screen for a drain run" \
+      "[[ \$(grep -v '^[[:space:]]*#' $MNT/usr/local/bin/uconsole-s2idle-test | grep -c 'backlight_off') -ge 2 ]]"
+# CLOCK_MONOTONIC runs through s2idle on this board, so systemd's 3-minute
+# service watchdogs expire during any longer sleep. Measured: journald and
+# logind were both killed on waking from a 20-minute sleep.
+check "s2idle test pauses service watchdogs for a sleep" \
+      "grep -qF 'systemctl service-watchdogs no' $MNT/usr/local/bin/uconsole-s2idle-test"
 # The config ships PANEL_OFF_ON_BLANK=0; a conf that predates the option must
 # not get the risky behaviour by default either.
 check "screen toggle defaults the panel power-down off" \
