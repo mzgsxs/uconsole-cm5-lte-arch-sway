@@ -200,6 +200,10 @@ systemctl enable uconsole-powerkey-tune.service
 # machine roams onto public Wi-Fi and a carrier LTE address; the ruleset limits
 # SSH to private LANs and the tailnet rather than disabling password auth.
 systemctl enable nftables.service
+# Breaks the OTA retry loop. A marker that survives into a normal boot means the
+# update failed; leaving it there would re-stage on every boot and fire an
+# unattended write whenever the battery guard stopped refusing.
+systemctl enable uconsole-ota-cleanup.service
 # zram needs no unit enabled: zram-generator reads /etc/systemd/zram-generator.conf
 # at boot and synthesises systemd-zram-setup@zram0.service itself.
 

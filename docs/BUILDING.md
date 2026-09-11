@@ -199,7 +199,7 @@ docker run --rm --privileged --platform linux/arm64 -v "$PWD":/work -w /work \
 
 The second argument is the profile, and it is cross-checked against what is actually
 inside the image — verifying a dev image as `runtime` fails loudly rather than quietly
-running the wrong assertions. Counts: **432** for runtime, **433** for dev.
+running the wrong assertions. Counts: **457** for runtime, **458** for dev.
 
 Structural verification cannot prove behaviour. The dev image carries
 `uconsole-selftest` for that, and it must be run on the device:
@@ -207,6 +207,10 @@ Structural verification cannot prove behaviour. The dev image carries
 ```bash
 uconsole-selftest --cycle
 ```
+
+To put the image on a machine: `sudo ./flash-to-sd.sh <disk>` for a card in a reader, or
+`build/ota-push.sh` for a machine that is already running — see
+[`docs/USAGE.md`](USAGE.md#reflashing-the-whole-card-over-the-network).
 
 See [`docs/TROUBLESHOOTING.md`](TROUBLESHOOTING.md) for why several checks are written the
 way they are — a few exist specifically because an earlier, more obvious formulation gave

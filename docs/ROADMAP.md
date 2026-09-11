@@ -9,99 +9,34 @@ not to work on this board.
 
 ---
 
-## 1. Full OTA reflash — **phase 0 implemented**
+## 1. OTA reflash — follow-ups
 
-**Problem.** Updating this machine means carrying the SD card to another computer. That is
-the single biggest friction in the workflow, and it is why the test device spent days
-running hand-copied files that matched no built image — which produced two wrong
-conclusions later retracted in `HARDWARE.md`.
+Built, and tested end to end on the machine with both images: a real dev flash took 169 s
+from typing `FLASH` to a settled desktop on the new card. Usage and measurements are in
+[`USAGE.md`](USAGE.md#reflashing-the-whole-card-over-the-network); what building it found is
+in [`CHANGELOG.md`](CHANGELOG.md). Left open:
 
-**Why the obvious approach fails.** The machine boots from `/dev/mmcblk0p2` and runs from
-it. Writing an image over that device while it is the live root means every page fault
-after the first written byte reads whatever `dd` has already put there. systemd, journald
-and sshd fault in continuously, so the write crashes partway and leaves an unbootable card.
+- **A runtime flash still needs someone at the machine.** The runtime image ships no Wi-Fi,
+  account or key, so it comes back offline at the first-boot wizard. Carrying the current
+  network connection and an authorised key across the flash — copied into the new image's
+  `/boot` and applied once on first boot — would make it truly remote, at the cost of writing
+  credentials onto the card's FAT partition, which anyone holding the card can read.
+- **The flash boot leaves no log.** The write runs in the initramfs, whose journal lives in
+  RAM, onto the card being replaced — so the one boot that matters most is the one with no
+  record, and the ~90 s write time is inferred from timestamps either side. Appending the
+  hook's log to the *new* boot partition after the write would fix it, at the cost of a
+  second write to a card that has just been flashed. Worth it the first time a flash fails.
+- **Does the panel initialise in the initramfs?** The `kms` hook is present, so early KMS may
+  bring it up — visible progress instead of three minutes of black screen, on a device whose
+  panel already fails silently on cold boot.
+- **Is 3.7 V the right battery floor?** A guess at "never approaches the 3.4 V cut under the
+  sag of a write". Logging the voltage across a flash would settle it.
+- **Should the initramfs load the battery driver?** It carries the AXP core but not
+  `axp20x_battery`, so its own check has nothing to read and the check at arming is the real
+  guard. Adding it means probing another driver on every boot, in the one place a fault is
+  hardest to see.
 
-**The design, and why it needs no network in early userspace.** The original sketch put
-Wi-Fi, `wpa_supplicant` and `dropbear` into the initramfs so it could pull the image down
-from recovery. That is the fiddliest and least debuggable part of the whole idea, and it is
-unnecessary — the *compressed* image fits in RAM (1.34 GB runtime against 3.9 GB), so it
-can be staged on the root filesystem while the machine is running normally, then copied
-into RAM by the initramfs before the card is touched.
-
-1. **Normal system.** `uconsole-ota` fetches the compressed image to `/var/tmp`, verifies
-   its SHA-256, writes a marker to `/boot/OTA-PENDING`, reboots.
-2. **Initramfs, before the real root is used.** Marker present → mount root read-only, copy
-   the `.gz` into tmpfs, unmount. Nothing is on the card now.
-3. `gunzip < /tmp/ota.img.gz | dd of=/dev/mmcblk0` — ~60 s at the card's 74.7 MB/s, with the
-   network no longer involved.
-4. Reboot. The write replaced the marker along with everything else, so the next boot is
-   normal and `uconsole-expand-root` grows the root to fill the card.
-
-The dangerous window shrinks from the whole transfer to 60 seconds of local writing. A
-network failure in step 1 costs nothing — the card is untouched and still bootable.
-
-**Measured, on this hardware over 5 GHz Wi-Fi at −64 dBm:**
-
-| | |
-|---|---|
-| SSH throughput, workstation → device | 12 MB/s |
-| SD card write | 74.7 MB/s |
-| `gunzip` on the CM5 | 438 MB/s output |
-| Runtime image, gzip -1 | 4.46 GB → **1.34 GB** |
-| Device RAM | 3987 MB total, 3664 MB available |
-
-Cipher choice is irrelevant — `aes128-gcm` and `chacha20-poly1305` both measured ~12 MB/s,
-so the CM5's crypto extensions are not the limit. Default tmpfs is half of RAM (1994 MB),
-which the dev image's 1.53 GB fits but not comfortably: mount it with an explicit size.
-
-### Phases
-
-| Phase | State | Deliverable |
-|---|---|---|
-| 0 | **done, untested on hardware** | Marker check that observes and falls through |
-| 1 | | Copy-to-RAM + `umount` of the root, still no writing |
-| 2 | | Add the `dd` |
-| 3 | | `uconsole-ota` CLI, checksum verification, battery/AC guard |
-
-**Phase 0 is the one that matters**, because the hook runs on *every* boot — a bug there
-breaks the machine on a normal boot, not just during an update. What exists now:
-
-- `overlay/usr/local/bin/uconsole-ota-recovery` — mounts `/boot` read-only, logs whether the
-  marker is present, unmounts, exits 0. It cannot write: verification asserts the script
-  contains no `dd`, `mkfs`, `sfdisk`, `parted` or `gunzip`.
-- `overlay/usr/lib/systemd/system/uconsole-ota-recovery.service` — `ConditionPathExists=/etc/initrd-release`
-  so it can only ever run inside the initramfs, `Before=initrd-root-fs.target`, with a
-  45-second timeout. Nothing Requires it, so a failure is logged and the boot continues.
-- `overlay/etc/initcpio/install/uconsole-ota` — an **install** hook, not a runtime one: this
-  initramfs runs systemd in early userspace, so the mechanism is a unit, not a `run_hook`.
-
-Fifteen verification checks cover it, including that the built initramfs actually carries
-all three files — an install hook present but absent from `HOOKS` is a silent no-op.
-
-### Testing phase 0 — do this with the card physically reachable
-
-The failure mode is a machine that will not boot and shows nothing, and this panel already
-fails silently on cold boot, so a black screen will be ambiguous.
-
-```bash
-sudo touch /boot/OTA-PENDING && sudo reboot
-```
-
-Then after it comes up:
-
-```bash
-sudo dmesg | grep uconsole-ota
-```
-
-Expect `marker found` and `PHASE 0 -- observing only`. Boot without the marker should log
-`no marker; normal boot`. Both must reach a normal desktop.
-
-### Open questions phase 1 depends on
-
-- **Does the panel initialise in the initramfs?** The `kms` hook is present, so early KMS
-  may bring it up — which would give visible progress instead of flashing blind.
-- **Can the root actually be unmounted at that point?** Phase 0 does not test this; it is
-  the whole content of phase 1.
+---
 
 ## 2. Escalation timer — standby that ends
 
@@ -180,6 +115,7 @@ Small, and each one closes a question that is currently guessed at.
 | What does Wi-Fi actually cost during a blank? | `RADIO_OFF_ON_BLANK=0`, compare with `uconsole-power-probe run` |
 | Does cutting the modem rail move the 3.2 W floor? | `MODEM_RAIL_OFF_ON_BLANK=1`, same comparison |
 | What is the pack's real capacity? | `uconsole-battery-calibrate run` — now that phase 1 terminates |
+| What does the machine draw while flashing? | `uconsole-power-probe` across an OTA write |
 
 The last one also gives a measured `PACK_WH`, replacing the nameplate figure that every
 runtime estimate currently relies on.

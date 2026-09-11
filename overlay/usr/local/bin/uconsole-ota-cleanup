@@ -1,0 +1,33 @@
+#!/bin/sh
+# Clears a stale OTA marker once the machine has reached a normal boot.
+#
+# Reaching userspace with /boot/OTA-PENDING still present means the update did
+# NOT happen -- a successful write replaces the whole card, marker included, and
+# reboots. So the marker being here is always the failure path: no staged image,
+# a bad checksum, too little RAM, or the battery guard refusing.
+#
+# Without this, that marker is retried on every single boot, costing ~17s of
+# staging each time and -- worse -- firing an unattended write at whatever later
+# moment the battery guard happens to stop refusing. The user armed an update
+# once; it must not sit there waiting to go off.
+#
+# The staged image is deliberately NOT deleted. It is the expensive part to
+# reproduce (a ~2 minute transfer), the disk has room for it, and keeping it
+# makes a retry cheap. `uconsole-ota` owns its lifetime.
+set -u
+
+MARKER=/boot/OTA-PENDING
+[ -f "$MARKER" ] || exit 0
+
+IMAGE=
+while IFS='=' read -r key val; do
+    [ "$key" = "IMAGE" ] && IMAGE=$val
+done < "$MARKER" 2>/dev/null
+
+rm -f "$MARKER" 2>/dev/null
+
+logger -t uconsole-ota "stale marker cleared: the update did not run (see 'dmesg | grep uconsole-ota' for why)"
+if [ -n "$IMAGE" ] && [ -f "$IMAGE" ]; then
+    logger -t uconsole-ota "staged image kept at $IMAGE; remove it by hand if you are not retrying"
+fi
+exit 0

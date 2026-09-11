@@ -425,6 +425,26 @@ If it *did* engage and the saving is still around a watt, that is expected. Meas
 this hardware: backlight ~0.7 W, everything else in the blank ~0.2 W, and a ~3.2 W floor
 of SoC, DSI panel and RP1/USB that userspace cannot reach.
 
+## ssh refuses to connect after an OTA flash
+
+**`REMOTE HOST IDENTIFICATION HAS CHANGED`.** Correct, not an attack: a flash writes a new
+system, with new host keys. Compare the fingerprint with the one the device shows, then drop
+the old key:
+
+```bash
+ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub    # on the device
+ssh-keygen -R <host>                                 # on the workstation
+```
+
+**Nothing answers at all, after flashing the runtime image.** Also expected. The runtime
+image ships no Wi-Fi, account or SSH key, so it is sitting at the first-boot wizard, offline.
+Finish the wizard at the machine, connect with `nmtui`, then `ssh-copy-id <user>@<host>`.
+
+**The flash seems not to have happened.** `journalctl -b -t uconsole-ota` on the device says
+what the hook did this boot. A refused flash logs why and boots the old system; a completed
+one shows only `no marker; normal boot`, because the flash boot's own log was on the card it
+replaced.
+
 ## Lessons that shaped the verification suite
 
 Several checks are written in a non-obvious way because the obvious version was wrong.

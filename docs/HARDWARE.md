@@ -43,6 +43,13 @@ only zone in the tree, which is why `thermal-zone: 0` is the right waybar settin
 from the part number rather than the DTB leads you to look for a 2712 driver that does not
 exist.
 
+**The battery says it is `online` with no charger attached.** On the AXP223,
+`axp20x-battery` reports `online=1` whenever a battery is fitted — it means *present*, not
+*powered*. AC is the separate `axp22x-ac` supply, `type=Mains`. Asking "is any supply
+online?" therefore answers "yes, on AC" while running on battery; the first OTA power guard
+did exactly that and never looked at the charge. Tell the supplies apart by `type`, and judge
+the battery by voltage rather than the gauge, as `uconsole-battery-guard` does.
+
 **The DSI panel often fails to initialise on a COLD boot.** Powering on from fully off is
 markedly less reliable than a warm restart, and the failure is silent: the panel reports
 `status=connected enabled=enabled`, `fb0` exists, the backlight sits at its normal level —

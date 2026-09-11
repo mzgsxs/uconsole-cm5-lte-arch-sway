@@ -13,6 +13,8 @@ build() {
     add_binary dd
     add_binary gzip
     add_binary mount
+    add_binary sha256sum
+    add_binary stat
     add_binary umount
     add_module 'vfat'
     add_module 'nls_cp437'
@@ -27,8 +29,10 @@ build() {
 
 help() {
     cat <<'HELPEOF'
-Adds the uConsole OTA recovery check to the initramfs. Phase 0 observes only:
-it reports whether /boot carries an OTA-PENDING marker and always falls through
-to a normal boot.
+Adds the uConsole OTA reflash to the initramfs. If /boot carries an OTA-PENDING
+marker it copies the named image into a tmpfs, verifies its SHA-256 and unmounts
+the root; only if the marker says MODE=write does it then write the image to the
+whole card and reboot. Without a marker, or on any failure before the write, it
+falls through to a normal boot. Armed by uconsole-ota.
 HELPEOF
 }

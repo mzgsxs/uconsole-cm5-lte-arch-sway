@@ -1,5 +1,5 @@
 #!/bin/sh
-# Runs INSIDE the initramfs, before the real root is used. Phase 0: observe only.
+# Runs INSIDE the initramfs, before the real root is used, to reflash the card.
 #
 # This is the most dangerous file in the repository, because it executes on every
 # single boot. A bug here does not break an update -- it breaks the machine, on a
@@ -8,18 +8,56 @@
 #
 # Hence one absolute rule: THIS SCRIPT ALWAYS EXITS 0 AND ALWAYS FALLS THROUGH.
 # Every failure mode -- no marker, unmountable boot partition, missing device,
-# anything unforeseen -- must end in a normal boot with the card untouched. The
-# unit that calls it is deliberately not required by anything, so even a crash
-# leaves the boot sequence intact.
+# too little RAM, a bad checksum, anything unforeseen -- must end in a normal
+# boot with the card untouched. The unit that calls it is deliberately not
+# required by anything, so even a crash leaves the boot sequence intact.
 #
-# Phase 0 does no work at all: it proves the hook runs, that the boot partition
-# can be read from early userspace, and that the marker is visible. Writing to
-# the card comes later, once that much is established on real hardware.
+# The sequence, all of it inside the initramfs:
+#
+#   1. copy the staged image off the root filesystem into a tmpfs, so the source
+#      no longer lives on the card that is about to be overwritten;
+#   2. verify the copy's SHA-256, because a card that is about to be erased is
+#      the worst possible moment to discover a bad read;
+#   3. unmount the root, so nothing holds the card;
+#   4. decompress the image straight onto the whole card and reboot.
+#
+# All four are proven on hardware: 1619MB staged in 17s at 91MB/s, hashed in 1s,
+# the root released, and a 5.19GB image written and booted. Step 4 is the one
+# that destroys what was there, and it is gated: the
+# marker must say MODE=write, and anything else -- including a marker that
+# predates this field -- runs the identical path with the output going to
+# /dev/null. A dry run therefore tests everything except the destination.
+#
+# THE DANGEROUS WINDOW is step 4 and nothing else. Losing power during those ~90
+# seconds leaves an unbootable card that has to be reflashed by hand, which is
+# exactly the situation this feature exists to avoid, so the write refuses to
+# start on a low battery and refuses entirely without a checksum to verify.
 set -u
 
 BOOT_DEV=${BOOT_DEV:-/dev/mmcblk0p1}
+ROOT_DEV=${ROOT_DEV:-/dev/mmcblk0p2}
+# The whole card, not a partition: the image carries its own partition table, and
+# `uconsole-expand-root` grows the root to fill the card on the next boot.
+DISK_DEV=${DISK_DEV:-/dev/mmcblk0}
 MARKER=OTA-PENDING
-MNT=/run/uconsole-ota-boot
+
+# Refuse to start a ~90 second write below this. Voltage, because the gauge on
+# this machine has read 30%+ moments before an undervoltage cut; well clear of
+# uconsole-battery-guard's 3.4V so the sag under a write never approaches it.
+# uconsole-ota checks the same floor when arming; this is the second line, for a
+# machine that sat on the marker for a while before rebooting.
+MIN_BATTERY_UV=3700000
+
+BOOT_MNT=/run/uconsole-ota-boot
+ROOT_MNT=/run/uconsole-ota-root
+RAM_MNT=/run/uconsole-ota-ram
+RAM_IMAGE=$RAM_MNT/ota.img.gz
+
+# Leave this much MemAvailable after the image is in tmpfs. The initramfs itself,
+# the kernel and the page cache all live in the same RAM, and the write additionally
+# runs gzip and dd out of it. Refusing the update is always better than an OOM
+# kill halfway through early userspace.
+MARGIN_KB=262144
 
 # /dev/kmsg so the message survives into the real system's journal -- there is no
 # display in early userspace and no network, so this is the only way to find out
@@ -27,6 +65,86 @@ MNT=/run/uconsole-ota-boot
 log() {
     echo "uconsole-ota: $*" > /dev/kmsg 2>/dev/null || echo "uconsole-ota: $*"
 }
+
+# Centiseconds since boot. /proc/uptime is always there and always has exactly two
+# decimals, which `date` in an initramfs cannot be relied on to be.
+now_cs() {
+    read -r u _ < /proc/uptime
+    echo "${u%.*}${u#*.}"
+}
+
+# Rate in MB/s from a byte count and a centisecond delta, in integer arithmetic.
+rate() {
+    [ "$2" -gt 0 ] 2>/dev/null || { echo "?"; return 0; }
+    echo $(( $1 / 10485 / $2 ))
+}
+
+# No grep: this initramfs is not guaranteed to carry one, and adding a dependency
+# to the one script that must never fail is a bad trade.
+mounted_at() {
+    while read -r _ mp _; do
+        [ "$mp" = "$1" ] && return 0
+    done < /proc/mounts
+    return 1
+}
+
+# Best effort. The initramfs carries the AXP PMIC core but not its battery and AC
+# drivers, so on this hardware there is normally nothing to read here and the
+# arming check in uconsole-ota is the real guard. A reading that does exist is
+# taken the same way: by supply type -- the battery reports online=1 whenever it
+# is fitted -- and by voltage rather than the gauge.
+battery_ok() {
+    for d in /sys/class/power_supply/*; do
+        read -r type 2>/dev/null < "$d/type" || continue
+        case "$type" in Mains|USB) ;; *) continue ;; esac
+        read -r on 2>/dev/null < "$d/online" || continue
+        [ "$on" = "1" ] && { log "on AC; proceeding"; return 0; }
+    done
+    for d in /sys/class/power_supply/*; do
+        read -r type 2>/dev/null < "$d/type" || continue
+        [ "$type" = "Battery" ] || continue
+        read -r uv 2>/dev/null < "$d/voltage_now" || continue
+        if [ "$uv" -lt "$MIN_BATTERY_UV" ] 2>/dev/null; then
+            log "battery at $(( uv / 1000 ))mV, below $(( MIN_BATTERY_UV / 1000 ))mV, no AC -- refusing to write. normal boot"
+            return 1
+        fi
+        log "battery at $(( uv / 1000 ))mV; proceeding"
+        return 0
+    done
+    log "no power reading in early userspace; relying on the arming check"
+    return 0
+}
+
+cleanup() {
+    umount "$ROOT_MNT" 2>/dev/null
+    umount "$BOOT_MNT" 2>/dev/null
+    # Nothing survives into a normal boot. Carrying 1.4 GB of tmpfs into it would be
+    # pure loss, and a refused or rehearsed update must leave no trace.
+    rm -f "$RAM_IMAGE" 2>/dev/null
+    umount "$RAM_MNT" 2>/dev/null
+    rmdir "$BOOT_MNT" "$ROOT_MNT" "$RAM_MNT" 2>/dev/null
+    return 0
+}
+
+# A timeout kills us with SIGTERM, and leaving the root mounted behind would be a
+# far worse outcome than the timeout itself.
+trap 'cleanup; exit 0' INT TERM
+trap cleanup EXIT
+
+# Run once per boot, whatever systemd decides to do.
+#
+# Measured on hardware: the unit was invoked twice per boot, at 1.6s and 2.8s,
+# because a Type=oneshot without RemainAfterExit goes back to "inactive" when it
+# finishes and a second pull-in of the target restarts it. The unit now sets
+# RemainAfterExit, and this stamp is the second, independent guard -- once this
+# script writes to a block device, "ran twice" stops being a curiosity and
+# becomes two concurrent writes onto the same card.
+STAMP=/run/uconsole-ota.ran
+if [ -e "$STAMP" ]; then
+    log "already ran this boot; skipping"
+    exit 0
+fi
+: > "$STAMP" 2>/dev/null || true
 
 # udev may not have created the node yet at this point in the initrd.
 i=0
@@ -40,20 +158,224 @@ if [ ! -b "$BOOT_DEV" ]; then
     exit 0
 fi
 
-mkdir -p "$MNT" 2>/dev/null
+mkdir -p "$BOOT_MNT" 2>/dev/null
 
-# Read-only: phase 0 must not be able to modify anything, even by accident.
-if ! mount -o ro -t vfat "$BOOT_DEV" "$MNT" 2>/dev/null; then
+# Read-only: the marker is only ever read here. The write replaces it along with
+# everything else, and uconsole-ota-cleanup removes it if a normal boot happens instead.
+if ! mount -o ro -t vfat "$BOOT_DEV" "$BOOT_MNT" 2>/dev/null; then
     log "could not mount $BOOT_DEV read-only; normal boot"
     exit 0
 fi
 
-if [ -f "$MNT/$MARKER" ]; then
-    log "marker found: $(cat "$MNT/$MARKER" 2>/dev/null | head -1)"
-    log "PHASE 0 -- observing only, taking no action, continuing to normal boot"
-else
+if [ ! -f "$BOOT_MNT/$MARKER" ]; then
     log "no marker; normal boot"
+    exit 0
 fi
 
-umount "$MNT" 2>/dev/null
-exit 0
+# Parse the marker. Deliberately not sourced: it is a data file, and one bad line
+# in it must not become a command in early userspace. Unknown keys are ignored so
+# a newer writer can add fields without breaking an older initramfs.
+OTA_IMAGE=
+OTA_SHA256=
+OTA_MODE=
+while IFS='=' read -r key val; do
+    case "$key" in
+        IMAGE)  OTA_IMAGE=$val ;;
+        SHA256) OTA_SHA256=$val ;;
+        MODE)   OTA_MODE=$val ;;
+    esac
+done < "$BOOT_MNT/$MARKER"
+
+umount "$BOOT_MNT" 2>/dev/null
+
+if [ -z "$OTA_IMAGE" ]; then
+    log "marker carries no IMAGE= line; nothing to stage. normal boot"
+    exit 0
+fi
+
+# The path comes off the card, so treat it as untrusted: absolute, no traversal.
+case "$OTA_IMAGE" in
+    /*) ;;
+    *)  log "marker IMAGE is not absolute; normal boot"; exit 0 ;;
+esac
+case "$OTA_IMAGE" in
+    *..*) log "marker IMAGE contains ..; normal boot"; exit 0 ;;
+esac
+
+log "marker found: IMAGE=$OTA_IMAGE"
+
+mkdir -p "$ROOT_MNT" 2>/dev/null
+
+# If systemd has already mounted the real root, we are running too late. The
+# write cannot go to a card that is mounted, so this is a hard stop, not a warning.
+if mounted_at /sysroot; then
+    log "/sysroot is ALREADY MOUNTED at this point -- unit ordering is wrong. normal boot"
+    exit 0
+fi
+
+if ! mount -o ro "$ROOT_DEV" "$ROOT_MNT" 2>/dev/null; then
+    log "could not mount $ROOT_DEV read-only; normal boot"
+    exit 0
+fi
+
+SRC=$ROOT_MNT$OTA_IMAGE
+if [ ! -f "$SRC" ]; then
+    log "staged image $OTA_IMAGE not on root; normal boot"
+    exit 0
+fi
+
+SIZE=$(stat -c %s "$SRC" 2>/dev/null) || SIZE=0
+if [ "$SIZE" -lt 1048576 ]; then
+    log "staged image is $SIZE bytes, implausible; normal boot"
+    exit 0
+fi
+SIZE_KB=$(( SIZE / 1024 ))
+
+AVAIL_KB=0
+while read -r key val _; do
+    [ "$key" = "MemAvailable:" ] && { AVAIL_KB=$val; break; }
+done < /proc/meminfo
+
+if [ "$AVAIL_KB" -lt $(( SIZE_KB + MARGIN_KB )) ]; then
+    log "need $(( (SIZE_KB + MARGIN_KB) / 1024 ))MB free, have $(( AVAIL_KB / 1024 ))MB; normal boot"
+    exit 0
+fi
+
+mkdir -p "$RAM_MNT" 2>/dev/null
+
+# An explicit size, not the default half-of-RAM: the dev image is 1.53 GB against
+# a 1994 MB default, which fits but not comfortably, and a tmpfs that fills up
+# fails the copy in a much less obvious way than refusing it up front.
+if ! mount -t tmpfs -o "size=$(( SIZE_KB + 4096 ))k,mode=0700" tmpfs "$RAM_MNT" 2>/dev/null; then
+    log "could not mount staging tmpfs; normal boot"
+    exit 0
+fi
+
+log "staging $(( SIZE / 1048576 ))MB into RAM ($(( AVAIL_KB / 1024 ))MB available)"
+
+T0=$(now_cs)
+if ! dd if="$SRC" of="$RAM_IMAGE" bs=4M 2>/dev/null; then
+    log "copy to RAM failed; normal boot"
+    exit 0
+fi
+T1=$(now_cs)
+log "copied in $(( (T1 - T0) / 100 ))s ($(rate "$SIZE" $(( T1 - T0 )))MB/s read from the card)"
+
+# Verify before releasing the source, so a bad copy can still be blamed on the
+# read rather than on the RAM.
+if [ -n "$OTA_SHA256" ]; then
+    T0=$(now_cs)
+    GOT=$(sha256sum "$RAM_IMAGE" 2>/dev/null)
+    GOT=${GOT%% *}
+    T1=$(now_cs)
+    if [ "$GOT" != "$OTA_SHA256" ]; then
+        log "SHA-256 MISMATCH -- refusing to go further. normal boot"
+        exit 0
+    fi
+    log "sha256 verified in $(( (T1 - T0) / 100 ))s"
+elif [ "$OTA_MODE" = "write" ]; then
+    log "marker says MODE=write but carries no SHA256 -- refusing. normal boot"
+    exit 0
+else
+    log "marker carries no SHA256; a write would be refused"
+fi
+
+# The step everything else depends on. If the root cannot be released here, the
+# card cannot be rewritten from early userspace and the design has to change.
+if umount "$ROOT_MNT" 2>/dev/null; then
+    log "root unmounted -- the card is free"
+else
+    log "root would NOT unmount; the card cannot be written from here. normal boot"
+    exit 0
+fi
+
+if mounted_at "$ROOT_MNT" || mounted_at /sysroot; then
+    log "root still mounted somewhere after umount; normal boot"
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# The write. Everything above this line is identical in both modes.
+# ---------------------------------------------------------------------------
+if [ "$OTA_MODE" = "write" ]; then
+    if ! battery_ok; then
+        exit 0
+    fi
+    TARGET=$DISK_DEV
+    # Without this dd can report success with gigabytes still in the page cache,
+    # and the reboot below would then cut them off.
+    DD_CONV=conv=fsync
+    log "WRITING to $TARGET -- do not remove power"
+else
+    # Not a typo and not a fallback: a marker without MODE=write must never write.
+    # The dry run still decompresses the whole stream, so it proves the image is
+    # intact and measures the real rate; only the destination differs.
+    TARGET=/dev/null
+    # /dev/null has no fsync, and asking for one returns EINVAL so dd exits 1.
+    # Measured, not guessed: the first dry run decompressed all 4.8GB correctly
+    # and then reported the image as bad, purely because of its own destination.
+    DD_CONV=
+    log "MODE=${OTA_MODE:-unset} -- dry run, decompressing to /dev/null, card untouched"
+fi
+
+# No pipefail: this is /bin/sh in an initramfs and the option is not portable.
+# A flag file in the tmpfs is, and gzip failing silently while dd reports success
+# is precisely the failure that would otherwise write a truncated image.
+rm -f "$RAM_MNT/gz.failed" 2>/dev/null
+T0=$(now_cs)
+# $DD_CONV unquoted on purpose: it is empty for the dry run and must vanish
+# rather than become an empty argument.
+# shellcheck disable=SC2086
+{ gzip -dc "$RAM_IMAGE" || : > "$RAM_MNT/gz.failed" ; } | \
+    dd of="$TARGET" bs=4M $DD_CONV 2>"$RAM_MNT/dd.err"
+DD_RC=$?
+sync
+T1=$(now_cs)
+
+# dd's own summary carries the byte count and rate, so log that rather than
+# recomputing it from a decompressed size we never knew in advance.
+while read -r line; do
+    case "$line" in *copied*) log "dd: $line" ;; esac
+done < "$RAM_MNT/dd.err"
+
+if [ -e "$RAM_MNT/gz.failed" ] || [ "$DD_RC" -ne 0 ]; then
+    # Which half of the pipe broke matters: a decompression failure means the
+    # staged image is corrupt and a retry is pointless, while a dd failure is
+    # about the destination. The first dry run reported only "dd rc=1" and the
+    # actual reason -- fsync on /dev/null -- was sitting unread in dd.err.
+    [ -e "$RAM_MNT/gz.failed" ] && log "DECOMPRESSION failed -- the staged image is corrupt"
+    while read -r line; do
+        case "$line" in *copied*|*records*) ;; *) log "dd: $line" ;; esac
+    done < "$RAM_MNT/dd.err"
+    if [ "$TARGET" = "$DISK_DEV" ]; then
+        # Nothing can be done from here: the card holds a partial image and the
+        # only recovery is a reflash on another machine. Say so plainly, because
+        # this message is the only thing the user will have to go on.
+        log "WRITE FAILED (dd rc=$DD_RC) -- THE CARD IS NOW INCOMPLETE AND MUST BE REFLASHED"
+    else
+        log "dry run failed (dd rc=$DD_RC); the staged image is bad. normal boot"
+    fi
+    exit 0
+fi
+
+log "completed in $(( (T1 - T0) / 100 ))s"
+
+if [ "$TARGET" != "$DISK_DEV" ]; then
+    log "DRY RUN OK -- the same run with MODE=write would have flashed the card"
+    log "discarding the RAM copy and continuing to a normal boot"
+    exit 0
+fi
+
+# Do not continue booting. The kernel is the old one, the initramfs in RAM is the
+# old one, and the root they were going to mount has just been replaced by a
+# different filesystem. Only a reboot makes the machine consistent again.
+log "flashed. rebooting into the new system"
+cleanup
+systemctl --no-block reboot 2>/dev/null || {
+    echo 1 > /proc/sys/kernel/sysrq 2>/dev/null
+    echo b > /proc/sysrq-trigger 2>/dev/null
+}
+# If both reboot paths somehow fail, falling through to a normal boot would mount
+# the freshly written root under a stale kernel. Hanging here is the better of
+# two bad outcomes, and the unit's timeout turns it into a bounded one.
+while : ; do sleep 5; done

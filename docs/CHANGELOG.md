@@ -1,5 +1,58 @@
 # Changelog
 
+## Reflash over the network: `uconsole-ota`
+
+A full image no longer means carrying the card to another computer.
+
+```bash
+build/ota-push.sh <user>@<host> out/uconsole-arch-cm5-sway.img   # workstation: stage it
+sudo uconsole-ota dry-run                                       # device: rehearse
+sudo uconsole-ota flash                                         # device: do it
+```
+
+The machine cannot overwrite the card it is running from, so the write happens in the
+initramfs: the image is copied into RAM, re-verified, the root is unmounted, and only then
+is the card written. Usage, timings and failure modes are in
+[`USAGE.md`](USAGE.md#reflashing-the-whole-card-over-the-network).
+
+**Tested end to end on the machine.** The 5.19 GB dev image went over in 160 s, a dry run
+passed, and the real flash took 169 s from typing `FLASH` to a settled desktop on the new card
+— fresh machine-id, root grown to fill the card, and canary files planted on the old card
+gone. A flashed machine has new SSH host keys: `ssh-keygen -R <host>` on the workstation.
+
+Then the runtime image, the same way: pushed in 123 s, rehearsed, flashed, and 20/20 checks
+afterwards — including that the dev account and autologin were gone. It comes back offline at
+the first-boot wizard, because the runtime image carries no Wi-Fi or key of its own, so a
+runtime flash still needs someone at the machine once it has finished.
+
+The hook's log is `journalctl -b -t uconsole-ota`, not `journalctl -k | grep uconsole-ota`:
+journald files lines written to `/dev/kmsg` under their identifier, so the message text no
+longer contains it — which a first check of the runtime flash scored as "the hook never ran".
+
+Found on the machine:
+
+- **The initramfs hook ran twice per boot.** `Type=oneshot` without `RemainAfterExit`
+  returns to inactive, and a second pull-in restarts it. With a write in the path that is
+  two concurrent writes onto one card. Guarded twice now, in the unit and in the script.
+- **The first dry run failed a good image**: `conv=fsync` on `/dev/null` is EINVAL. The log
+  now reports which half of the pipe failed, and what `dd` said.
+- **Both battery guards read "battery fitted" as "on AC"**: this PMIC's battery supply reports
+  `online=1` whenever a battery is present. They now find AC by supply type and gate on
+  voltage (3.7 V) rather than the gauge, as `uconsole-battery-guard` already did.
+
+Found in review, before either could bite:
+
+- **The hook was not ordered against `sysroot.mount`**, which fstab-generator gives the same
+  `Before=initrd-root-fs.target`. It now names `sysroot.mount` and refuses if it finds the
+  root already mounted.
+- **The start timeout was sized for this card, not for SD cards.** 45 s would have killed
+  every update here, and even 300 s is shorter than a healthy write on a class-10 card. A
+  timeout mid-write lets the boot carry on onto a half-written card, so it is now 30 minutes.
+
+A marker that survives into a normal boot means the update did not happen, and
+`uconsole-ota-cleanup` now clears it. Without that, a refused update would re-stage on every
+boot and fire an unattended write whenever the refusal stopped applying.
+
 ## Images shrunk to fit: 8 GB -> 4.5 GB runtime, 4.9 GB dev
 
 The image is now built at 8 GB and shrunk as the final step, after customisation.

@@ -5,7 +5,7 @@ A build system that produces a bootable **Arch Linux ARM** image with a
 fitted with a **Raspberry Pi Compute Module 5**.
 
 The kernel is compiled from source; the image is assembled and then checked by an
-automated verification suite — **432 checks** for the runtime image, **433** for the dev
+automated verification suite — **457 checks** for the runtime image, **458** for the dev
 image, all passing.
 
 Inputs are pinned where upstream allows it: the kernel commit, the upstream builder, and
@@ -47,6 +47,7 @@ tarball's SHA-256 and says so when it differs.
 | **Session** | Powers off and comes back where you left it — apps, workspaces, fullscreen, tmux |
 | **Recovery** | `Ctrl`+`Alt`+`F2` → `uconsole-unstick` — works with the network off |
 | **First boot** | Prompts for a username and password; expands the root filesystem to fill the card |
+| **Updates** | Reflash a running machine over the network — staged, rehearsed with a dry run, then written by the initramfs |
 
 ## Quick start
 
@@ -74,6 +75,9 @@ docker run --rm --privileged --platform linux/arm64 -v "$PWD":/work -w /work \
 
 # 5. Flash (macOS)
 sudo ./flash-to-sd.sh disk4
+
+# ...or, once a machine is running, reflash it over the network
+build/ota-push.sh <user>@<host> out/uconsole-arch-cm5-sway.img
 ```
 
 Full instructions, including how to create the `alarm-base` container, are in
@@ -151,10 +155,10 @@ are deliberately untracked — see `.gitignore`.
 |---|---|
 | [`docs/BUILDING.md`](docs/BUILDING.md) | The build pipeline in detail, and how to modify it |
 | [`docs/HARDWARE.md`](docs/HARDWARE.md) | uConsole + CM5 hardware notes and known defects |
-| [`docs/USAGE.md`](docs/USAGE.md) | Operator commands: LTE, WAN routing, Tailscale, battery, tmux |
+| [`docs/USAGE.md`](docs/USAGE.md) | Operator commands: LTE, WAN routing, Tailscale, battery, tmux, OTA reflash |
 | [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) | Problems hit during development and their fixes |
 | [`docs/CHANGELOG.md`](docs/CHANGELOG.md) | What changed and why |
-| [`docs/ROADMAP.md`](docs/ROADMAP.md) | Designed but not built — incl. full OTA reflash |
+| [`docs/ROADMAP.md`](docs/ROADMAP.md) | Designed but not built, and what remains of OTA |
 
 ## Verification
 
@@ -175,11 +179,12 @@ privilege with a command different from the one it intends to run — each of wh
 real defect found by measuring the machine rather than reading the code.
 
 ```
-RESULT: 432 passed, 0 failed
+RESULT: 457 passed, 0 failed
 ```
 
-Structural verification is not a boot test. Nothing here has been validated by an
-automated boot on real hardware.
+Structural verification is not a boot test, and there is no automated boot on real
+hardware. The exception is the network reflash, which has been run on the real machine with
+both images and checked afterwards — see [`docs/USAGE.md`](docs/USAGE.md#reflashing-the-whole-card-over-the-network).
 
 ## Credits
 

@@ -1,0 +1,17 @@
+[Unit]
+Description=Clear a stale uConsole OTA marker
+Documentation=file:///usr/local/bin/uconsole-ota-cleanup
+# The mirror image of the recovery unit's interlock: that one runs only in the
+# initramfs, this one only on the real system.
+ConditionPathExists=!/etc/initrd-release
+ConditionPathExists=/boot/OTA-PENDING
+# /boot has to be mounted before the marker can be seen or removed.
+After=boot.mount local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/uconsole-ota-cleanup
+
+[Install]
+WantedBy=multi-user.target

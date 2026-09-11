@@ -3,7 +3,12 @@ Description=uConsole OTA recovery check (initramfs)
 Documentation=file:///usr/local/bin/uconsole-ota-recovery
 DefaultDependencies=no
 # Early enough that the real root has not been used yet.
-Before=initrd-root-fs.target
+#
+# Before=initrd-root-fs.target alone is NOT enough. systemd-fstab-generator gives
+# sysroot.mount the same ordering, so the two are unordered with respect to each
+# other and the root could be mounted underneath us. Naming sysroot.mount is what
+# actually guarantees we run first; the target stays as the belt to that brace.
+Before=sysroot.mount initrd-root-fs.target
 After=systemd-udev-trigger.service
 # THE safety interlock: this unit must never run on the real system, only inside
 # the initramfs. /etc/initrd-release exists only there.
@@ -11,10 +16,28 @@ ConditionPathExists=/etc/initrd-release
 
 [Service]
 Type=oneshot
+# Measured on hardware: without this the unit ran TWICE per boot, at 1.6s and
+# 2.8s, both inside the initramfs. A Type=oneshot without RemainAfterExit returns
+# to "inactive (dead)" when it finishes, so a second pull-in of the target starts
+# it again. Harmless while the script only reads; catastrophic once it writes,
+# where it would mean two concurrent writes onto the same block device.
+#
+# The script carries its own run-once stamp as well. This is the kind of thing
+# that should not depend on a single mechanism being correct.
+RemainAfterExit=yes
 ExecStart=/usr/local/bin/uconsole-ota-recovery
 # Nothing Requires or Wants this unit, so a failure here is logged and ignored
 # rather than failing the boot. The timeout is the backstop for a hang, which is
 # the one failure mode that would actually stop the machine booting.
-TimeoutStartSec=45
+#
+# Sized for the slowest card, not for this one. On the test card staging takes
+# 17s and the write ~90s, but a class-10 card is only guaranteed 10MB/s, and a
+# 5GB image then takes ~9 minutes to write. The timeout firing MID-WRITE is the
+# worst outcome available: the write is killed and the boot carries on onto a
+# half-written card. So it must outlast any healthy write, with margin -- 30
+# minutes covers cards down to ~3MB/s. The price is that a hang BEFORE the write
+# (never observed) shows a blank screen that long before the script is killed,
+# cleans up, and the boot continues normally.
+TimeoutStartSec=30min
 StandardOutput=journal+console
 StandardError=journal+console

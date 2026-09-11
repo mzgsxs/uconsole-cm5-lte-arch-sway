@@ -427,19 +427,166 @@ so `sudo uconsole-battery-calibrate run` gives a truer figure than any datasheet
 
 ## Updating the machine
 
-Today this means writing a new image to the card from another computer. A network reflash
-is designed but not built — see [`ROADMAP.md`](ROADMAP.md), which carries the measured
-transfer figures (~3.3 minutes for a compressed 8 GB image over 5 GHz Wi-Fi).
-
-For everything short of a full image — scripts, config, even the kernel package and its
-device-tree overlay — a targeted update works over SSH today:
+For anything short of a full image — scripts, config, even the kernel package and its
+device-tree overlay — a targeted update over SSH is the right tool:
 
 ```bash
 sudo pacman -U /tmp/linux-uconsole-cm5-4k-git-*.pkg.tar.xz
 ```
 
-That covers any change except the base package set and a clean filesystem. A kernel or
+That covers every change except the base package set and a clean filesystem. A kernel or
 device-tree change needs a reboot to take effect.
+
+### Reflashing the whole card, over the network
+
+A full image no longer means carrying the card to another computer. From the workstation
+that built it:
+
+```bash
+build/ota-push.sh <user>@<host> out/uconsole-arch-cm5-sway.img
+```
+
+The image is compressed as it is sent, so a 4.79 GB image is 1.38 GB on the wire. Nothing
+is armed by that command — it stages and checks the image and stops. Then, on the device:
+
+```bash
+sudo uconsole-ota dry-run
+```
+
+**Do the dry run.** It is the same code path as the real thing with the output going to
+`/dev/null`: it stages the image into RAM, verifies it, unmounts the root and decompresses
+all of it, then throws the result away and boots normally. It costs about 40 seconds and it
+is the difference between finding a problem now and finding it with a half-written card.
+The very first dry run failed — on a bug in the dry run itself — and the card was never at
+risk.
+
+When that comes back clean:
+
+```bash
+sudo uconsole-ota flash     # asks you to type FLASH, then reboots
+```
+
+`uconsole-ota status` shows what is staged, what is armed, and whether the machine is fit
+to write. `uconsole-ota cancel` disarms.
+
+### Driving it from the workstation
+
+`ota-push.sh` calls plain `ssh`, so ssh has to find the device's key on its own. If the key
+is not one of ssh's default names, give the device an alias once — without a `User` line,
+because the account depends on which image is running:
+
+```bash
+cat >> ~/.ssh/config <<'EOF'
+
+Host uconsole
+    HostName <device-ip>
+    IdentityFile ~/.ssh/<key>
+    IdentitiesOnly yes
+EOF
+```
+
+| Image running now | Account to use | Its `sudo` |
+|---|---|---|
+| dev | `DEV_USER` from `secrets/dev-account.env` | no password |
+| runtime | the one its first-boot wizard created | asks for the password |
+
+The account is always that of the image being *replaced*, not the one being flashed. The
+whole sequence then runs from the workstation, with `-t` so that `sudo` and the `FLASH`
+confirmation can reach your terminal. The dry run offers to reboot; afterwards its log should
+end with `DRY RUN OK`.
+
+```bash
+build/ota-push.sh <user>@uconsole out/uconsole-arch-cm5-sway-dev.img
+```
+
+```bash
+ssh -t <user>@uconsole sudo uconsole-ota dry-run
+```
+
+```bash
+ssh <user>@uconsole journalctl -b -t uconsole-ota
+```
+
+```bash
+ssh -t <user>@uconsole sudo uconsole-ota flash
+```
+
+Use `out/uconsole-arch-cm5-sway.img` to flash the runtime image instead. A dev image comes
+back on the network by itself; a runtime one does not — see below.
+
+### What actually happens
+
+The machine cannot overwrite the card it is running from — every page fault after the first
+written byte would read whatever `dd` had already put there. So the write happens in the
+initramfs, before the real root is ever mounted:
+
+1. `uconsole-ota` stages the compressed image on the root filesystem, records its SHA-256
+   and writes `/boot/OTA-PENDING`.
+2. On the next boot, before the root is mounted, the initramfs hook copies the image into a
+   tmpfs, re-checks its SHA-256, and unmounts the root. **The card is now free.**
+3. It decompresses the image straight onto `/dev/mmcblk0` and reboots.
+4. The write replaced the marker along with everything else, so the next boot is an ordinary
+   one, and `uconsole-expand-root` grows the root to fill the card.
+
+Measured on this hardware over 5 GHz Wi-Fi at −64 dBm:
+
+| | |
+|---|---|
+| Transfer, 4.79 GB runtime image → 1.38 GB on the wire | 123–136 s (three runs) |
+| Stage into RAM at boot | 15–17 s at 91 MB/s |
+| SHA-256 of 1.38 GB | 1 s (1.3 GB/s — the SoC has crypto extensions) |
+| Decompress 4.79 GB / 5.19 GB | 22 s / 25 s, at 205–220 MB/s |
+| Transfer, 5.19 GB dev image → 1.62 GB | 160 s |
+| Write to the card | ~85 s (4.79 GB) to ~90 s (5.19 GB) — inferred from timestamps; the flash boot's own log cannot survive it |
+| Typing `FLASH` → settled desktop on the new card (dev) | **169 s** |
+| Typing `FLASH` → runtime image booting to its first-boot wizard | ~135 s |
+
+So a full reflash is two to three minutes of transfer that can be interrupted harmlessly,
+then about three minutes of reboots — of which only the ~90 seconds of writing cannot.
+
+### When it refuses, and when it cannot
+
+The write refuses to start without a recorded checksum, and without either AC or a battery
+above 3.7 V — losing power during those ninety seconds leaves a card that has to be
+reflashed from another computer, which is the exact situation this feature exists to avoid.
+The floor is a voltage because the gauge on this machine has read 30%+ moments before an
+undervoltage cut. It is checked when arming. The initramfs checks again when it can, but it
+does not carry the battery driver, so in practice the check at arming is the guard — reboot
+promptly after arming rather than leaving the machine armed on battery.
+
+If anything goes wrong before the write starts — no staged image, a bad checksum, too little
+RAM — the boot continues normally and the card is
+untouched. `journalctl -b -t uconsole-ota` says why — the hook's own lines and the
+cleanup's together — and the marker is cleared so the machine does not retry it on every
+subsequent boot. Not `journalctl -k | grep uconsole-ota`: journald files lines written to
+`/dev/kmsg` under their identifier, so the message text no longer contains it. `dmesg` works.
+
+If the write itself fails part-way there is no recovery on the device: the card holds an
+incomplete image and must be written from another computer. That is the one failure this
+design cannot engineer away, and it is why the battery guard is deliberately conservative.
+
+Tested end to end on this machine with both images, each pushed, rehearsed with a dry run,
+then flashed for real. Each new card came up with a fresh machine-id and host keys, the root
+grown to fill it, and its OTA files byte-identical to the repo, and canary files planted on
+the old root and boot partitions were gone — the card was rewritten, not just rebooted. The
+dev flash came back with autologin; the runtime flash came back with neither the dev account
+nor autologin, as it should.
+
+**After a flash the machine has new SSH host keys**, so the workstation's next `ssh` refuses
+with a host-key warning. That is the right behaviour, not a fault: remove the old key with
+`ssh-keygen -R <host>`, and compare the new fingerprint with the one the device shows.
+
+**Flashing the runtime image takes the machine off the network.** The runtime image carries
+no Wi-Fi, account or SSH key — deliberately — so after the flash it sits at the first-boot
+wizard, offline, until someone is at it: finish the wizard, connect with `nmtui`, clear the
+old host key as above, then install a key for the new account:
+
+```bash
+ssh-copy-id <user>@<host>
+```
+
+That account's `sudo` asks for its password, so the next `uconsole-ota flash` is armed from
+a terminal that can answer it. `ota-push.sh` itself needs no root.
 
 ## Suspend — do not use it
 

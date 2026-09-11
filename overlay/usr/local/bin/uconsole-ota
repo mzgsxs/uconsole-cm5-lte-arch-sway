@@ -1,0 +1,281 @@
+#!/usr/bin/env bash
+# uconsole-ota -- reflash this machine's SD card from the machine itself.
+#
+#   uconsole-ota status            what is staged, what is armed, is it safe to go
+#   uconsole-ota stage <file|url>  put a compressed image in place and check it
+#   uconsole-ota verify [sha256]   re-check the staged image, record its hash
+#   uconsole-ota dry-run           rehearse the whole flash, writing nothing
+#   uconsole-ota flash             arm the real write and reboot into it
+#   uconsole-ota cancel            disarm, and optionally drop the staged image
+#
+# Nothing here writes to the card. This side stages the image on the running
+# filesystem and leaves a marker in /boot; the write happens in the initramfs on
+# the next boot, where the root can be unmounted first -- see
+# /usr/local/bin/uconsole-ota-recovery for why it has to work that way.
+#
+# The guards are here rather than there because this is where the fuel gauge and
+# the network are up. The initramfs re-checks what it can, on the assumption that
+# an armed machine may not be rebooted for hours.
+set -uo pipefail
+
+STAGE=/var/tmp/uconsole-ota.img.gz
+STAGE_SHA=$STAGE.sha256
+MARKER=/boot/OTA-PENDING
+# Voltage, well clear of uconsole-battery-guard's 3.4V cut, so the sag under a
+# ~90s write never approaches it. Overridable for testing the refusal path.
+MIN_BATTERY_UV=${MIN_BATTERY_UV:-3700000}
+# Matches the initramfs. Refusing here, where there is a terminal to say why, is
+# much better than refusing there, where there is only dmesg.
+MARGIN_KB=262144
+
+c_ok=$'\033[32m'; c_no=$'\033[31m'; c_wa=$'\033[33m'; c_b=$'\033[1m'; c_z=$'\033[0m'
+ok(){  printf "  ${c_ok}OK${c_z}  %s\n" "$*"; }
+no(){  printf "  ${c_no}NO${c_z}  %s\n" "$*"; }
+wa(){  printf "  ${c_wa}!!${c_z}  %s\n" "$*"; }
+inf(){ printf '      %s\n' "$*"; }
+say(){ printf "\n${c_b}== %s${c_z}\n" "$*"; }
+die(){ printf "uconsole-ota: %s\n" "$*" >&2; exit 1; }
+need_root(){ [[ $EUID -eq 0 ]] || die "'$1' needs root -- use sudo"; }
+
+human(){ numfmt --to=iec --suffix=B "$1" 2>/dev/null || echo "$1 bytes"; }
+
+meminfo_kb(){
+    local key=$1 k v
+    while read -r k v _; do [[ $k == "$key:" ]] && { echo "$v"; return 0; }; done < /proc/meminfo
+    echo 0
+}
+
+# True if on AC, or on a battery with enough voltage to survive the write.
+#
+# By supply TYPE, not by `online` alone: on this PMIC the battery supply reports
+# online=1 whenever a battery is fitted, and the first version of this read
+# "battery present" as "on AC" and never looked at the charge at all.
+#
+# Voltage, not capacity, for the reason uconsole-battery-guard gives: the gauge
+# has read 30%+ moments before an undervoltage cut. Its claim is shown, not used.
+power_ok(){
+    local d type on uv pct
+    for d in /sys/class/power_supply/*; do
+        read -r type 2>/dev/null < "$d/type" || continue
+        case $type in Mains|USB) ;; *) continue ;; esac
+        read -r on 2>/dev/null < "$d/online" || continue
+        [[ $on == 1 ]] && { POWER_WHY="on AC ($(basename "$d"))"; return 0; }
+    done
+    for d in /sys/class/power_supply/*; do
+        read -r type 2>/dev/null < "$d/type" || continue
+        [[ $type == Battery ]] || continue
+        read -r uv 2>/dev/null < "$d/voltage_now" || continue
+        pct=$(cat "$d/capacity" 2>/dev/null || echo '?')
+        if (( uv < MIN_BATTERY_UV )); then
+            POWER_WHY="battery at $(( uv / 1000 ))mV, below $(( MIN_BATTERY_UV / 1000 ))mV, no AC (gauge says ${pct}%)"
+            return 1
+        fi
+        POWER_WHY="battery at $(( uv / 1000 ))mV, no AC (gauge says ${pct}%)"
+        return 0
+    done
+    POWER_WHY="no power supply readable"
+    return 0
+}
+
+ram_ok(){
+    local size_kb=$1 total_kb
+    total_kb=$(meminfo_kb MemTotal)
+    # Not MemAvailable: by the time it matters the running system is gone and the
+    # initramfs has nearly all of RAM to itself. Measured there: 3833MB free of
+    # 3987MB total, so total minus 200MB is the honest budget.
+    RAM_WHY="$(( size_kb / 1024 ))MB image, $(( (total_kb - 204800) / 1024 ))MB usable in early userspace"
+    (( size_kb + MARGIN_KB <= total_kb - 204800 ))
+}
+
+staged_size(){ stat -c %s "$STAGE" 2>/dev/null || echo 0; }
+
+cmd_status(){
+    say "staged image"
+    if [[ -f $STAGE ]]; then
+        ok "$STAGE  ($(human "$(staged_size)"))"
+        if [[ -f $STAGE_SHA ]]; then ok "checksum recorded: $(cut -c1-16 < "$STAGE_SHA")..."
+        else no "no checksum recorded -- 'flash' will refuse this"; fi
+    else
+        no "nothing staged"
+    fi
+
+    say "armed"
+    if [[ -f $MARKER ]]; then
+        local mode; mode=$(sed -n 's/^MODE=//p' "$MARKER" 2>/dev/null)
+        if [[ $mode == write ]]; then wa "ARMED TO FLASH on the next boot"
+        else ok "armed for a dry run on the next boot"; fi
+        sed 's/^/      /' "$MARKER" 2>/dev/null
+    else
+        ok "not armed -- the next boot is a normal one"
+    fi
+
+    say "fit to flash"
+    if power_ok; then ok "$POWER_WHY"; else no "$POWER_WHY"; fi
+    # Only meaningful with something staged: "OK 0MB image" told nobody anything.
+    if [[ -f $STAGE ]]; then
+        if ram_ok "$(( $(staged_size) / 1024 ))"; then ok "$RAM_WHY"; else no "$RAM_WHY"; fi
+    fi
+
+    say "last attempt"
+    local seen=0 line
+    while IFS= read -r line; do seen=1; inf "$line"; done < <(dmesg 2>/dev/null | sed -n 's/.*uconsole-ota: //p')
+    (( seen )) || inf "nothing in this boot's log"
+}
+
+# /var/tmp is sticky: a file one user created cannot be replaced by another. Run
+# this tool with sudo once and without it the next time, and the second run finds
+# root's files in its way.
+owner_hint(){
+    echo "checksum file owned by $(stat -c %U "$STAGE_SHA" 2>/dev/null || echo '?'), image by $(stat -c %U "$STAGE" 2>/dev/null || echo '?');" \
+         "run this the same way the image was staged -- with sudo both times, or neither"
+}
+
+# The one place that decides whether a staged image is acceptable, so that
+# streaming it in from a workstation and copying it in locally cannot drift apart.
+record_hash(){
+    local want=${1:-}
+    say "checking"
+    local got; got=$(sha256sum "$STAGE" | cut -d' ' -f1)
+    if [[ -n $want ]]; then
+        if [[ $got != "$want" ]]; then
+            rm -f "$STAGE" "$STAGE_SHA" 2>/dev/null
+            [[ -e $STAGE ]] && die "checksum mismatch, and $STAGE could not be removed -- $(owner_hint)"
+            die "checksum mismatch -- staged image discarded"
+        fi
+        ok "matches the expected checksum"
+    else
+        # Say exactly what this does and does not prove. A hash computed from the
+        # copy catches a damaged transfer and a bad card read, which is what the
+        # initramfs uses it for; it says nothing about where the image came from.
+        wa "no expected checksum given"
+        inf "recorded a self-computed hash: it will catch transfer or card damage,"
+        inf "but it cannot tell you the image is the one you think it is."
+    fi
+    # Checked, because failing here used to print a permission error and then "OK":
+    # the old checksum stayed in place and 'flash' later refused with a message
+    # that pointed at the image rather than at the file it could not write.
+    # The group matters: a trailing 2>/dev/null is applied after the > that fails,
+    # so bash's own "Permission denied" would still reach the terminal.
+    { printf '%s\n' "$got" > "$STAGE_SHA"; } 2>/dev/null \
+        || die "could not record the checksum in $STAGE_SHA -- $(owner_hint)"
+    ok "staged $(human "$(staged_size)") at $STAGE"
+}
+
+cmd_verify(){
+    [[ -f $STAGE ]] || die "nothing staged"
+    # No argument: re-check against what was recorded, which is the useful
+    # question after the image has sat on the card for a while.
+    record_hash "${1:-$( [[ -f $STAGE_SHA ]] && cat "$STAGE_SHA" )}"
+}
+
+cmd_stage(){
+    local src=${1:-}
+    [[ -n $src ]] || die "stage needs a file, URL, or - for stdin"
+
+    local want=${2:-}
+    case $src in
+        -)  say "reading from stdin"
+            cat > "$STAGE" || die "read failed" ;;
+        http://*|https://*)
+            command -v curl >/dev/null || die "curl is not installed"
+            say "downloading"
+            curl -fL --progress-bar -o "$STAGE" "$src" || die "download failed"
+            # A checksum published next to the image is worth far more than one
+            # computed from the copy we just pulled, so try for it.
+            if [[ -z $want ]] && curl -fsL -o /tmp/ota.sha "$src.sha256" 2>/dev/null; then
+                want=$(awk '{print $1; exit}' /tmp/ota.sha); rm -f /tmp/ota.sha
+            fi ;;
+        *)
+            [[ -f $src ]] || die "no such file: $src"
+            say "copying"
+            cp -f -- "$src" "$STAGE" || die "copy failed"
+            [[ -z $want && -f $src.sha256 ]] && want=$(awk '{print $1; exit}' "$src.sha256") ;;
+    esac
+
+    record_hash "$want"
+    inf "next: uconsole-ota dry-run   (rehearsal, writes nothing)"
+    inf "      uconsole-ota flash     (the real thing)"
+}
+
+arm(){
+    local mode=$1
+    [[ -f $STAGE ]]     || die "nothing staged -- run 'uconsole-ota stage <file>' first"
+    [[ -f $STAGE_SHA ]] || die "staged image has no recorded checksum -- re-stage it"
+    local size_kb=$(( $(staged_size) / 1024 ))
+    ram_ok "$size_kb" || die "image will not fit in RAM in early userspace ($RAM_WHY)"
+
+    say "verifying the staged image"
+    inf "reading $(human "$(staged_size)") back off the card..."
+    local got want
+    got=$(sha256sum "$STAGE" | cut -d' ' -f1)
+    want=$(cat "$STAGE_SHA")
+    [[ $got == "$want" ]] || die "staged image no longer matches its checksum -- re-stage it"
+    ok "checksum good"
+
+    printf 'IMAGE=%s\nSHA256=%s\nMODE=%s\n' "$STAGE" "$got" "$mode" > "$MARKER"
+    sync
+}
+
+cmd_dryrun(){
+    need_root dry-run
+    arm dry-run
+    say "armed for a dry run"
+    inf "The next boot will stage the image into RAM, decompress all of it and"
+    inf "throw it away. The card is not touched. Adds about 40s to that boot."
+    inf "Afterwards: sudo dmesg | grep uconsole-ota"
+    printf '\nReboot now? [y/N] '
+    read -r a; [[ $a == [yY]* ]] && systemctl reboot || inf "left armed; reboot when you like"
+}
+
+cmd_flash(){
+    need_root flash
+    local assume=${1:-}
+
+    if ! power_ok; then
+        die "refusing to arm: $POWER_WHY. Losing power during the write leaves a card that must be reflashed on another machine."
+    fi
+
+    arm write
+
+    say "ARMED TO FLASH"
+    inf "power: $POWER_WHY"
+    inf "On the next boot this machine will overwrite $(human "$(staged_size)") of"
+    inf "compressed image onto /dev/mmcblk0 -- the whole card, partition table"
+    inf "included. Everything currently on it is gone, including this filesystem."
+    inf ""
+    inf "The write takes about 90s and cannot be interrupted safely. If it fails"
+    inf "part-way the card must be reflashed from another computer."
+    inf ""
+    inf "'uconsole-ota cancel' disarms it. Anything you have not saved elsewhere,"
+    inf "save now."
+
+    if [[ $assume != --yes ]]; then
+        printf '\nType FLASH to confirm, anything else to disarm: '
+        read -r a
+        if [[ $a != FLASH ]]; then rm -f "$MARKER"; sync; say "disarmed"; return 0; fi
+    fi
+    say "rebooting into the flash"
+    systemctl reboot
+}
+
+cmd_cancel(){
+    need_root cancel
+    [[ -f $MARKER ]] && { rm -f "$MARKER"; sync; ok "disarmed"; } || ok "was not armed"
+    if [[ -f $STAGE ]]; then
+        printf 'Also delete the staged image (%s)? [y/N] ' "$(human "$(staged_size)")"
+        read -r a
+        [[ $a == [yY]* ]] && { rm -f "$STAGE" "$STAGE_SHA"; ok "staged image removed"; } \
+                          || inf "kept at $STAGE"
+    fi
+}
+
+case ${1:-status} in
+    status)  cmd_status ;;
+    stage)   shift; cmd_stage "${1:-}" "${2:-}" ;;
+    verify)  shift; cmd_verify "${1:-}" ;;
+    dry-run) cmd_dryrun ;;
+    flash)   shift; cmd_flash "${1:-}" ;;
+    cancel)  cmd_cancel ;;
+    -h|--help|help) sed -n '2,14p' "$0" | sed 's/^#[ ]\{0,1\}//' ;;
+    *) die "unknown command '${1}' -- try 'uconsole-ota --help'" ;;
+esac

@@ -431,33 +431,99 @@ done
 # blank is what switches the network off.
 check "VT recovery tool present"       "[[ -x $MNT/usr/local/bin/uconsole-unstick ]]"
 
-echo "-- OTA recovery hook, phase 0 (initramfs) --"
+echo "-- OTA reflash: initramfs hook, arming tool, cleanup --"
 # This code runs on EVERY boot, before the real root is used. A fault here does
 # not break an update, it breaks the machine -- on a device whose panel already
 # fails silently on cold boot, so a black screen will not say which fault it is.
-# These checks exist to keep phase 0 incapable of doing harm.
+# These checks exist to keep the hook incapable of doing harm.
 check "recovery script present"        "[[ -x $MNT/usr/local/bin/uconsole-ota-recovery ]]"
 check "recovery script parses"         "sh -n $MNT/usr/local/bin/uconsole-ota-recovery"
 # `set -e` would turn any unexpected failure into an early exit mid-way through,
 # which is the one thing this script must never do -- it has to reach its exit 0.
 check "recovery script does not set -e" "[[ \$(grep -cE '^set .*-[a-z]*e' $MNT/usr/local/bin/uconsole-ota-recovery) -eq 0 ]]"
 check "recovery script always exits 0" "[[ \$(grep -c 'exit 0' $MNT/usr/local/bin/uconsole-ota-recovery) -ge 3 ]]"
-# PHASE 0 IS OBSERVE-ONLY. No writing verb may appear until phase 2 lands.
-check "phase 0 writes nothing"         "[[ \$(grep -v '^[[:space:]]*#' $MNT/usr/local/bin/uconsole-ota-recovery | grep -cE '\\b(dd|mkfs|sfdisk|parted|gunzip)\\b') -eq 0 ]]"
-check "phase 0 mounts read-only"       "grep -q 'mount -o ro' $MNT/usr/local/bin/uconsole-ota-recovery"
+# The write is gated on the marker saying MODE=write, and every other value --
+# including a marker written before the field existed -- takes the identical path
+# with the output going to /dev/null. These three checks are that gate: that the
+# safe destination is the default, that the card is only ever the target inside
+# the gate, and that the image is never repartitioned (it carries its own table).
+check "dry run is the default"         "grep -q 'TARGET=/dev/null' $MNT/usr/local/bin/uconsole-ota-recovery"
+check "write is gated on MODE=write"   "grep -qE '^if \\[ \"\\\$OTA_MODE\" = \"write\" \\]' $MNT/usr/local/bin/uconsole-ota-recovery"
+check "hook repartitions nothing"      "[[ \$(grep -v '^[[:space:]]*#' $MNT/usr/local/bin/uconsole-ota-recovery | grep -cE '\\b(mkfs|sfdisk|parted)\\b') -eq 0 ]]"
+# Writing an unverified image is worse than not updating: it replaces a working
+# system with an unbootable one and the only recovery is physical.
+check "write refuses without a hash"   "grep -q 'MODE=write but carries no SHA256' $MNT/usr/local/bin/uconsole-ota-recovery"
+check "write refuses on low battery"   "grep -q 'battery_ok' $MNT/usr/local/bin/uconsole-ota-recovery"
+# On this PMIC the battery supply reports online=1 whenever a battery is fitted,
+# and the first version of both guards read that as "on AC" -- so the charge was
+# never checked. AC must be found by supply type. Code lines only (grep -c, not
+# -q, so pipefail cannot turn an early exit into a false failure): the comments
+# explaining the rule must not be what satisfies it.
+for f in uconsole-ota uconsole-ota-recovery; do
+    check "$f finds AC by supply type"  "[[ \$(grep -v '^[[:space:]]*#' $MNT/usr/local/bin/$f | grep -c 'Mains') -ge 1 ]]"
+    # Voltage, never the gauge -- the rule uconsole-battery-guard already follows.
+    check "$f gates on voltage"         "[[ \$(grep -v '^[[:space:]]*#' $MNT/usr/local/bin/$f | grep -c 'MIN_BATTERY_UV') -ge 2 ]]"
+done
+# gzip failing mid-stream while dd reports success would write a truncated image.
+# /bin/sh in an initramfs has no pipefail, hence the flag file.
+check "hook detects a gzip failure"    "grep -q 'gz.failed' $MNT/usr/local/bin/uconsole-ota-recovery"
+# dd can report success with gigabytes still in the page cache, and the reboot
+# straight afterwards would cut them off.
+check "write is flushed before reboot" "grep -q 'DD_CONV=conv=fsync' $MNT/usr/local/bin/uconsole-ota-recovery"
+# Both mounts of the card -- the vfat boot partition and the ext4 root -- are taken
+# read-only, so even a logic error cannot modify what is on it.
+check "hook mounts read-only"          "[[ \$(grep -c 'mount -o ro' $MNT/usr/local/bin/uconsole-ota-recovery) -ge 2 ]]"
+# The marker is a data file read off the card. Sourcing it would turn one bad line
+# into a command running as root in early userspace.
+check "hook does not source marker"    "[[ \$(grep -v '^[[:space:]]*#' $MNT/usr/local/bin/uconsole-ota-recovery | grep -cE '^[[:space:]]*(\\.|source)[[:space:]]') -eq 0 ]]"
+# Cleanup on SIGTERM matters because the timeout is how a hang ends: without it a
+# killed run would leave the root mounted from the initramfs into the real system.
+check "hook cleans up when killed"     "grep -q 'trap .*INT TERM' $MNT/usr/local/bin/uconsole-ota-recovery"
 # The interlock that stops the unit ever running on the real system.
 check "unit is initramfs-only"         "grep -q 'ConditionPathExists=/etc/initrd-release' $MNT/usr/lib/systemd/system/uconsole-ota-recovery.service"
-check "unit runs before the real root" "grep -q 'Before=initrd-root-fs.target' $MNT/usr/lib/systemd/system/uconsole-ota-recovery.service"
+# Naming sysroot.mount is the part that actually orders this ahead of the root
+# being mounted: systemd-fstab-generator gives that unit Before=initrd-root-fs.target
+# too, so sharing only the target leaves the two unordered against each other.
+check "unit runs before the real root" "grep -qE '^Before=.*sysroot\\.mount' $MNT/usr/lib/systemd/system/uconsole-ota-recovery.service"
+check "unit runs before the fs target" "grep -qE '^Before=.*initrd-root-fs\\.target' $MNT/usr/lib/systemd/system/uconsole-ota-recovery.service"
 # Nothing may Require it, or a failure would fail the boot instead of being logged.
 check "unit has a hang timeout"        "grep -q 'TimeoutStartSec=' $MNT/usr/lib/systemd/system/uconsole-ota-recovery.service"
+# And not a short one: a timeout that fires mid-write kills the write and lets the
+# boot carry on onto a half-written card. 300s was enough for the test card and
+# far too little for a class-10 one, so hold it at 20 minutes or more.
+check "timeout outlasts a slow write"  "grep -qE '^TimeoutStartSec=([2-9][0-9]|[1-9][0-9]{2,})min\$' $MNT/usr/lib/systemd/system/uconsole-ota-recovery.service"
+# Measured on hardware: a Type=oneshot without this ran the hook twice per boot,
+# because finishing returns it to inactive and a second pull-in restarts it.
+check "unit cannot re-run in a boot"   "grep -q '^RemainAfterExit=yes' $MNT/usr/lib/systemd/system/uconsole-ota-recovery.service"
+check "script has its own run-once guard" "grep -q '/run/uconsole-ota.ran' $MNT/usr/local/bin/uconsole-ota-recovery"
 check "mkinitcpio hook installed"      "[[ -x $MNT/etc/initcpio/install/uconsole-ota ]]"
 check "hook listed in HOOKS"           "grep -qE '^HOOKS=.*uconsole-ota' $MNT/etc/mkinitcpio.conf"
 # The hook being present is not the same as it having run: an install hook that
 # is not listed in HOOKS is a silent no-op, so assert the built artefact.
 for f in usr/local/bin/uconsole-ota-recovery usr/lib/systemd/system/uconsole-ota-recovery.service usr/lib/systemd/system/initrd-root-fs.target.wants/uconsole-ota-recovery.service; do
-    check "initramfs carries $(basename "$f")" \
+    # ${f##*/system/}, not basename: the unit and its .wants symlink share a name,
+    # and two identical labels hide which of the two is actually missing.
+    check "initramfs carries ${f##*/system/}" \
           "chroot $MNT /usr/bin/lsinitcpio /boot/initramfs-linux-uconsole-cm5-git.img 2>/dev/null | grep -qx '$f'"
 done
+
+check "arming tool present"            "[[ -x $MNT/usr/local/bin/uconsole-ota ]]"
+check "arming tool parses"             "bash -n $MNT/usr/local/bin/uconsole-ota"
+# The split that makes this safe: the userspace side only ever stages a file and
+# writes a marker. Every block-device verb lives in the initramfs script, where
+# the root is unmounted first.
+check "arming tool touches no device"  "[[ \$(grep -v '^[[:space:]]*#' $MNT/usr/local/bin/uconsole-ota | grep -cE '\\b(dd|mkfs|sfdisk|parted)\\b') -eq 0 ]]"
+# Arming the real write is the one irreversible act on this side.
+check "flash refuses without power"    "grep -q 'refusing to arm' $MNT/usr/local/bin/uconsole-ota"
+check "flash needs typed confirmation" "grep -q 'Type FLASH to confirm' $MNT/usr/local/bin/uconsole-ota"
+# The loop-breaker. Without it a failed update re-stages on every boot and fires
+# an unattended write the moment the battery guard stops refusing.
+check "stale-marker cleanup present"   "[[ -x $MNT/usr/local/bin/uconsole-ota-cleanup ]]"
+check "stale-marker cleanup parses"    "sh -n $MNT/usr/local/bin/uconsole-ota-cleanup"
+check "cleanup enabled"                "[[ -L $MNT/etc/systemd/system/multi-user.target.wants/uconsole-ota-cleanup.service ]]"
+# The mirror of the recovery unit's interlock: that one only in the initramfs,
+# this one only on the real system.
+check "cleanup is real-system-only"    "grep -q 'ConditionPathExists=!/etc/initrd-release' $MNT/usr/lib/systemd/system/uconsole-ota-cleanup.service"
 
 echo "-- low-power blank (Stage 1) --"
 check "lowpower policy ships"          "[[ -f $MNT/etc/uconsole/lowpower.conf ]]"
