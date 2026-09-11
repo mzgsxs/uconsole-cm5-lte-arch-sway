@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # uconsole-modem-power {enable|disable|status}
 #
-# Powers the uConsole 4G module (SIMCOM SIM7600G-H) on Raspberry Pi CM5.
+# Powers the uConsole 4G module (SIMCOM SIM7600G-H) on and off, on Raspberry Pi
+# CM5.
 #
 # Replaces the GPIO handling in the vendor uconsole-4g-cm5.sh, which is broken
 # on CM5 + libgpiod v2 for two independent reasons:
@@ -12,15 +13,41 @@
 #      the chip to be passed with -c, and parses a bare first argument as a
 #      line=value pair -> "gpioset: invalid line value: 'gpiochip0'".
 #
-# It also holds the power line with 'gpioset -z' (daemonize). In libgpiod v2 a
-# line's output state is only guaranteed while the requesting process lives, so
-# a plain gpioset would set the pin, exit, release it, and drop modem power.
+# WHAT THE TWO LINES ACTUALLY DO (measured on this unit, 2026-09-11)
+#
+# The vendor names them POWER_MCU (24) and RESET_MCU (15), and this script used
+# to treat 24 as the module's supply: 'enable' held it at 1, and 'disable'
+# released it and assumed power dropped. That is not what happens:
+#
+#   line 24 is the module's POWER KEY, pressed at 1. Pressing it for 3 s powered
+#     a running SIM7600 down: it left USB 22 s later -- its own orderly shutdown,
+#     network detach first -- and stayed off. Held at 1 from boot it is a key
+#     held down, which these modules treat as "stay on". Driving it to 0 under a
+#     running module does nothing; it only lets go of the key.
+#   line 15 is RESET. Asserted for 3 s, the module dropped off USB and
+#     re-enumerated 8 s later.
+#
+# Nor does releasing a line change anything. pinctrl-rp1 defaults to
+# persist_gpio_outputs=Y, and rp1_pmx_free() then leaves a freed GPIO driving its
+# last level ("Return all pins to GPIO_IN, unless persist_gpio_outputs is set").
+#
+# So 'enable' and 'disable' PRESS the key, the way a finger would -- up first,
+# since a key held since power-on is not a new press -- and then hold it up with
+# a gpioset daemon. The daemon keeps the idle level defined even with
+# pinctrl_rp1.persist_gpio_outputs=n, where a freed line would float and could
+# press the key by itself. Both verbs then check the result on the USB bus
+# instead of trusting the GPIO write, which is how the old 'disable' went
+# unnoticed: it reported success while the modem stayed registered and
+# connected.
 set -euo pipefail
 
-PWR_LINE=24          # POWER_MCU
-PWRKEY_LINE=15       # RESET_MCU / PWRKEY
+PWRKEY_LINE=24       # vendor name POWER_MCU; behaves as the power key
+RESET_LINE=15        # vendor name RESET_MCU
 MODEM_VID=1e0e       # SimTech
 CONSUMER=uconsole-modem
+ON_PRESS_MS=1500     # power on: at least 0.5 s, and short of the 2.5 s that powers off
+OFF_PRESS_MS=3000    # power off: at least 2.5 s
+OFF_WAIT_S=45        # measured: gone from USB 22 s after the press
 
 log() { printf '[uconsole-modem-power] %s\n' "$*"; }
 
@@ -39,42 +66,139 @@ modem_present() {
     grep -qs "$MODEM_VID" /sys/bus/usb/devices/*/idVendor 2>/dev/null
 }
 
-holder_pid() { pgrep -f "gpioset.*${CONSUMER}" || true; }
+# Anchored on the program name: an unanchored pattern also matches any shell
+# whose command line merely contains it, and then gets killed as a "holder".
+HOLDER_RE="^(/usr/bin/)?gpioset .*${CONSUMER}"
+
+holder_pids() { pgrep -f "$HOLDER_RE" || true; }
+
+held_level() {   # the level the current holder was started with, from its argv
+    # gpioset splits its "24=1" argument in place, so the process list shows
+    # "24 1". Accept either form.
+    pgrep -af "$HOLDER_RE" 2>/dev/null \
+        | awk -v l="$PWRKEY_LINE" '{
+              for (i = 2; i <= NF; i++) {
+                  if ($i == l && $(i + 1) ~ /^[01]$/) { print $(i + 1); exit }
+                  if ($i ~ "^" l "=[01]$") { split($i, a, "="); print a[2]; exit }
+              }
+          }' \
+        || true
+}
+
+stop_holders() {
+    local p
+    for p in $(holder_pids); do kill "$p" 2>/dev/null || true; done
+    # gpioset owns the line until it has exited; requesting it again before then
+    # fails with EBUSY.
+    for _ in $(seq 1 20); do [[ -z $(holder_pids) ]] && return 0; sleep 0.1; done
+    log "WARNING: a holder of line $PWRKEY_LINE did not exit"
+}
+
+hold_line() {   # 0|1 -- drive the key line and keep holding it
+    # -z detaches and holds the line for the life of the daemon.
+    gpioset -z -C "$CONSUMER" -c "$CHIP" "${PWRKEY_LINE}=$1"
+}
+
+press_key() {   # ms -- one press: up 0.5 s, down for ms, up; then hold it up
+    stop_holders
+    # One process for the whole sequence. Separate gpioset calls would release
+    # the line between them, and with persistence off it would float.
+    gpioset -C "$CONSUMER" -c "$CHIP" -t "500,$1,0" "${PWRKEY_LINE}=0"
+    hold_line 0
+}
+
+mm_index() {
+    timeout 5 mmcli -L 2>/dev/null | grep -o '/Modem/[0-9]*' | head -1 | tr -d '/A-Za-z' || true
+}
+
+shutting_down() { [[ $(systemctl is-system-running 2>/dev/null) == stopping ]]; }
 
 case "${1-status}" in
 enable)
     if modem_present; then log "modem already enumerated"; exit 0; fi
     CHIP=$(find_chip)
     [[ -n $CHIP ]] || { log "ERROR: no usable gpiochip found"; exit 1; }
-    log "using $CHIP, line $PWR_LINE"
-    if [[ -z $(holder_pid) ]]; then
-        # -z detaches and holds the line for the life of the daemon.
-        gpioset -z -C "$CONSUMER" -c "$CHIP" "${PWR_LINE}=1" \
-            || { log "ERROR: gpioset failed"; exit 1; }
-    fi
-    log "power asserted; waiting for USB enumeration"
+    log "using $CHIP; pressing the power key (line $PWRKEY_LINE) for ${ON_PRESS_MS} ms"
+    press_key "$ON_PRESS_MS" || { log "ERROR: gpioset failed"; exit 1; }
+    log "waiting for USB enumeration"
     for _ in $(seq 1 30); do modem_present && break; sleep 2; done
     if modem_present; then
         log "SIM7600 enumerated"
     else
-        # Some units need an explicit PWRKEY pulse in addition to the rail.
-        log "no enumeration yet; pulsing PWRKEY (line $PWRKEY_LINE)"
-        # One process for the whole pulse: high, hold 1s, low, exit. Splitting
-        # this into two gpioset calls would release the line in between and let
-        # the pin float.
-        gpioset -c "$CHIP" -t 1000,0 "${PWRKEY_LINE}=1" 2>/dev/null || true
+        # A module that is powered but wedged ignores the key; reset it.
+        log "no enumeration yet; pulsing RESET (line $RESET_LINE)"
+        # One process for the whole pulse: high, hold 1s, low, exit.
+        gpioset -c "$CHIP" -t 1000,0 "${RESET_LINE}=1" 2>/dev/null || true
         for _ in $(seq 1 20); do modem_present && break; sleep 2; done
         modem_present || { log "ERROR: modem never appeared on USB"; exit 1; }
-        log "SIM7600 enumerated after PWRKEY pulse"
+        log "SIM7600 enumerated after a reset"
     fi
     ;;
 disable)
-    p=$(holder_pid); [[ -n $p ]] && { kill $p; log "released power line (pid $p)"; }
+    CHIP=$(find_chip)
+    [[ -n $CHIP ]] || { log "ERROR: no usable gpiochip found"; exit 1; }
+    if ! modem_present; then
+        # Already off -- but make sure the key is not held down: the old
+        # 'enable' held it pressed, and a module that sees that powers up.
+        stop_holders
+        hold_line 0
+        log "modem already off (not on USB); power key released"
+        exit 0
+    fi
+    if shutting_down; then
+        # This unit stops after ModemManager, so there is nobody to ask, and a
+        # poweroff must not wait ~25 s for the module. Press and return; it
+        # finishes its own shutdown alongside the machine's.
+        log "system is shutting down: pressing the power key, not waiting"
+        press_key "$OFF_PRESS_MS" || true
+        exit 0
+    fi
+    # A module that has only just powered up ignores its key until it has
+    # booted. Measured: a press 9 s after power-on did nothing, and one a minute
+    # later worked. ModemManager listing it is the sign that it is up, and
+    # waiting for that also lets the radio be taken off the air first.
+    for _ in $(seq 1 15); do [[ -n $(mm_index) ]] && break; sleep 2; done
+    for attempt in 1 2; do
+        idx=$(mm_index)
+        if [[ -n $idx ]] && timeout 10 mmcli -m "$idx" --set-power-state-low >/dev/null 2>&1; then
+            log "radio set to low power (ModemManager modem $idx)"
+        fi
+        log "pressing the power key (line $PWRKEY_LINE) for ${OFF_PRESS_MS} ms"
+        press_key "$OFF_PRESS_MS" || { log "ERROR: gpioset failed"; exit 1; }
+        log "waiting for the module to power down (it detaches first: ~20 s)"
+        for _ in $(seq 1 "$OFF_WAIT_S"); do modem_present || break; sleep 1; done
+        modem_present || { log "SIM7600 powered off"; exit 0; }
+        # Still up after twice the longest shutdown measured, so the press was
+        # not taken. The module is on, so another press can only power it off.
+        (( attempt == 1 )) && log "still on USB after ${OFF_WAIT_S} s; pressing again"
+    done
+    log "ERROR: the power key was pressed twice but the SIM7600 is still on USB"
+    exit 1
     ;;
 status)
     modem_present && echo "modem: enumerated" || echo "modem: absent"
-    p=$(holder_pid); [[ -n $p ]] && echo "power hold: pid $p" || echo "power hold: none"
-    echo "gpiochip: $(find_chip)"
+    CHIP=$(find_chip)
+    echo "gpiochip: ${CHIP:-none found (reading chips needs root)}"
+    p=$(holder_pids | tr '\n' ' ')
+    if [[ -n ${p// /} ]]; then
+        case "$(held_level)" in
+            0) key="up" ;;
+            1) key="HELD DOWN" ;;
+            *) key="held at an unknown level" ;;
+        esac
+        echo "power key (line $PWRKEY_LINE): $key, by pid ${p% }"
+    elif [[ -n $CHIP ]] && v=$(gpioget -a -c "$CHIP" "$PWRKEY_LINE" 2>/dev/null); then
+        # Nobody holds it. Read it without changing its direction: with
+        # persist_gpio_outputs it is still driving whatever it last drove.
+        echo "power key (line $PWRKEY_LINE): not held, reads $v"
+    else
+        echo "power key (line $PWRKEY_LINE): not held"
+    fi
+    idx=$(mm_index)
+    if [[ -n $idx ]]; then
+        echo "ModemManager: modem $idx, power state $(timeout 5 mmcli -m "$idx" 2>/dev/null | awk -F': *' '/power state/ {print $2; exit}')"
+    fi
+    echo "persist_gpio_outputs: $(cat /sys/module/pinctrl_rp1/parameters/persist_gpio_outputs 2>/dev/null || echo unknown)"
     ;;
 *)
     echo "usage: $0 {enable|disable|status}" >&2; exit 2 ;;

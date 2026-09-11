@@ -219,6 +219,17 @@ check "modem power script present"     "[[ -x $MNT/usr/local/bin/uconsole-modem-
 check "modem power detects chip by label" "grep -q 'pinctrl-rp1' $MNT/usr/local/bin/uconsole-modem-power"
 check "modem power holds the line (-z)"   "grep -q 'gpioset -z' $MNT/usr/local/bin/uconsole-modem-power"
 check "modem power uses libgpiod v2 -c"   "grep -q 'gpioset -z -C .* -c ' $MNT/usr/local/bin/uconsole-modem-power"
+# Line 24 is the module's power key, not its supply (measured): releasing it
+# does nothing, and pinctrl-rp1's persist_gpio_outputs keeps a freed line at its
+# last level anyway. The old 'disable' did only that, and the modem stayed
+# registered and connected. It has to be PRESSED, then held up, and the result
+# checked on the USB bus.
+check "modem disable presses the power key" "grep -qF 'press_key \"\$OFF_PRESS_MS\"' $MNT/usr/local/bin/uconsole-modem-power"
+check "modem key is held up between presses" "grep -qF 'hold_line 0' $MNT/usr/local/bin/uconsole-modem-power"
+check "modem disable checks the USB bus"  "grep -qF 'still on USB' $MNT/usr/local/bin/uconsole-modem-power"
+# The module takes ~22 s to power down. Waiting for it on every poweroff would
+# add that to each shutdown, the battery guard's included.
+check "modem disable does not wait at shutdown" "grep -qF 'is-system-running' $MNT/usr/local/bin/uconsole-modem-power"
 # Only assert on live code: the script's header comment quotes the vendor bug
 # it replaces, so a naive grep matches the explanation rather than the defect.
 check "no hardcoded gpiochip0 in live code" "! grep -vE '^[[:space:]]*#' $MNT/usr/local/bin/uconsole-modem-power | grep -q gpiochip0"
