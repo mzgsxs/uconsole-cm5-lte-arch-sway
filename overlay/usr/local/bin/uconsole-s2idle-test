@@ -618,6 +618,14 @@ do_run() {
     echo "Results are written to $RESULTS as they are taken, so a hang loses nothing."
     echo
 
+    # ONE low-power descent for both phases. Coming up between them restarts the
+    # modem through uconsole-modem-wake, which runs for up to three minutes in the
+    # background and can still be bringing the radio up when the second descent
+    # asks for it down -- and then the phases are not in the same state, which is
+    # the one thing the comparison needs.
+    (( MODEM_LOW )) && { mmcli -m 0 --set-power-state-low >/dev/null 2>&1; say "modem radio set low"; }
+    /usr/local/bin/uconsole-lowpower down >/dev/null 2>&1
+
     if (( on_ac )); then
         echo "On AC: a survival run only. No drain figures, and no awake phase."
     else
@@ -625,19 +633,15 @@ do_run() {
         # Phase 1: the machine as it already behaves -- blanked but awake. This is
         # the control, and the only figure s2idle has to beat.
         echo "== phase 1/2: blanked, awake (the current low-power blank)"
-        /usr/local/bin/uconsole-lowpower down >/dev/null 2>&1
         local a1 a2
         a1=$(read_gauge); rec "awake_before=$a1"
         sleep "$secs"
         a2=$(read_gauge); rec "awake_after=$a2"
-        /usr/local/bin/uconsole-lowpower up >/dev/null 2>&1
         say "gauge $a1 -> $a2"
         echo
     fi
 
     echo "== s2idle"
-    (( MODEM_LOW )) && { mmcli -m 0 --set-power-state-low >/dev/null 2>&1; say "modem radio set low"; }
-    /usr/local/bin/uconsole-lowpower down >/dev/null 2>&1
     say "mem_sleep forced to: $(force_s2idle)"
 
     if (( PRINT_TIMES )); then

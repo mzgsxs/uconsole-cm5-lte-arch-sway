@@ -611,6 +611,11 @@ check "s2idle test darkens the screen for a drain run" \
 # logind were both killed on waking from a 20-minute sleep.
 check "s2idle test pauses service watchdogs for a sleep" \
       "grep -qF 'systemctl service-watchdogs no' $MNT/usr/local/bin/uconsole-s2idle-test"
+# One low-power descent for both drain phases. Coming up between them restarts
+# the modem in the background, so the second phase could begin in a different
+# state from the first -- the one thing the comparison cannot allow.
+check "s2idle test descends once for both phases" \
+      "[[ \$(grep -v '^[[:space:]]*#' $MNT/usr/local/bin/uconsole-s2idle-test | grep -c 'uconsole-lowpower down') -eq 1 ]]"
 # The config ships PANEL_OFF_ON_BLANK=0; a conf that predates the option must
 # not get the risky behaviour by default either.
 check "screen toggle defaults the panel power-down off" \
