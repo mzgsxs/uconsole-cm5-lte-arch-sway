@@ -616,6 +616,13 @@ check "s2idle test pauses service watchdogs for a sleep" \
 # state from the first -- the one thing the comparison cannot allow.
 check "s2idle test descends once for both phases" \
       "[[ \$(grep -v '^[[:space:]]*#' $MNT/usr/local/bin/uconsole-s2idle-test | grep -c 'uconsole-lowpower down') -eq 1 ]]"
+# energy_now is the gauge's percentage times the pack -- 1 % steps, far too
+# coarse for a 20-minute phase. The awake phase must be SAMPLED, and the sleep
+# measured by the voltage at its edges against that calibration.
+check "s2idle test samples power while awake" \
+      "grep -qF 'sample_mean power_now' $MNT/usr/local/bin/uconsole-s2idle-test"
+check "s2idle test takes a voltage edge after the sleep" \
+      "grep -qF 'v_edge v2' $MNT/usr/local/bin/uconsole-s2idle-test"
 # The config ships PANEL_OFF_ON_BLANK=0; a conf that predates the option must
 # not get the risky behaviour by default either.
 check "screen toggle defaults the panel power-down off" \

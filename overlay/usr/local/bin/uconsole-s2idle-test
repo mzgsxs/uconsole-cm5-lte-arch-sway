@@ -433,6 +433,38 @@ swd_restore() {
     SWD_SAVED=""
 }
 
+### battery sampling ------------------------------------------------------------
+# energy_now is only the AXP's percentage times the pack: 1 % steps of 0.26 Wh,
+# ~0.8 W of uncertainty over a 20-minute phase -- too coarse to tell a blank
+# from a sleep. The PMIC's coulomb counters read zero (CC_CTRL 0xc0), and on the
+# AXP228 family bits of that register drive fuel-gauge calibration, so they are
+# not ours to reprogram. What is left is power_now, exact but instantaneous and
+# only readable awake, and the battery voltage.
+#
+# So the awake phase is measured by sampling power_now throughout, and both
+# phases by the voltage at their edges, each taken under the same blanked, awake
+# load after settling. Over a few percent of charge the discharge curve is close
+# to linear, so charge used scales with voltage lost, and the awake phase's
+# sampled energy calibrates that scale for the sleep. Recovery after the sleep's
+# lighter load reads slightly high, which flatters s2idle a little.
+sample_mean() {   # attribute seconds -- integer mean of 1 Hz samples
+    local n=$2 s=0 i
+    for (( i = 0; i < n; i++ )); do
+        s=$(( s + $(cat "$B/$1" 2>/dev/null || echo 0) ))
+        sleep 1
+    done
+    echo $(( s / n ))
+}
+v_edge() {   # label settle_seconds -- settle, then record the voltage and when
+    sleep "$2"
+    local t v
+    t=$(( $(date +%s) + 15 ))          # the middle of the 30 s window
+    v=$(sample_mean voltage_now 30)
+    rec "${1}_uv=$v"
+    rec "${1}_t=$t"
+    rec "${1}_pct=$(cat "$B/capacity" 2>/dev/null)"
+}
+
 ### cleanup -------------------------------------------------------------------
 # Whatever happens, leave the machine as it was found: no pm_test level armed,
 # the screen lit again, the watchdogs back at their configured values, the kernel
@@ -633,11 +665,16 @@ do_run() {
         # Phase 1: the machine as it already behaves -- blanked but awake. This is
         # the control, and the only figure s2idle has to beat.
         echo "== phase 1/2: blanked, awake (the current low-power blank)"
-        local a1 a2
+        # The battery was under a heavier load until the descent; let its voltage
+        # recover before taking the first edge.
+        say "settling 3 min, then sampling"
+        v_edge v0 180
+        local a1 a2 pa
         a1=$(read_gauge); rec "awake_before=$a1"
-        sleep "$secs"
+        pa=$(sample_mean power_now "$secs"); rec "awake_power_uw=$pa"
         a2=$(read_gauge); rec "awake_after=$a2"
-        say "gauge $a1 -> $a2"
+        v_edge v1 0
+        say "gauge $a1 -> $a2, mean power $(awk -v p="$pa" 'BEGIN{printf "%.3f", -p/1e6}') W"
         echo
     fi
 
@@ -694,6 +731,9 @@ do_run() {
     rec "wakeup_irq=$(cat /sys/power/pm_wakeup_irq 2>/dev/null || echo none)"
     rec "wake_sources=$(ws_fired "$ws0")"
     rec "survived_wake=yes"
+    # The sleep's closing voltage edge, under the same blanked, awake load as the
+    # other two -- so nothing is brought back up until it has been taken.
+    (( on_ac )) || { say "settling 2 min after the wake, then sampling"; v_edge v2 120; }
     wd_restore
     keep_log "run"
 
@@ -761,6 +801,30 @@ do_report_file() {
         fi
     else
         printf '  %-22s %s\n' "s2idle" "NO RESULT -- the machine did not survive the suspend"
+    fi
+
+    # The figures that can actually tell the two apart: see "battery sampling".
+    local v0 v1 v2 t0 t1 t2 pa
+    v0=$(v v0_uv); v1=$(v v1_uv); v2=$(v v2_uv)
+    t0=$(v v0_t); t1=$(v v1_t); t2=$(v v2_t); pa=$(v awake_power_uw)
+    if [[ -n $v0 && -n $v1 && -n $v2 && -n $t0 && -n $t1 && -n $t2 && -n $pa && -n $slept ]]; then
+        echo
+        awk -v v0="$v0" -v v1="$v1" -v v2="$v2" -v t0="$t0" -v t1="$t1" -v t2="$t2" \
+            -v pa="$pa" -v sl="$slept" 'BEGIN {
+            P  = -pa / 1e6                  # blanked, awake: W, sampled every second
+            dA = v0 - v1; dB = v1 - v2      # uV lost across each span
+            if (dA <= 0 || sl <= 0) { print "  voltage method: no drop across the awake span, nothing to calibrate with"; exit }
+            EA = P * (t1 - t0) / 3600       # Wh across the awake span
+            EB = EA * dB / dA               # Wh across the span holding the sleep
+            Es = EB - P * ((t2 - t1) - sl) / 3600   # less the awake parts of that span
+            Ps = Es * 3600 / sl
+            printf "  %-22s %8.3f W   power_now, sampled every second\n", "blanked, awake", P
+            printf "  %-22s %8.3f W   %d uV lost across the sleep, %d uV across the awake span\n", "s2idle (from voltage)", Ps, dB, dA
+            printf "  %-22s %8.2f\n", "s2idle / blanked", Ps / P
+        }'
+        echo "  The voltage figure assumes the discharge curve is linear over a few percent,"
+        echo "  and recovery after the sleep's lighter load reads slightly high: it flatters"
+        echo "  s2idle a little."
     fi
     echo
     echo "  Only the DIFFERENCE is meaningful. Expect it to be small: Pi 5 has no"
