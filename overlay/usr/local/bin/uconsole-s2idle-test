@@ -85,7 +85,12 @@ BREADCRUMB=/var/lib/uconsole/s2idle-attempt
 # machine wedged while printing the summary, so the report existed only on a
 # stdout nobody could read any more. Anything learned before the hang must be on
 # disk before the hang.
-RESULTS=/var/lib/uconsole/s2idle-results
+# Overridable so a SAVED run can be re-priced without touching the live log:
+#   RESULTS=/tmp/run-of-the-11th uconsole-s2idle-test report
+# Re-analysis is a real need -- the pricing method has changed twice -- and the
+# alternative is editing records into a file that is supposed to be what the
+# machine actually measured.
+RESULTS=${RESULTS:-/var/lib/uconsole/s2idle-results}
 # The kernel log of each attempt, cut at a marker and synced the same way.
 LOGDIR=/var/lib/uconsole/s2idle-dmesg
 MINUTES=20
@@ -443,10 +448,20 @@ swd_restore() {
 #
 # So the awake phase is measured by sampling power_now throughout, and both
 # phases by the voltage at their edges, each taken under the same blanked, awake
-# load after settling. Over a few percent of charge the discharge curve is close
-# to linear, so charge used scales with voltage lost, and the awake phase's
-# sampled energy calibrates that scale for the sleep. Recovery after the sleep's
-# lighter load reads slightly high, which flatters s2idle a little.
+# load after settling -- the same load at every edge, so the pack's own IR step
+# cancels in the differences instead of having to be modelled.
+#
+# Turning those voltages into energy is the part that needed a real measurement.
+# The original method priced the sleep by scaling its voltage drop by the awake
+# span's Wh-per-volt, which assumes ONE slope across both spans. The calibrated
+# pack says the slope runs 58.6 Wh/V at 4.00 V, ~37 at 3.90 and ~30 by 3.75, so
+# two spans straddling a bend are mispriced by up to 1.6x -- about the size of
+# the spread these runs kept reporting. uconsole-battery-calibrate's table.tsv
+# holds the measured curve, so the edges are looked up in it instead.
+#
+# The current at each edge is recorded for that lookup: correcting a loaded
+# voltage to an OCV shifts it by ~61 mV at 0.9 A, more than one bin of the table,
+# so which part of the curve applies depends on it.
 sample_mean() {   # attribute seconds -- integer mean of 1 Hz samples
     local n=$2 s=0 i
     for (( i = 0; i < n; i++ )); do
@@ -455,12 +470,25 @@ sample_mean() {   # attribute seconds -- integer mean of 1 Hz samples
     done
     echo $(( s / n ))
 }
-v_edge() {   # label settle_seconds -- settle, then record the voltage and when
+# Wh remaining at an edge, from the calibrated pack. Empty when the pack has
+# never been characterised -- the run is still valid, it just cannot be priced.
+soc_wh() {   # voltage_uv current_ua
+    /usr/local/bin/uconsole-battery-calibrate soc "$1" "$2" 2>/dev/null \
+        | awk -F= '$1 == "left_wh" { print $2 }'
+}
+v_edge() {   # label settle_seconds -- settle, then record voltage, current, time
     sleep "$2"
-    local t v
+    # Voltage AND current in one 30 s window rather than two: the edge has to be
+    # a single instant in the discharge, and the pair is what the table needs.
+    local t k n=30 sv=0 si=0
     t=$(( $(date +%s) + 15 ))          # the middle of the 30 s window
-    v=$(sample_mean voltage_now 30)
-    rec "${1}_uv=$v"
+    for (( k = 0; k < n; k++ )); do
+        sv=$(( sv + $(cat "$B/voltage_now" 2>/dev/null || echo 0) ))
+        si=$(( si + $(cat "$B/current_now" 2>/dev/null || echo 0) ))
+        sleep 1
+    done
+    rec "${1}_uv=$(( sv / n ))"
+    rec "${1}_ua=$(( si / n ))"
     rec "${1}_t=$t"
     rec "${1}_pct=$(cat "$B/capacity" 2>/dev/null)"
 }
@@ -842,6 +870,59 @@ do_report_file() {
         echo "  The voltage figure assumes the discharge curve is linear over a few percent,"
         echo "  and recovery after the sleep's lighter load reads slightly high: it flatters"
         echo "  s2idle a little."
+    fi
+
+    # The same edges, priced with the measured pack instead of with the awake
+    # span's own voltage drop -- and, unlike the figure above, carrying a check
+    # that assumes nothing. The awake span's energy is known independently from
+    # power_now sampled every second; if the table reproduces THAT, it can be
+    # trusted for the sleep span, where no such sampling is possible because
+    # userspace is frozen.
+    #
+    # That check earns its place. Re-pricing the 1201 s run of 2026-09-11: the
+    # table made the awake span 2.614 W where power_now sampled 3.280 W, 20% low,
+    # so its 0.420 W for the sleep was 0.634 W once corrected. That run sat at
+    # OCV 4.05-4.02 V -- the steepest and thinnest part of the table, crossed
+    # quickly under 2.1 A while surface charge from the just-finished charge
+    # still held the voltage up. Both spans were inside one bin, so the bend the
+    # table was meant to catch never arose and the in-run scale was the better
+    # estimate. The table is dense and trustworthy at 3.95-3.80 V; run there.
+    local i0 i1 i2 w0 w1 w2
+    i0=$(v v0_ua); i1=$(v v1_ua); i2=$(v v2_ua)
+    if [[ -n $v0 && -n $v1 && -n $v2 && -n $i0 && -n $i1 && -n $i2 && -n $pa && -n $slept ]]; then
+        w0=$(soc_wh "$v0" "$i0"); w1=$(soc_wh "$v1" "$i1"); w2=$(soc_wh "$v2" "$i2")
+        echo
+        awk -v w0="$w0" -v w1="$w1" -v w2="$w2" -v t0="$t0" -v t1="$t1" -v t2="$t2" \
+            -v pa="$pa" -v sl="$slept" 'BEGIN {
+            if (w0 == "" || w1 == "" || w2 == "") {
+                print "  calibrated pack: no table.tsv -- run uconsole-battery-calibrate to price these"
+                exit
+            }
+            P   = -pa / 1e6
+            ta  = t1 - t0
+            EA  = w0 - w1                          # awake span, from the table
+            EAm = P * ta / 3600                    # awake span, measured
+            EB  = w1 - w2                          # the span holding the sleep
+            Es  = EB - P * ((t2 - t1) - sl) / 3600 # less its awake parts
+            Ps  = Es * 3600 / sl
+            # The shape of the table, with the scale set in situ. Where the
+            # curve is locally linear this reduces exactly to the older method;
+            # where the spans straddle a bend it does not, and that is the case
+            # the older method gets wrong. Either way it absorbs a table that is
+            # off. (No apostrophes in here: this comment is inside a
+            # single-quoted awk program, and one would end it.)
+            k   = (EA > 0 && EAm > 0) ? EAm / EA : 0
+            Esc = k > 0 ? EB*k - P*((t2-t1)-sl)/3600 : 0
+            Psc = (k > 0 && sl > 0) ? Esc*3600/sl : 0
+            printf "  %-22s %8.3f W   the awake span, priced from the table\n", "table check", (ta > 0 ? EA*3600/ta : 0)
+            printf "  %-22s %8.3f W   the same span, sampled every second\n", "  vs power_now", (ta > 0 ? EAm*3600/ta : 0)
+            if (k > 0) printf "  %-22s %8.2f    1.00 is exact agreement\n", "  ratio", EA/EAm
+            printf "  %-22s %8.3f W   %.0f mWh over %ds\n", "s2idle (table raw)", Ps, Es*1000, sl
+            if (k > 0)
+                printf "  %-22s %8.3f W   table shape, scale from power_now  <- best\n", "s2idle (corrected)", Psc
+            if (k > 0 && (EA/EAm > 1.15 || EA/EAm < 0.87))
+                printf "  NOTE: the table is %.0f%% off power_now across a span where both are\n        valid. The corrected figure absorbs that; the raw one does not.\n        Prefer a run at 3.95-3.80 V, where the table is densest.\n", (EA/EAm-1)*100
+        }'
     fi
     echo
     echo "  Only the DIFFERENCE is meaningful. Expect it to be small: Pi 5 has no"

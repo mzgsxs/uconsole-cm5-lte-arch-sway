@@ -952,6 +952,9 @@ check "soc subcommand present"          "grep -q 'soc)     shift; do_soc' $MNT/u
 check "table carries its resistance"    "grep -q 'pack_resistance_ohm' $MNT/usr/local/bin/uconsole-battery-calibrate"
 check "soc corrects load to OCV"        "grep -qF 'ocv = uv/1e6 - (ua/1e6) * R' $MNT/usr/local/bin/uconsole-battery-calibrate"
 check "soc flags off-table lookups"     "grep -q 'clamped=' $MNT/usr/local/bin/uconsole-battery-calibrate"
+# harness prices its edges from that table rather than from one assumed slope.
+check "harness prices edges from table" "grep -q 'soc_wh' $MNT/usr/local/bin/uconsole-s2idle-test"
+check "harness records edge current"    "grep -qF '\${1}_ua=' $MNT/usr/local/bin/uconsole-s2idle-test"
 check "stops above the PMU cutoff"     "grep -q 'FLOOR_UV:-3500000' $MNT/usr/local/bin/uconsole-battery-calibrate"
 check "warns when the modem is powered" "grep -q 'modem_is_on' $MNT/usr/local/bin/uconsole-battery-calibrate"
 # The AXP223 driver never sets status=Full: measured at 4.213V / 100% / 5mA it
