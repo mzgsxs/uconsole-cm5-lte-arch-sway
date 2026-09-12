@@ -1,5 +1,45 @@
 # Changelog
 
+## The blank powers the DSI panel down: 0.714 W, and sway can bring it back
+
+`PANEL_OFF_ON_BLANK` is on by default. Powering the panel down — not merely dimming its
+backlight — is the largest single saving in the low-power path.
+
+| state | draw |
+|---|---|
+| screen on | 4.082 W |
+| blanked, panel powered down | **2.632 W** |
+
+**1.450 W, a 36 % saving**, measured on battery through the real power-key path. Isolating
+the panel alone, with the backlight already off in both states so the delta is the panel and
+its controller: **0.714 W**, repeatable to 0.018 W across a repeated state.
+
+This was believed impossible. Report S3.8 recorded the DSI panel as never waking from
+`dpms off`, so the blank dimmed the backlight instead for years. The panel was never the
+problem — re-enabling sway's output was, and no single command does it:
+
+| sequence | connector restored |
+|---|---|
+| `output DSI-2 power on` alone | 0/3 |
+| `output DSI-2 enable` alone | 0/3 |
+| **`power on` then `enable`** | **3/3** |
+
+The earlier investigation tried each command separately, saw each return `{"success": true}`
+and change nothing, and concluded the compositor was incapable. Best reading of why the pair
+works: `power on` sets the desired DPMS state without committing anything, and `enable`
+forces the output reconfigure that applies it.
+
+So the restore runs over sway IPC in the user-context wake path — no root, no VT switch, and
+none of the session-loss risk that held this option at 0. `uconsole-lowpower panel-on` keeps
+a VT bounce as a fallback for when no compositor socket is reachable, and it is now the
+worse path: it leaves sway reporting `"power": false` on a panel that is lit, which is why
+`panel_is_on` believes DRM instead. The wake path logs which route restored the panel.
+
+**No kernel change is involved.** A candidate patch to the cwu50 panel driver — clearing
+`prepared` when the unprepare DCS writes fail — turned out to be unnecessary here: on this
+hardware those writes do not fail (0 occurrences, against 11 successful re-initialisations),
+so the stock driver already re-prepares the panel correctly.
+
 ## Reflash over the network: `uconsole-ota`
 
 A full image no longer means carrying the card to another computer.

@@ -582,6 +582,17 @@ check "core offlining spares cpu0"     "[[ \$(grep -c 'cpu\[1-9\]\*/online' $MNT
 # reboot recovers. Shipping this on by default cripples the machine after the
 # first blank, silently, because the write on the way down reports success.
 check "core parking off by default"    "grep -q '^CPU_OFFLINE_CORES_ON_BLANK=0' $MNT/etc/uconsole/lowpower.conf"
+# The panel power-down, and more importantly its restore. The ORDER of those two
+# sway commands IS the fix -- each alone restored 0/3 cycles and the pair 3/3 --
+# so pin both, and pin that IPC is tried before the VT bounce, which is the path
+# that used to strand the session on a dead VT.
+check "panel power-down on by default" "grep -q '^PANEL_OFF_ON_BLANK=1' $MNT/etc/uconsole/lowpower.conf"
+check "panel restore uses sway IPC"    "grep -qF 'panel_on_ipc' $MNT/usr/local/bin/uconsole-screen-toggle"
+check "panel restore sends power on"   "grep -qF 'output \"\$out\" power on' $MNT/usr/local/bin/uconsole-screen-toggle"
+check "panel restore then sends enable" "grep -qF 'output \"\$out\" enable' $MNT/usr/local/bin/uconsole-screen-toggle"
+check "panel state read from DRM"      "grep -qF 'card*-DSI-*' $MNT/usr/local/bin/uconsole-screen-toggle"
+check "restore path is logged"         "grep -qF 'panel restored by \${_how' $MNT/usr/local/bin/uconsole-screen-toggle"
+check "root panel-on tries IPC first"  "grep -qF 'panel_on_ipc_as_user && return 0' $MNT/usr/local/bin/uconsole-lowpower"
 check "core bring-up is verified"      "grep -q 'stayed offline after writing 1' $MNT/usr/local/bin/uconsole-lowpower"
 check "hotplug selftest present"       "grep -q 'selftest-cores' $MNT/usr/local/bin/uconsole-lowpower"
 # Modem presence is the only direct evidence MODEM_OFF_ON_BLANK actually worked.
