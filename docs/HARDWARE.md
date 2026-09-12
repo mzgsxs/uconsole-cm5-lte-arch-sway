@@ -330,8 +330,16 @@ minutes asleep:
   0.63 W. That method reads low, because the battery recovers from the sleep's light load
   for longer than the 2 minutes it was given before the closing reading.
 
-That puts the sleep somewhere between ~0.6 and ~2.7 W. Narrowing it needs a longer sleep and
-a longer settle before the closing reading.
+That put the sleep somewhere between ~0.6 and ~2.7 W, and named the fix: a longer settle
+before the closing reading.
+
+**Settled, 2026-09-12: 3.14 W asleep against 3.51 W awake** — a saving of at most 11 %, and
+3.14 W is itself a lower bound. The suspicion above was the entire discrepancy. Given the
+full 600 s settle instead of 153 s, the same 20-minute sleep costs five times what the first
+run reported, and `energy_now` puts the two phases at 3.105 W and 3.108 W — unable to
+separate them at all. The recovery was logged at 10 s intervals: 3806 mV at the wake, 3782
+by 60 s, 3767 by 540 s, so a closing edge taken at 153 s sits 10–12 mV high and hides
+~0.6 Wh, about 1.75 W across the sleep. See "Power figures" below.
 
 The last two rows change what the old "a real s2idle never returns" result means. With no
 wake source and a 15 s watchdog, a perfect suspend and a hang look identical, so that result
@@ -373,6 +381,12 @@ Measured on this hardware:
   a 36 % saving**, measured on battery through the real power-key path. The panel and its
   controller are **0.714 W** of that, measured separately with the backlight already off in
   both states and repeatable to 0.018 W.
+- **s2idle, actually suspended: 3.14 W against 3.51 W for the same machine blanked but
+  awake** (2026-09-12, 1201 s sleep, OCV 3.905→3.828 V, table ratio 0.96). A saving of
+  **≤ 11 %, and the 3.14 W is a lower bound** — see below. The `energy_now` gauge puts the
+  two phases at 3.108 W and 3.105 W: over four 0.26 Wh steps each, it cannot tell them
+  apart at all. This is what "no cpuidle driver" costs: freezing userspace does not turn
+  off the SoC, the DSI panel or the RP1/USB tree, and there are no C-states to enter.
 - LTE connected but not routed ("hot standby"): ~0.1 W, ~4 MiB/month
 - LTE transmit burst: 4.4 A swing, 305 mV rail sag
 - Pack, **measured**: **4.47 Ah / 16.5 Wh** down to 3.50 V resting, **4.9 Ah / ~18 Wh** down

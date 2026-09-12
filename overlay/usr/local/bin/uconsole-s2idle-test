@@ -498,6 +498,17 @@ v_edge() {   # label settle_seconds -- settle, then record voltage, current, tim
 # against 19 mV across the awake span, a gap the recovery alone could account
 # for. So settle longer, and log the curve, so the remaining bias can be seen
 # instead of assumed.
+#
+# That suspicion was right, and it was the whole result. Logged 2026-09-12 at
+# 10 s intervals across the 600 s settle: 3806 mV at the wake, 3782 by 60 s,
+# 3779 by 120 s, 3767 by 540 s. Nearly all of the recovery is over within two
+# minutes, so a closing edge taken at 153 s -- as the run that reported 0.634 W
+# did -- sits 10-12 mV high, hiding ~0.6 Wh, or ~1.75 W across a 20-minute
+# sleep. Re-measured with the full settle the same sleep costs 3.14 W.
+#
+# 600 s is still not quite enough: the closing slope was 2.00 mV/min against
+# 1.55 mV/min for steady awake discharge. The residual can only bias the edge
+# upward, so every figure this produces is a LOWER bound on the sleep's drain.
 v_track() {   # seconds -- voltage and power every 10 s into s2idle-vtrack
     local f=/var/lib/uconsole/s2idle-vtrack end=$(( $(date +%s) + $1 ))
     : > "$f"
@@ -923,6 +934,11 @@ do_report_file() {
             if (k > 0 && (EA/EAm > 1.15 || EA/EAm < 0.87))
                 printf "  NOTE: the table is %.0f%% off power_now across a span where both are\n        valid. The corrected figure absorbs that; the raw one does not.\n        Prefer a run at 3.95-3.80 V, where the table is densest.\n", (EA/EAm-1)*100
         }'
+        echo "  Both are a LOWER BOUND on the sleep. A sleep lets the pack's overpotential"
+        echo "  decay, and it takes ~2 min under load to re-develop, so the closing edge"
+        echo "  settles from above; measured 2026-09-12, even 600 s left that edge falling at"
+        echo "  2.00 mV/min against 1.55 for steady awake discharge. The bias can only make"
+        echo "  the sleep look cheaper than it was -- never dearer."
     fi
     echo
     echo "  Only the DIFFERENCE is meaningful. Expect it to be small: Pi 5 has no"

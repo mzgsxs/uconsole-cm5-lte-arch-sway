@@ -1,5 +1,72 @@
 # Changelog
 
+## s2idle saves at most 11 %, and the 0.63 W that said otherwise was a settling artifact
+
+Measured 2026-09-12 in the part of the discharge curve the pack is actually characterised
+over: **3.14 W asleep against 3.51 W blanked but awake**, over a 1201 s sleep at OCV
+3.905→3.828 V. Three methods agree, which is the point of having built the third one:
+
+| method | asleep | awake |
+|---|---|---|
+| voltage × calibrated table, scale set in situ | 3.144 W | 3.512 W |
+| voltage × calibrated table, raw | 2.954 W | 3.379 W |
+| `energy_now` gauge | 3.105 W | 3.108 W |
+
+The gauge cannot separate them: four 0.26 Wh steps each, identical to the last µWh. And
+3.144 W is a **lower bound**, because the closing edge is still very slightly high.
+
+**The earlier 0.634 W was wrong, and the recovery log says exactly why.** After a sleep the
+pack's overpotential has decayed, and it takes about two minutes under load to re-develop;
+until it has, the closing voltage reads high and the sleep looks cheap. That run took its
+closing edge 153 s after the wake. Logged this time at 10 s intervals: 3806 mV at the wake,
+3782 by 60 s, 3767 by 540 s — so a 153 s edge sits ~10–12 mV high, which at 58 Wh/V hides
+~0.6 Wh, or ~1.75 W across a 20-minute sleep. Add that back and the old run lands where
+this one is.
+
+Even at 600 s the settle is not quite complete: the closing slope is 2.00 mV/min against
+1.55 mV/min for steady awake discharge. The residual biases the closing edge upward, so it
+can only make the sleep look *cheaper* than it is — hence "lower bound", and hence the
+saving is at most 11 % and may be nothing measurable.
+
+None of which is a defect. BCM2712 has no cpuidle driver, so s2idle freezes userspace and
+calls `default_idle_call()`; the SoC, DSI panel and RP1/USB tree draw what they drew before.
+The suspend path itself works — 1201 s, RTC wake, display, keyboard and Wi-Fi all intact.
+What it does not do is save power.
+
+## The pack holds 18 Wh above the cutoff, and the gauge is 35 points out
+
+A full calibration discharge, 90 minutes from full to 3.50 V, settled two open questions.
+
+**The pack.** 3828 mAh / 14.22 Wh reached the 3.50 V stop, but that stop came under a 2.3 A
+load, which hid 0.16 V. Corrected for the pack's own resistance it holds **4.47 Ah /
+16.5 Wh to 3.50 V resting, 4.9 Ah / ~18 Wh to the 3.40 V the guard cuts at**. That is the
+usable figure, and it is the one a runtime estimate needs.
+
+It is *not* comparable to the 7000 mAh / 25.9 Wh printed on two 3500 mAh cells. An 18650's
+rated capacity is measured down to roughly 2.7 V per cell, and this machine stops at
+3.40 V; the charge below that is real, just unreachable here. An earlier version of this
+entry read the difference as worn or overrated cells — that compared two different voltage
+windows, and this run says nothing about cell health.
+
+`PACK_WH` is now the measured 18.0, so runtime estimates stop being 44 % optimistic — not
+because the nameplate was wrong, but because about 8 Wh of it sits below a cutoff this
+device never crosses. The device tree still declares 7000 mAh, which the driver scales
+`capacity` and `energy_now` against; making those track usable charge instead is a policy
+choice rather than a bug fix, and needs a kernel rebuild.
+
+**The gauge.** Against the charge actually counted out of the pack it reads 10 points high
+at 82 % charge, 24 high at 43 %, and 35 high at 15 % — still claiming 49 % minutes before
+the guard fired. It cannot be corrected from here: `calibrate` and `charge_full_design` are
+read-only on this kernel.
+
+**`uconsole-battery-calibrate report` now derives all of this from the run.** It measures
+the pack's resistance from the load steps already in the log (68 mΩ from 48 of them),
+corrects every sample to its resting voltage, counts the charge and energy delivered,
+estimates what is left below the stop, and prints resting volts → charge left → true state
+of charge beside what the gauge claimed. The table is saved to
+`/var/lib/uconsole/battery-calibration/table.tsv`. It used to print only what the
+uncalibrated gauge had said at each voltage, which measured nothing.
+
 ## The CPU stuck at 1.5 GHz was powertop, not this image
 
 During a battery calibration the CPU ceiling was found at 1.5 GHz, its minimum. It came back
