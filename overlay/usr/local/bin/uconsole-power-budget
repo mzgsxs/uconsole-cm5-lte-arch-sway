@@ -1,0 +1,291 @@
+#!/usr/bin/env bash
+# uconsole-power-budget -- price one subsystem at a time, on the awake machine.
+#
+#   uconsole-power-budget list                  what can be priced
+#   uconsole-power-budget measure <name> [...]  price those
+#   uconsole-power-budget all                   price everything safe
+#   uconsole-power-budget backlight-curve       cost of each brightness step
+#   uconsole-power-budget noise [secs]          resolution floor, changes nothing
+#
+# WHY THIS EXISTS, AND WHY IT IS NOT uconsole-power-probe
+#
+# power-probe measures the BLANK DESCENT: awake -> blanked -> awake, the whole
+# bundle at once. That answered "is standby worth it" (yes, 1.45 W) and nothing
+# else. It cannot say where the remaining draw goes while the machine is in USE,
+# which is where a handheld actually spends its battery.
+#
+# This tool answers that, one subsystem at a time, and it is the reason the
+# ranking in HARDWARE.md is a measurement rather than a plausible story. The
+# first run overturned the ranking that was assumed: the backlight is worth more
+# than everything else in this file combined, and parking CPU cores -- long
+# assumed a saving worth having -- is worth nothing at all.
+#
+# A/B/A, BECAUSE A DISCHARGING PACK DRIFTS
+#
+# Draw is computed from the pack, which is emptying while we measure. Over a few
+# minutes that drift is close to linear, so every measurement brackets the B
+# state between two A windows and compares B against their MEAN. A single A/B
+# pair would charge the drift to the subsystem.
+#
+# Two things this cannot do, and says so rather than hiding:
+#   - It refuses on AC. Charging current swamps load current; the number would
+#     be confident and meaningless.
+#   - Per-sample noise here is ~190 mW (genuine activity, not ADC quantisation).
+#     30 s windows bring the A/B/A resolution to roughly +/-30 mW, but a state
+#     change that also shifts SoC TEMPERATURE moves leakage for minutes
+#     afterwards, which no bracketing removes. `noise` reports the floor, and
+#     anything under about 50 mW should be read as "not resolved".
+set -uo pipefail
+# Every numeric path below -- EPOCHREALTIME's separator, read -t, awk's sqrt --
+# follows LC_NUMERIC, so pin it before anything parses a number.
+export LC_ALL=C
+
+B=/sys/class/power_supply/axp20x-battery
+AC=/sys/class/power_supply/axp22x-ac/online
+BL=
+for _b in /sys/class/backlight/*; do
+    [[ -r $_b/brightness ]] && { BL=$_b; break; }
+done
+
+SECS=${SECS:-30}                 # per window
+SETTLE=${SETTLE:-8}              # discarded after a state change
+REPEATS=${REPEATS:-1}
+
+die()  { echo "uconsole-power-budget: $*" >&2; exit 1; }
+note() { printf '  %s\n' "$*"; }
+
+### sampling ----------------------------------------------------------------
+# Fork-free: one `read` per file per sample, integer accumulators, and a FIFO
+# read -t as the sleep. A forking loop costs measurable power on a machine whose
+# idle draw is what we are trying to resolve.
+exec 9<> <(:) 2>/dev/null || { _f=/tmp/.pb.$$; mkfifo "$_f"; exec 9<> "$_f"; rm -f "$_f"; }
+
+win() {  # $1=secs; sets W_MEAN W_SD W_MV (milliwatts, milliwatts, millivolts)
+    local secs=$1 n=0 sum=0 sumsq=0 vsum=0 v ua p
+    while (( n < secs )); do
+        IFS= read -r v  < "$B/voltage_now" || v=0
+        IFS= read -r ua < "$B/current_now" || ua=0
+        # mV * mA = uW; /1000 -> mW. current_now is negative while discharging,
+        # so negate to make "draw" positive.
+        p=$(( (v / 1000) * (ua / 1000) / -1000 ))
+        sum=$(( sum + p )); sumsq=$(( sumsq + p * p )); vsum=$(( vsum + v / 1000 ))
+        n=$(( n + 1 ))
+        read -t 1 -u 9 _ 2>/dev/null
+    done
+    W_MEAN=$(( sum / secs ))
+    local var=$(( sumsq / secs - W_MEAN * W_MEAN ))
+    W_SD=0; (( var > 0 )) && W_SD=$(awk -v x="$var" 'BEGIN{printf "%d", sqrt(x)}')
+    W_MV=$(( vsum / secs ))
+}
+
+preflight() {
+    [[ -r $B/voltage_now && -r $B/current_now ]] || die "no battery gauge at $B"
+    [[ $EUID -eq 0 ]] || die "must run as root (it writes sysfs)"
+    local ac=0; [[ -r $AC ]] && IFS= read -r ac < "$AC"
+    [[ $ac == 1 ]] && die "on AC -- unplug. Charging current makes every delta meaningless."
+    local on; IFS= read -r on < /sys/devices/system/cpu/online
+    [[ $on == 0-* ]] || note "WARNING: only cpu(s) '$on' online; reboot to restore before trusting load-dependent rows"
+}
+
+### the table ---------------------------------------------------------------
+# name|description|enter-B|leave-B
+#
+# B is always the LOW-POWER state where one exists, so a negative delta is a
+# saving. backlight is the exception: B is max brightness, because "what does
+# the backlight cost" is the question worth answering.
+# name|needs|settle|description|enter-B|leave-B
+#
+# `needs` is a command that must exist; the row is SKIPPED with a reason rather
+# than silently reporting a zero delta, which is what a missing helper produced
+# before this column existed.
+#
+# `settle` matters more than it looks. The modem takes about 22 s to leave the
+# USB bus after its power key is pressed and 8 s to come back; measuring it with
+# the default 8 s would average the transition into both windows and halve the
+# apparent saving.
+subsystems() {
+cat <<'TBL'
+backlight|-|8|backlight at maximum vs off|bl_set max|bl_set 0
+modem-off|uconsole-modem-power|35|modem powered down at its power key|uconsole-modem-power disable|uconsole-modem-power enable
+usb-autosuspend|-|10|USB autosuspend on every non-root-hub device|usb_ctl auto|usb_ctl on
+usb-kbd|-|10|USB autosuspend on the uConsole keyboard alone|usb_one 1eaf:0024 auto|usb_one 1eaf:0024 on
+usb-modem|-|10|USB autosuspend on the SIM7600 alone|usb_one 1e0e:9001 auto|usb_one 1e0e:9001 on
+usb-hub|-|10|USB autosuspend on the internal Genesys hub alone|usb_one 05e3:0608 auto|usb_one 05e3:0608 on
+wifi-powersave|iw|10|Wi-Fi 802.11 power save on|wifi_ps on|wifi_ps off
+end0-down|-|10|on-module Ethernet PHY administratively down|ip link set end0 down|ip link set end0 up
+cpu-clamp|-|8|CPU ceiling pinned to minimum|cpu_max min|cpu_max restore
+audio-amp|gpioset|10|speaker amplifier gate (GPIO 11) driven low|amp 0|amp 1
+TBL
+}
+
+bl_set()  { local v=$1; [[ -n $BL ]] || return 0
+            [[ $v == max ]] && IFS= read -r v < "$BL/max_brightness"
+            echo "$v" > "$BL/brightness"; }
+# Every non-root-hub USB device, and it must REPORT whether it did anything.
+# The first version globbed 1-1.[0-9]* and returned the exit status of its last
+# `[[ -w ]]` test, so a single unwritable entry -- or the modem coming back on a
+# different port number after the row above power-cycled it -- reported "enter
+# failed" and measured nothing. Root hubs are skipped because `usbN` has no
+# device behind it to suspend.
+usb_ctl() {
+    local d n=0
+    for d in /sys/bus/usb/devices/*/power/control; do
+        [[ -w $d ]] || continue
+        case ${d#/sys/bus/usb/devices/} in usb*) continue ;; esac
+        echo "$1" > "$d" 2>/dev/null && n=$(( n + 1 ))
+    done
+    (( n > 0 ))
+}
+# One device, addressed by vendor:product rather than by port.
+#
+# Port numbers are not stable here: powering the modem down and back up at its
+# power key can re-enumerate it on a different number, which is how the first
+# version of the row above came to report "enter failed".
+usb_one() {
+    local want=$1 val=$2 d vid pid n=0
+    for d in /sys/bus/usb/devices/*/idVendor; do
+        d=${d%/idVendor}
+        IFS= read -r vid < "$d/idVendor" 2>/dev/null || continue
+        IFS= read -r pid < "$d/idProduct" 2>/dev/null || continue
+        [[ $vid:$pid == "$want" ]] || continue
+        [[ -w $d/power/control ]] || continue
+        echo "$val" > "$d/power/control" 2>/dev/null && n=$(( n + 1 ))
+    done
+    (( n > 0 )) || { note "usb_one: no writable device matching $want"; return 1; }
+}
+
+wifi_ps() { command -v iw >/dev/null || return 0
+            local w; for w in /sys/class/net/wl*; do
+                [[ -e $w ]] && iw dev "$(basename "$w")" set power_save "$1"; done; }
+cpu_max() { local p=/sys/devices/system/cpu/cpufreq/policy0 v
+            if [[ $1 == min ]]; then IFS= read -r v < "$p/cpuinfo_min_freq"
+            else IFS= read -r v < "$p/cpuinfo_max_freq"; fi
+            echo "$v" > "$p/scaling_max_freq"; }
+# GPIO 11 gates the speaker amplifier and config.txt holds it HIGH from boot,
+# so the amp is enabled whether or not anything is playing. Driving it low is
+# the only way to price that; pinctrl-rp1 defaults to persist_gpio_outputs=Y,
+# so a released line keeps its last level and the write has to be held by a
+# daemon -- the same reason uconsole-modem-power runs one.
+amp() {
+    local chip
+    # v2 gpiodetect prints "gpiochip15 [pinctrl-rp1] (54 lines)" -- whitespace,
+    # no colon, so $1 is the chip. On CM5 the header pins are pinctrl-rp1, NOT
+    # gpiochip0; that mismatch is the same one uconsole-modem-power documents.
+    chip=$(gpiodetect 2>/dev/null | awk '/pinctrl-rp1/{print $1; exit}')
+    [[ -n $chip ]] || { note "amp: no pinctrl-rp1 gpiochip"; return 1; }
+    # libgpiod v2 syntax: "<line=value>" with the chip via -c. The first version
+    # of this used v1's "--mode=signal <chip> 11=x" AND backgrounded it, so the
+    # unrecognised-option failure was invisible and the row reported a clean
+    # zero -- the exact false negative the `needs` column was added to prevent.
+    #
+    # And `-t 0`, which is not optional. v2 gpioset HOLDS THE LINE UNTIL KILLED by
+    # default -- "to guarantee the requested value, by default gpioset does not
+    # exit" -- so the foreground call that replaced the backgrounded one simply
+    # never returned, and the row sat for two hours. `-t 0` sets and exits; the
+    # level then persists because pinctrl-rp1 defaults to persist_gpio_outputs=Y.
+    gpioset -t 0 -c "$chip" "11=$1" >/dev/null 2>&1
+}
+
+### bounded state changes ---------------------------------------------------
+# Every enter/leave runs under a deadline. A helper that blocks is not
+# hypothetical: libgpiod v2's gpioset holds its line until killed, and a row
+# built on it hung for two hours with nothing in the log to say why. Children
+# are killed first so a held gpioset does not outlive the subshell that ran it.
+STEP_LIMIT=${STEP_LIMIT:-90}     # modem power-down alone takes ~25 s
+
+run_bounded() {  # $1 = command string; returns 124 if it had to be killed
+    local pid t=0
+    ( eval "$1" ) >/dev/null 2>&1 &
+    pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+        if (( t >= STEP_LIMIT )); then
+            pkill -P "$pid" 2>/dev/null
+            kill "$pid" 2>/dev/null
+            wait "$pid" 2>/dev/null
+            return 124
+        fi
+        read -t 1 -u 9 _ 2>/dev/null
+        t=$(( t + 1 ))
+    done
+    wait "$pid"
+}
+
+### one measurement ---------------------------------------------------------
+measure_one() {
+    local name=$1 desc=$2 enter=$3 leave=$4 settle=${5:-$SETTLE} i a1 b a2 abar
+    for (( i = 1; i <= REPEATS; i++ )); do
+        win "$SECS"; a1=$W_MEAN; local sd1=$W_SD v1=$W_MV
+        run_bounded "$enter"; case $? in
+            0) ;; 124) note "$name: enter KILLED after ${STEP_LIMIT}s -- row is meaningless" ;;
+            *) note "$name: enter failed" ;; esac
+        read -t "$settle" -u 9 _ 2>/dev/null
+        win "$SECS"; b=$W_MEAN; local sdb=$W_SD
+        run_bounded "$leave"; case $? in
+            0) ;; 124) note "$name: leave KILLED after ${STEP_LIMIT}s -- CHECK THE MACHINE'S STATE" ;;
+            *) note "$name: leave failed" ;; esac
+        read -t "$settle" -u 9 _ 2>/dev/null
+        win "$SECS"; a2=$W_MEAN; local sd2=$W_SD v2=$W_MV
+        abar=$(( (a1 + a2) / 2 ))
+        printf '%-17s %+6d mW   A %5d / %5d  B %5d   (sd %3d %3d %3d, %d->%d mV)\n' \
+               "$name" "$(( b - abar ))" "$a1" "$a2" "$b" "$sd1" "$sdb" "$sd2" "$v1" "$v2"
+        (( (a1 > a2 ? a1 - a2 : a2 - a1) > 250 )) && \
+            note "^ A windows differ by >250 mW; drift or thermal, treat the delta as indicative"
+    done
+}
+
+### verbs -------------------------------------------------------------------
+do_list() {
+    printf '%-17s %-6s %s\n' NAME NEEDS DESCRIPTION
+    local n q s d e l
+    while IFS='|' read -r n q s d e l; do
+        local mark=ok
+        [[ $q != - ]] && ! command -v "$q" >/dev/null && mark="NO($q)"
+        printf '%-17s %-6s %s\n' "$n" "$mark" "$d"
+    done < <(subsystems)
+}
+
+do_measure() {
+    preflight
+    local want=("$@") n q s d e l hit w
+    while IFS='|' read -r n q s d e l; do
+        hit=0; for w in "${want[@]}"; do [[ $w == "$n" || $w == all ]] && hit=1; done
+        (( hit )) || continue
+        if [[ $q != - ]] && ! command -v "$q" >/dev/null; then
+            printf '%-17s %6s   SKIPPED -- needs %s, which is not installed\n' "$n" "--" "$q"
+            continue
+        fi
+        measure_one "$n" "$d" "$e" "$l" "$s"
+    done < <(subsystems)
+}
+
+do_noise() {
+    preflight
+    local secs=${1:-$SECS}
+    win "$secs"; printf 'noise  %d s: mean %d mW, sd %d mW, %d mV -- nothing was changed\n' \
+        "$secs" "$W_MEAN" "$W_SD" "$W_MV"
+}
+
+do_curve() {
+    preflight
+    [[ -n $BL ]] || die "no backlight found"
+    local max l; IFS= read -r max < "$BL/max_brightness"
+    local -A up dn
+    for (( l = 0; l <= max; l++ )); do bl_set "$l"; read -t 4 -u 9 _ 2>/dev/null; win "$SECS"; up[$l]=$W_MEAN; done
+    for (( l = max; l >= 0; l-- )); do bl_set "$l"; read -t 4 -u 9 _ 2>/dev/null; win "$SECS"; dn[$l]=$W_MEAN; done
+    local base=$(( (up[0] + dn[0]) / 2 )) m prev=0
+    printf '%5s %8s %8s %9s %9s\n' level up_mW down_mW mean_mW over_0
+    for (( l = 0; l <= max; l++ )); do
+        m=$(( (up[$l] + dn[$l]) / 2 ))
+        printf '%5d %8d %8d %9d %+9d\n' "$l" "${up[$l]}" "${dn[$l]}" "$m" "$(( m - base ))"
+    done
+    bl_set "$max"
+}
+
+case ${1:-} in
+    list)            do_list ;;
+    measure)         shift; [[ $# -gt 0 ]] || die "measure needs a name (see 'list')"; do_measure "$@" ;;
+    all)             do_measure all ;;
+    backlight-curve) shift; do_curve "$@" ;;
+    noise)           shift; do_noise "$@" ;;
+    *) sed -n '2,10p' "$0" | sed 's/^# \?//'; exit 1 ;;
+esac

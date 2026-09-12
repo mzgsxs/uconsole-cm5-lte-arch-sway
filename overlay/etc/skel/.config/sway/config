@@ -176,19 +176,38 @@ bindsym --no-repeat --locked XF86PowerOff exec /usr/local/bin/uconsole-powerkey-
 bindsym --no-repeat --release --locked XF86PowerOff exec /usr/local/bin/uconsole-powerkey-hold release
 
 ### Idle behaviour
-# Dim the BACKLIGHT rather than powering the panel down.
+# TWO stages, because the backlight is the most expensive thing on this machine.
 #
-# Report S3.8: on this cwu50 DSI panel, `output dpms off` was observed never to
-# come back -- no keyboard or trackball input revived it, and it presents as a
-# completely hung machine. The kernel log showed the panel re-enable never
-# firing. Driving the backlight avoids the DSI power-down entirely, is instant,
-# and cannot strand you at a black screen.
+# Measured on this unit, on battery (uconsole-power-budget backlight-curve):
+# the backlight spans 1.96 W from off to maximum -- more than the DSI panel
+# (0.714 W) and both radios put together -- and the curve is convex, so one
+# notch through the middle costs up to 527 mW. Levels 0 and 1 measured
+# IDENTICAL: the PWM duty is zero below 2, so level 1 is off, not dim.
 #
-# No suspend, no lock, no power-off: the screen dims, the machine keeps running,
-# and any key or trackball movement brings it straight back.
+# A single 300 s stage therefore held the most expensive component at full power
+# through every pause shorter than five minutes. The first stage now drops to
+# DIM_LEVEL after 60 s, which is worth up to 1.7 W and is recoverable by any
+# keypress; the second still switches the backlight off entirely.
+#
+# The helper owns the save file rather than brightnessctl -s/-r doing it inline:
+# swayidle fires EVERY armed resume handler on activity, so a second -s would
+# save the already-dimmed value and ratchet the user's brightness down one notch
+# per idle cycle until the screen was black. See uconsole-idle-dim.
+#
+# Still no suspend and no lock: the screen dims, the machine keeps running, and
+# any key or trackball movement brings it straight back. Powering the DSI panel
+# down here as well is a further 0.714 W and is available behind
+# PANEL_OFF_ON_IDLE in /etc/uconsole/lowpower.conf.
+#
+# (An earlier version of this comment cited report S3.8 -- "the cwu50 panel
+# never comes back from dpms off" -- as the reason to touch only the backlight.
+# S3.8 was wrong. The panel powers down and returns fine; what never worked was
+# sway RE-ENABLING the output, which takes `power on` then `enable` as a pair.)
 exec swayidle -w \
-    timeout 300 'brightnessctl -s set 0' \
-    resume    'brightnessctl -r'
+    timeout 60  'uconsole-idle-dim dim' \
+    resume      'uconsole-idle-dim undim' \
+    timeout 300 'uconsole-idle-dim off' \
+    resume      'uconsole-idle-dim undim'
 
 ### Session restore
 # There is no suspend on this hardware, so the way back from a poweroff is to

@@ -595,6 +595,20 @@ check "restore path is logged"         "grep -qF 'panel restored by \${_how' $MN
 check "root panel-on tries IPC first"  "grep -qF 'panel_on_ipc_as_user && return 0' $MNT/usr/local/bin/uconsole-lowpower"
 check "core bring-up is verified"      "grep -q 'stayed offline after writing 1' $MNT/usr/local/bin/uconsole-lowpower"
 check "hotplug selftest present"       "grep -q 'selftest-cores' $MNT/usr/local/bin/uconsole-lowpower"
+
+# The measurement tool behind every number above.
+check "power budget tool present"      "[[ -x $MNT/usr/local/bin/uconsole-power-budget ]]"
+check "power budget parses"            "bash -n $MNT/usr/local/bin/uconsole-power-budget"
+# A/B/A, not A/B: the pack is discharging while we measure, and a single pair
+# charges that drift to whichever subsystem happened to be under test.
+check "budget brackets B between two A" \
+      "grep -qF 'a1 + a2' $MNT/usr/local/bin/uconsole-power-budget"
+check "budget refuses on AC"           "grep -qF 'on AC -- unplug' $MNT/usr/local/bin/uconsole-power-budget"
+check "budget skips missing helpers"   "grep -qF 'which is not installed' $MNT/usr/local/bin/uconsole-power-budget"
+# libgpiod v2's gpioset holds its line until killed. Without -t 0 the audio-amp
+# row never returned, and without a deadline on every step nothing said so.
+check "budget gpioset sets and exits"  "grep -qF 'gpioset -t 0' $MNT/usr/local/bin/uconsole-power-budget"
+check "budget bounds every step"       "[[ \$(grep -vE '^[[:space:]]*#' $MNT/usr/local/bin/uconsole-power-budget | grep -cF 'run_bounded \"\$') -eq 2 ]]"
 # Modem presence is the only direct evidence MODEM_OFF_ON_BLANK actually worked.
 # A QMI raw_ip netdev reports operstate "unknown" whether the radio is on or
 # off, so it can never show the transition. Read ModemManager's power state --
