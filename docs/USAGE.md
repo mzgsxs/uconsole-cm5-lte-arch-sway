@@ -405,6 +405,55 @@ Absolute figures include the sampler's own overhead, which is not nothing on a m
 clamped to one core under a watt. **Trust the difference between phases, not the
 absolutes.**
 
+### Pricing one subsystem at a time
+
+`power-probe` measures the blank as a bundle. To find out what a single thing costs on the
+*awake* machine:
+
+```bash
+sudo uconsole-power-budget list              # what can be priced
+sudo uconsole-power-budget all               # price everything safe
+sudo uconsole-power-budget measure modem-off # just one
+sudo uconsole-power-budget backlight-curve   # cost of each brightness step
+sudo uconsole-power-budget noise             # resolution floor, changes nothing
+```
+
+Each row switches one thing, brackets it between two unchanged windows, and reports the
+difference against their mean — the pack is discharging while you measure, and a single
+before/after pair charges that drift to whichever subsystem was under test. A row whose two
+reference windows disagree by more than 250 mW says so; read that one as indicative.
+
+Also refuses on AC, for the same reason as `power-probe`. Unlike `power-probe` it is fine
+over SSH, because it never blanks the machine. Anything under about **50 mW is not
+resolved** — per-sample noise here is ~190 mW of genuine activity, and a state change that
+shifts SoC temperature moves leakage for minutes afterwards, which no bracketing removes.
+
+### The single biggest thing you can do about battery life: turn the brightness down
+
+The backlight is **the most expensive component on this machine** — 1.96 W from off to
+maximum, more than the DSI panel and both radios put together. And the curve is convex, so
+the top of the range is cheap to give up:
+
+| level | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| mW over off | +0 | +0 | +159 | +253 | +455 | +703 | +1125 | +1652 | +1853 | +1964 |
+
+**Going from 9 to 6 saves 839 mW** and costs three notches of a nine-notch scale. Against
+the 18 Wh this pack actually holds, brightness alone is the difference between about
+**3.3 h and 5.0 h** of idle runtime.
+
+Two surprises worth knowing:
+
+- **Level 1 is off, not dim.** It measured identical to level 0, to the milliwatt — the PWM
+  duty is zero below 2. If the screen is dark and `brightnessctl get` says 1, that is why.
+- **One notch is not one notch.** 6→7 costs 527 mW; 8→9 costs 111 mW.
+
+The screen dims itself to `DIM_LEVEL` (3) after 60 s idle and switches the backlight off at
+300 s; any keypress brings it straight back, and neither stage locks the session. Set
+`PANEL_OFF_ON_IDLE=1` in `/etc/uconsole/lowpower.conf` to also power the DSI panel down at
+the second stage, for a further 0.714 W — it defaults to off because nothing you did caused
+that blank, so a restore that failed would look like a machine that had died.
+
 ### After a cell swap
 
 Runtime estimates use `PACK_WH` from `/etc/uconsole/lowpower.conf`. Don't edit it by hand

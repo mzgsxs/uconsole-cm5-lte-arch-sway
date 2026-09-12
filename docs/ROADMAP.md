@@ -112,10 +112,25 @@ Small, and each one closes a question that is currently guessed at.
 | Question | How to settle it |
 |---|---|
 | Does the boot-time clock ceiling depend on AC vs battery? | One boot on each, read `scaling_max_freq` immediately |
-| What does Wi-Fi actually cost during a blank? | `RADIO_OFF_ON_BLANK=0`, compare with `uconsole-power-probe run` |
-| Does cutting the modem rail move the 3.2 W floor? | `MODEM_RAIL_OFF_ON_BLANK=1`, same comparison |
-| What is the pack's real capacity? | `uconsole-battery-calibrate run` — now that phase 1 terminates |
+| Does cutting the modem rail move the floor further than powering the modem down? | `MODEM_RAIL_OFF_ON_BLANK=1`, compare with `uconsole-power-probe run` (the power-key press is already measured at 0.325 W) |
 | What does the machine draw while flashing? | `uconsole-power-probe` across an OTA write |
 
-The last one also gives a measured `PACK_WH`, replacing the nameplate figure that every
-runtime estimate currently relies on.
+Two that `uconsole-power-budget` opened and cannot close over SSH:
+
+| Question | Why it needs someone at the device |
+|---|---|
+| What does Wi-Fi cost while awake, as opposed to power-save? | The measurement has to run over a link that is not the one being switched off — from the device's own terminal, or over the modem |
+| Does `dtparam=pciex1` cost anything with nothing in the slot? | The 4G module is USB-attached, so the external PCIe controller may be training for nothing. Needs a boot with it removed, and a bad `config.txt` needs the card in hand to fix |
+
+Not worth trying without physical access: a negative `over_voltage_delta`. It would reduce
+core voltage at every OPP, and the idle rail sits at the 1.5 GHz point because that is the
+lowest OPP BCM2712 has — so it is one of the few remaining levers on the ~2.9 W that is left
+once the backlight and panel are off. It is also the one change that can leave the machine
+unable to boot, with the only recovery being the SD card in another machine.
+
+Settled, and kept here so nobody re-opens them: the pack's real capacity (18 Wh usable,
+measured); whether cpuidle is worth enabling (no — the firmware's retention state is a
+WFI, its core power-down is the `CPU_OFF` path that saved −8 mW and does not return, and on
+the shipped `bcm2712` branch a power-down idle request asks VideoCore for system suspend; see
+`HARDWARE.md`); and whether USB autosuspend is (no — −98 mW in all, the
+keyboard −10 mW of it, and the rest on the modem, where autosuspend risks the data link).

@@ -300,6 +300,123 @@ Measured on this hardware:
 The gauge is uncalibrated (`calibrate` reads 0) and its percentage cannot be trusted —
 it read 49 % at 3.402 V. Use voltage, which is what `uconsole-battery-guard` does.
 
+### Where the draw actually goes
+
+Measured 2026-09-12 with `uconsole-power-budget`, on battery, in the 3.87–3.85 V part of the
+curve the pack is characterised over. Each row brackets the changed state between two
+unchanged windows and compares against their mean, because the pack is emptying while we
+measure. **Idle baseline: 3.64 W** with the backlight off, the panel on, the modem
+registered and Wi-Fi associated.
+
+Ranked by what they are worth, which is not the order anyone here had assumed:
+
+| Lever | Worth | Notes |
+|---|---|---|
+| **Backlight, off → maximum** | **1.964 W** | The most expensive component on the machine. Convex: see below |
+| **DSI panel + controller** | **0.714 W** | Already taken on blank (`PANEL_OFF_ON_BLANK`) |
+| **Modem powered down** | **0.325 W** | With the power-key `disable` from the s2idle branch (`cbb4662`). **Not on `main` yet**: main's `disable` does not power the module down, and its blank only puts the radio in low power |
+| USB autosuspend | ~0.1 W | −98 mW on every device; −73 mW of that is the modem, −10 mW the keyboard. Not worth taking; see below |
+| CPU ceiling pinned to 1.5 GHz | **0.064 W** | At idle. Already taken on blank (`CPU_CLAMP_ON_BLANK`) |
+| Wi-Fi 802.11 power save | not resolved | −61 mW, but the two reference windows disagreed by 298 mW |
+| Ethernet PHY (`end0`) down | **0.009 W** | Nothing. Already effectively off with no carrier |
+| Parking 3 of 4 CPU cores | **0.008 W** | Nothing — and it is a one-way door; see below |
+
+**The backlight curve is convex, and that is the practical finding.** 10 s per level, swept
+up and then back down so drift cancels:
+
+| level | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| mW over off | +0 | +0 | +159 | +253 | +455 | +703 | +1125 | +1652 | +1853 | +1964 |
+
+One notch through the middle costs up to **527 mW** (6→7) while the top notch costs **111 mW**
+(8→9). So **dropping from 9 to 6 saves 839 mW** and gives up three notches of a nine-notch
+scale — the single largest thing a user can do about battery life on this machine. Against
+the measured 18 Wh usable pack, brightness alone moves idle runtime between roughly **3.3 h
+at level 9 and 5.0 h with the backlight off**.
+
+**Levels 0 and 1 measured identical, to the milliwatt.** PWM duty is zero below 2, so level 1
+is *off*, not dim. Do not read "brightness 1" on a running machine as a lit screen, and do
+not set `DIM_LEVEL=1` expecting a faint glow — `verify-image` refuses it.
+
+**The CPU's dynamic range is 4.44 W** — four cores busy measured 8.30 W against a 3.86 W
+idle. That is the largest number in this document, and the only lever for it is not doing
+the work; there is no idle state to exploit (below).
+
+**USB autosuspend is not worth taking, and the first two numbers said otherwise.** Runs of
+−171 mW and −237 mW came from a helper that globbed port numbers and half-failed, with
+reference windows 155 mW apart. With the helper fixed and the windows agreeing to 5 mW, every
+non-root-hub device together is **−98 mW**, and split by device the **keyboard is −10 mW** —
+nothing — while the **modem is −73 mW**. So the only real saving sits on the one device where
+USB autosuspend is known to break data connections, for a tenth of a watt, while powering the
+modem down entirely is worth 0.325 W. It is not enabled, and there is no longer any reason to
+test whether a keypress wakes a suspended keyboard.
+
+**The 0.325 W modem figure is not available on `main` yet.** It was measured with the
+power-key `uconsole-modem-power disable` that the test unit runs, from the s2idle branch
+(`cbb4662`). On `main`, `disable` kills the process holding GPIO 24 and reports success while
+the SIM7600 stays registered, and the blank (`MODEM_OFF_ON_BLANK`) only asks ModemManager for
+radio low-power — which has not been priced. `uconsole-power-budget measure modem-off` run
+against main's script would measure that no-op, not the saving.
+
+### There is no cpuidle here, and the firmware is why
+
+`/sys/devices/system/cpu/cpuidle/current_driver` reads **`none`**. `CONFIG_CPU_IDLE` is on —
+the framework and its governors are present — but there is no driver behind it, so
+`cpuidle_idle_call()` falls through to `default_idle_call()` and the cores idle in plain WFI.
+Confirmed on 7.1.4: no `psci_cpuidle` or `dt_idle_states` symbols in `/proc/kallsyms`, and no
+`cpus/idle-states` node in the device tree. Enabling it would need both a kernel rebuild and
+a DT change.
+
+It is not worth doing, and the firmware source says why in plain code.
+
+**The firmware does not refuse the call** — that is the first thing to know, because it rules
+out the cheap answer. `/sys/kernel/debug/psci` reads `OSI is not supported` and `Original
+StateID format is used`, and the kernel prints those two lines only when
+`PSCI_FEATURES(CPU_SUSPEND)` succeeds. So `CPU_SUSPEND` is advertised, in platform-coordinated
+mode.
+
+What stands behind it is Raspberry Pi's own TF-A fork — `raspberrypi/arm-trusted-firmware`,
+branch `bcm2712`, `plat/rpi/rpi5/rpi5_pm.c` — not upstream TF-A's Pi 5 port. Upstream's
+`psci_setup.c` only advertises `CPU_SUSPEND` when a platform provides `pwr_domain_suspend` and
+`pwr_domain_suspend_finish`, and upstream's Pi code provides neither, so the device cannot be
+running it. The fork's file accepts three states, and none saves power over what the kernel
+already does:
+
+| State | What the firmware does | Worth |
+|---|---|---|
+| Core retention (standby) | `dsb(); wfi();` | Exactly the WFI `default_idle_call()` already does, plus an SMC round trip |
+| Core power-down | `pwr_down_wfi`: `write_cpupwrctlr_el1(0x1)`, then WFI | The same path as `CPU_OFF` — measured **−8 mW** for three cores |
+| Cluster power-down | The above on every core | Only reachable with every core idle |
+
+**And on the `bcm2712` branch the power-down states are worse than useless.**
+`rpi5_pwr_domain_suspend` writes `MBOX_CHAN_SUSPEND` to VideoCore *unconditionally* — for any
+power-down `CPU_SUSPEND`, so a single idle core would ask for system suspend — and
+`rpi5_pwr_domain_suspend_finish` is an `#if 0` block of leftover Rockchip code. The
+`bcm2712-s2ram` branch fixes exactly that ("The VC powers the ARM cluster off as soon as it
+handles this message"; it now returns early unless the request is a system suspend), which
+confirms the reading. Which branch built the bl31 in this unit's EEPROM is not visible from
+Linux; on either, a cpuidle driver would offer the governor one state that ties WFI and one
+that saves nothing measurable — and, on `bcm2712`, can take the machine down.
+
+The measurement agrees with the source. `CPU_OFF` sets the A76's core power-down request and
+parks the core in WFI; three of four cores parked that way measured **−8 mW** against ±180 mW
+of noise. Either BCM2712 does not switch per-core power on that request, or per-core leakage
+is below what this pack can resolve. Either way, there is nothing for an idle state to reach.
+
+**And `CPU_OFF` is a one-way door on this board.** After offlining, `CPU_ON` refuses:
+
+```
+psci: failed to boot CPU1 (-22)
+CPU1: failed to boot: -22
+CPU2: failed to come online
+CPU2: failed in unknown state : 0x0
+```
+
+The cores do not come back without a reboot. That is the same failure `lowpower.conf`
+records for `CPU_OFFLINE_CORES_ON_BLANK` (default 0, 2026-09-08); this run adds the cause —
+the firmware's own error — and the number that makes the option pointless even if bring-up
+were fixed.
+
 ### What a full discharge showed
 
 `uconsole-battery-calibrate run`, from full to 3.50 V under 0.8–3.3 A (mean 2.6 A):
