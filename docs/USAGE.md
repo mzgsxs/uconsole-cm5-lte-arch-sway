@@ -144,14 +144,23 @@ purpose — the gauge's percentage is not trustworthy on this hardware.
 uconsole-battery-calibrate status     # gauge state, and a voltage/percentage cross-check
 sudo uconsole-battery-calibrate run   # guided charge -> measured discharge -> recharge
 uconsole-battery-calibrate report     # results and a voltage -> charge table
+uconsole-battery-calibrate soc 3900000 -900000   # voltage (+current) -> charge left
 sudo uconsole-battery-calibrate apply # write calibration where the driver allows
 ```
 
-**The percentage reads high near empty — the gauge is uncalibrated** (`calibrate` reads 0)
-and the AXP223's internal model does not match this pack. It is *not* a capacity mismatch:
-the device tree's design capacity is within 4 % of a 2×3500 mAh pack. A shutdown at
-"30 % remaining" is the gauge being wrong, not the guard being early, and the journal now
-prints both numbers together so the two can be compared directly.
+**The percentage reads high — measured, at every level** (`calibrate` reads 0; the gauge has
+never been calibrated). A full discharge put it 10 points high at 82 % charge, 24 high at
+43 %, and 35 high at 15 %: it still said 49 % minutes before the guard fired. A shutdown at
+"30 % remaining" is the gauge being wrong, not the guard being early, and the journal prints
+both numbers together so the two can be compared directly.
+
+**And less of the pack is reachable than the nameplate suggests.** The same run measured
+4.47 Ah / 16.5 Wh to 3.50 V resting. Two 3500 mAh cells are rated down to a ~2.7 V cutoff
+this machine never reaches — it stops at 3.40 V — so the nameplate is not the number to plan
+around; this one is. `report` corrects for the pack's measured 68 mΩ, so a discharge that
+ended under load is not read as an empty battery, prints the voltage → charge table, and
+saves it to `/var/lib/uconsole/battery-calibration/table.tsv`. Compare its "resting V"
+column against a voltage read while the machine is idle, not busy.
 
 If the guard fires, **charge before powering on again**. A pack flat enough to trigger it
 will usually die part-way through the next boot, and every attempt that does leaves the FAT
