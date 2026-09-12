@@ -1,5 +1,46 @@
 # Changelog
 
+## The pack is 18 Wh usable, the gauge is 35 points out, and the calibrator samples at 1 Hz
+
+**The pack.** 3828 mAh / 14.22 Wh reached the 3.50 V stop, but that stop came under a 2.3 A
+load, which hid 0.16 V. Corrected for the pack's own 68 mΩ it holds **4.47 Ah / 16.5 Wh to
+3.50 V resting, 4.9 Ah / ~18 Wh to the 3.40 V the guard cuts at**. `PACK_WH` is now the
+measured 18.0 rather than the nominal 25.9, so runtime estimates stop being ~44 % optimistic.
+
+That is *not* a shortfall against the cells. An 18650's rated capacity is measured down to
+roughly 2.7 V per cell and this machine stops at 3.40 V; the charge below that is real, just
+unreachable here. The two numbers describe different voltage windows. Likewise the 68 mΩ is
+measured at the gauge's terminals, so it covers cells, welds, wiring and connector rather
+than the cells alone — it is the right number for the load correction, and not a verdict on
+cell health.
+
+**The gauge.** Against the charge actually counted out of the pack it reads 10 points high
+at 82 % charge, 24 high at 43 %, and 35 high at 15 % — still claiming 49 % minutes before
+the guard fired. It cannot be corrected from here: `calibrate` and `charge_full_design` are
+both read-only on this kernel. `uconsole-battery-guard` already decides on voltage, which is
+why this is documentation rather than a defect.
+
+**The calibrator.** `report` now derives all of the above from the sample log — pack
+resistance from the load steps already in it, every sample corrected to its resting voltage,
+charge and energy by trapezoid, and an estimate of what is left below the stop — then writes
+`table.tsv`. A new `soc <µV> [µA]` interpolates that table into mAh, Wh and true state of
+charge, correcting a loaded voltage to an open-circuit one first. The slope is not constant
+(58.6 Wh/V at 4.00 V, ~37 at 3.90, ~30 by 3.75), so assuming one is wrong by up to 1.6×.
+
+Sampling moved from every 10 s to every 1 s. The 10 s interval was guarding against a cost
+nobody had measured: the four sysfs reads take 5.8 ms, but the loop around them took 18.9 ms
+because it forked about nine processes per sample. It now forks none — reads by redirection,
+time from `EPOCHREALTIME`, totals in integer arithmetic, and a FIFO-timeout sleep instead of
+`/bin/sleep` — so a sample costs 5.98 ms, 0.6 % of one core, and the reads are the only
+limit. Sampling runs against a deadline rather than a fixed delay, so the interval does not
+drift: 20 samples at 1 s landed in 20001 ms.
+
+Two defects surfaced while measuring. `report` without `sudo` died on the `table.tsv`
+redirect — awk treats a failed redirect as fatal — losing the *printed* table along with the
+file. And `soc` used `|I|`, adding the IR correction while **charging** too, where the
+terminal voltage already sits above the OCV: a pack at 4.030 V taking 2.081 A came back as
+"100 %" when it was near 3.888 V and 51 %.
+
 ## The blank powers the DSI panel down: 0.714 W, and sway can bring it back
 
 `PANEL_OFF_ON_BLANK` is on by default. Powering the panel down — not merely dimming its

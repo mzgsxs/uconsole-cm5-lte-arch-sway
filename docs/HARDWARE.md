@@ -289,11 +289,52 @@ Measured on this hardware:
   both states and repeatable to 0.018 W.
 - LTE connected but not routed ("hot standby"): ~0.1 W, ~4 MiB/month
 - LTE transmit burst: 4.4 A swing, 305 mV rail sag
-- Pack: **25.9 Wh nominal** on this unit -- 2x 18650 at 3.7V 3500mAh, wired in
-  **parallel** (3.7V x 7000mAh). Parallel is not an assumption: the AXP223 is a
-  single-cell PMIC and the pack reads 3.4-4.2V in sysfs, where a series pair would
-  read double. Earlier figures in this repo assumed 2x2000mAh / 14.8 Wh; the cells
-  were swapped. Set it with `uconsole-power-probe pack 2x3500` rather than by hand.
+- Pack, **measured**: **4.47 Ah / 16.5 Wh** down to 3.50 V resting, **4.9 Ah / ~18 Wh** down
+  to the 3.40 V the guard cuts at. That is the energy this machine can actually use, and it
+  is **not** comparable to the 2× 18650 3500 mAh nameplate: an 18650's rated capacity is
+  measured down to a ~2.7 V cutoff, and this device never goes below 3.40 V. The charge
+  between those two voltages is real and simply out of reach here. Parallel is not an
+  assumption: the AXP223 is a single-cell PMIC and the pack reads 3.4–4.2 V in sysfs, where
+  a series pair would read double.
 
 The gauge is uncalibrated (`calibrate` reads 0) and its percentage cannot be trusted —
 it read 49 % at 3.402 V. Use voltage, which is what `uconsole-battery-guard` does.
+
+### What a full discharge showed
+
+`uconsole-battery-calibrate run`, from full to 3.50 V under 0.8–3.3 A (mean 2.6 A):
+
+| | |
+|---|---|
+| delivered to the 3.50 V stop | 3828 mAh / 14.22 Wh |
+| pack resistance | **68 mΩ**, median of 48 load steps in the run (quartiles 66–72) |
+| voltage at the stop, corrected for that | **3.65 V**, not 3.50 — at 2.3 A the load hid 0.16 V |
+| still left at the stop | ~640 mAh to 3.50 V resting, ~1070 mAh to 3.40 V |
+
+68 mΩ is measured at the gauge's terminals, so it covers the whole path — cells, welds,
+wiring, connector — rather than the cells alone, and it is exactly what the load correction
+needs. **A run that ends under load stops early**: that is what the correction is for, and
+why the discharge should be idle by the end.
+
+**The gauge reads far too high, and now by how much.** Against the charge actually counted
+out of the pack it is 10 points high at 82 % charge, 24 high at 43 % and 35 high at 15 % —
+still claiming 49 % minutes before the guard fired. It cannot be corrected from here:
+`calibrate` and `charge_full_design` are both read-only on this kernel.
+
+`report` derives all of that from the run and writes
+`/var/lib/uconsole/battery-calibration/table.tsv`, a voltage → charge table which
+`uconsole-battery-calibrate soc <µV> [µA]` then interpolates — correcting a loaded voltage
+to an open-circuit one first, since at 0.9 A this pack reads 61 mV low. The slope is not
+constant, so a single Wh-per-volt is wrong by up to 1.6× depending only on where you sit:
+
+| OCV | Wh per volt | |
+|---|---|---|
+| above 4.15 V | ~16 | near vertical; 50 mV is worth 9 mAh |
+| 4.05–4.00 V | 47 | thin, crossed under load — read with suspicion |
+| 3.95–3.80 V | 36–37 | dense and consistent — **measure here** |
+| below 3.75 V | 30 and falling | |
+
+The 4.05–4.00 V band is the weakest: the calibration discharge crosses it quickly under
+~2 A while surface charge from the just-finished charge still holds the voltage up, and
+pricing a drop there against independently sampled power came out **20 % low**. Take
+measurements in 3.95–3.80 V.

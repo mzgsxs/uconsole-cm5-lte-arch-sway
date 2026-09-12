@@ -794,7 +794,19 @@ echo
 echo "### 17. battery calibration utility"
 check "calibrate utility present"      "[[ -x $MNT/usr/local/bin/uconsole-battery-calibrate ]]"
 check "has status/run/report/apply"    "grep -qE 'status\\)  *show_status' $MNT/usr/local/bin/uconsole-battery-calibrate"
-check "integrates current for capacity" "grep -q 'mah+=a\\*dt/3600' $MNT/usr/local/bin/uconsole-battery-calibrate"
+check "integrates current for capacity" "grep -q 'chg + a \\* dt' $MNT/usr/local/bin/uconsole-battery-calibrate"
+# The sample loop must stay fork-free: at 1 Hz the forks cost more than the reads
+# they surround, and they draw current from the very pack being measured.
+check "sample loop forks nothing per sample" \
+      "grep -q 'rdv v voltage_now' $MNT/usr/local/bin/uconsole-battery-calibrate && ! grep -q 'sleep \"\$SAMPLE_SEC\"' $MNT/usr/local/bin/uconsole-battery-calibrate"
+# The datasheet lookup, and the two things that make it trustworthy: the table
+# carries the resistance needed to correct a loaded voltage, and that correction
+# is SIGNED -- |I| would add it while charging too, where the terminal voltage
+# already sits above the OCV.
+check "soc subcommand present"          "grep -q 'soc)     shift; do_soc' $MNT/usr/local/bin/uconsole-battery-calibrate"
+check "table carries its resistance"    "grep -q 'pack_resistance_ohm' $MNT/usr/local/bin/uconsole-battery-calibrate"
+check "soc corrects load to OCV"        "grep -qF 'ocv = uv/1e6 - (ua/1e6) * R' $MNT/usr/local/bin/uconsole-battery-calibrate"
+check "soc flags off-table lookups"     "grep -q 'clamped=' $MNT/usr/local/bin/uconsole-battery-calibrate"
 check "stops above the PMU cutoff"     "grep -q 'FLOOR_UV:-3500000' $MNT/usr/local/bin/uconsole-battery-calibrate"
 check "warns when the modem is powered" "grep -q 'modem_is_on' $MNT/usr/local/bin/uconsole-battery-calibrate"
 # The AXP223 driver never sets status=Full: measured at 4.213V / 100% / 5mA it
