@@ -596,6 +596,33 @@ check "root panel-on tries IPC first"  "grep -qF 'panel_on_ipc_as_user && return
 check "core bring-up is verified"      "grep -q 'stayed offline after writing 1' $MNT/usr/local/bin/uconsole-lowpower"
 check "hotplug selftest present"       "grep -q 'selftest-cores' $MNT/usr/local/bin/uconsole-lowpower"
 
+# The staged idle backlight. The backlight measured 1.96 W from off to maximum
+# on this unit -- more than the panel and both radios together -- so the single
+# 300 s stage that used to be here was holding the most expensive component at
+# full power through every pause shorter than five minutes.
+check "idle dim helper present"        "[[ -x $MNT/usr/local/bin/uconsole-idle-dim ]]"
+check "idle dim parses"                "bash -n $MNT/usr/local/bin/uconsole-idle-dim"
+check "sway arms a first dim stage"    "grep -qF \"timeout 60  'uconsole-idle-dim dim'\" $MNT/etc/skel/.config/sway/config"
+check "sway arms the off stage"        "grep -qF \"timeout 300 'uconsole-idle-dim off'\" $MNT/etc/skel/.config/sway/config"
+# The inline `brightnessctl -s` is what the helper replaces. If it comes back
+# alongside the helper, BOTH save -- and the second save records the dimmed
+# value, which walks the user's brightness down a notch per idle cycle.
+check "sway no longer saves inline" \
+      "[[ \$(grep -vE '^[[:space:]]*#' $MNT/etc/skel/.config/sway/config | grep -c 'brightnessctl -s') -eq 0 ]]"
+# Only `dim` may write the save file. This is the same ratchet in the helper.
+check "only dim writes the save file"  "[[ \$(grep -c '> \"\$STATE\"' $MNT/usr/local/bin/uconsole-idle-dim) -eq 1 ]]"
+check "dim skips when already dim"     "grep -qF '(( c > DIM_LEVEL )) || exit 0' $MNT/usr/local/bin/uconsole-idle-dim"
+# Same ordered pair as the power-key path; each command alone leaves it dark.
+check "idle panel restore sends power on" "grep -qF 'output \"\$out\" power on' $MNT/usr/local/bin/uconsole-idle-dim"
+check "idle panel restore then enables"   "grep -qF 'output \"\$out\" enable' $MNT/usr/local/bin/uconsole-idle-dim"
+check "idle panel restore has root fallback" \
+      "grep -qF 'uconsole-lowpower panel-on' $MNT/usr/local/bin/uconsole-idle-dim"
+check "dim level is configured"        "grep -q '^DIM_LEVEL=' $MNT/etc/uconsole/lowpower.conf"
+# Levels 0 and 1 measured identical: PWM duty is zero below 2, so a DIM_LEVEL of
+# 1 is not a dim screen, it is an off one.
+check "dim level is visible (>=2)"     "[[ \$(sed -n 's/^DIM_LEVEL=//p' $MNT/etc/uconsole/lowpower.conf) -ge 2 ]]"
+check "idle panel-down off by default" "grep -q '^PANEL_OFF_ON_IDLE=0' $MNT/etc/uconsole/lowpower.conf"
+
 # The measurement tool behind every number above.
 check "power budget tool present"      "[[ -x $MNT/usr/local/bin/uconsole-power-budget ]]"
 check "power budget parses"            "bash -n $MNT/usr/local/bin/uconsole-power-budget"
