@@ -164,7 +164,7 @@ Derived from an on-device defect report. Section numbers reference that report.
 | 3.5 | No low-voltage protection; the gauge reads ~71 % about an hour before an undervoltage cut | **Guard shipped** — voltage-based, warns at 3.50 V, clean shutdown at 3.40 V. Root cause of the gauge error now identified — see below |
 | 3.6 | No RTC; clock wrong every boot | **Mitigated** — networkd fix lets timesyncd work; NTP servers pinned by IP so a first sync does not need DNS |
 | 3.7 | `wireless-regdb` missing — 299 brcmfmac channel errors per boot, 14.5 % of the journal | **Fixed** — `wireless-regdb` and `iw` installed |
-| 3.8 | DSI panel never wakes from `dpms off`; presents as a hung machine | **Fixed** — idle dims the backlight instead; `dpms` is never used |
+| 3.8 | DSI panel never wakes from `dpms off`; presents as a hung machine | **Misdiagnosed, and now used deliberately.** The panel always woke; what failed was sway re-enabling a powered-off DSI output. Each of `power on`, `enable` and `mode` *alone* reports success and leaves it dark — but `power on` **then** `enable` restores it 3/3, no VT switch and no root. The blank now powers the panel down for a measured 0.714 W (`PANEL_OFF_ON_BLANK`, default on) |
 | 3.9 | No kernel suspend support (`/sys/power/state` empty) | **Superseded.** The premise was a CM4 observation. On this build both sleep states register — and both are unusable. Suspend is now masked; see below |
 | 3.10 | PWM audio picks up LTE transmit bursts as audible static | **Not fixable in software** — see below |
 | 3.11 | Missing `usbutils`/`iw`, no swap, sshd defaults | **Partly fixed** — tools and `zram-generator` added; sshd left enabled |
@@ -283,6 +283,10 @@ Measured on this hardware:
 - Idle, screen on: **4.08 W** measured on battery (2026-09-08, `uconsole-power-probe`).
   An earlier ~5–7 W estimate was not measured on this unit.
 - Idle, backlight off, nothing else changed: **3.36 W**
+- **Blanked with the panel powered down: 2.632 W, against 4.082 W screen-on** — **1.450 W,
+  a 36 % saving**, measured on battery through the real power-key path. The panel and its
+  controller are **0.714 W** of that, measured separately with the backlight already off in
+  both states and repeatable to 0.018 W.
 - LTE connected but not routed ("hot standby"): ~0.1 W, ~4 MiB/month
 - LTE transmit burst: 4.4 A swing, 305 mV rail sag
 - Pack: **25.9 Wh nominal** on this unit -- 2x 18650 at 3.7V 3500mAh, wired in

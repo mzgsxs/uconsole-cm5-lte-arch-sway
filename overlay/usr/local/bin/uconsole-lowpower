@@ -265,6 +265,91 @@ do_up() {
     rm -f "$STATE"
 }
 
+### panel --------------------------------------------------------------------
+# Restore a DSI output that sway powered off.
+#
+# Measured on this hardware: `swaymsg output DSI-2 power off` genuinely powers
+# the panel down -- 0.714 W off the battery draw, so it is real and not merely a
+# state flag. Bringing it back looked impossible at first, because no single
+# command does it:
+#
+#     output DSI-2 power on      -> {"success": true},  connector still Off
+#     output DSI-2 enable        -> {"success": true},  connector still Off
+#     output DSI-2 mode 720x...  -> {"success": true},  connector still Off
+#
+# but `power on` FOLLOWED BY `enable` restores it -- 3/3 cycles by IPC and 2/2
+# through this function. Best reading: `power on` sets the desired DPMS state
+# without committing, and `enable` forces the commit that applies it.
+#
+# This is also what the old S3.8 note ("the DSI panel never wakes") was actually
+# describing. The panel wakes fine; sway was just never asked correctly.
+# Is the connector actually being driven? Ground truth, unlike sway's own flag,
+# which a VT bounce leaves reading false on a panel that is lit.
+panel_drm_on() {
+    local c
+    for c in /sys/class/drm/card*-DSI-*; do
+        [[ -r $c/enabled && -r $c/dpms ]] || continue
+        [[ $(cat "$c/enabled") == enabled && $(cat "$c/dpms") == On ]] && return 0
+        return 1
+    done
+    return 1
+}
+
+# Try sway IPC first, as whoever owns the compositor.
+#
+# Measured 2026-09-12: `power on` then `enable` restores the panel 3/3 with no VT
+# switch (see uconsole-screen-toggle's panel_on_ipc for the evidence and why
+# neither half works alone). This runs from root -- the s2idle harness and
+# `lowpower up` are root -- so it has to find the user's socket and drop to them.
+panel_on_ipc_as_user() {
+    local sock uid user out
+    for sock in /run/user/*/sway-ipc.*.sock; do
+        [[ -S $sock ]] || continue
+        uid=${sock#/run/user/}; uid=${uid%%/*}
+        user=$(getent passwd "$uid" | cut -d: -f1)
+        [[ -n ${user:-} ]] || continue
+        out=$(runuser -u "$user" -- env SWAYSOCK="$sock" swaymsg -t get_outputs -r 2>/dev/null \
+              | grep -m1 '"name"' | sed 's/.*: *"//; s/".*//')
+        [[ -n ${out:-} ]] || continue
+        runuser -u "$user" -- env SWAYSOCK="$sock" swaymsg output "$out" power on >/dev/null 2>&1
+        runuser -u "$user" -- env SWAYSOCK="$sock" swaymsg output "$out" enable   >/dev/null 2>&1
+        sleep 1
+        panel_drm_on && { log "panel restored over sway IPC (power on + enable) -- no VT switch"; return 0; }
+    done
+    return 1
+}
+
+do_panel_on() {
+    # The cheap, safe path first. The VT bounce below is the fallback.
+    panel_on_ipc_as_user && return 0
+    log "sway IPC could not restore the panel; falling back to a VT bounce"
+    local cur other
+    cur=$(fgconsole 2>/dev/null || echo 1)
+    other=2; [[ $cur == 2 ]] && other=1
+    if ! chvt "$other" 2>/dev/null; then
+        log "ERROR: chvt $other failed; panel not restored"
+        return 1
+    fi
+    sleep 1
+    if ! chvt "$cur" 2>/dev/null; then
+        log "ERROR: chvt back to $cur failed -- session is stranded on VT $other"
+        log "recover with: pkill -x swaylock; pkill -x sway; sudo chvt $cur"
+        return 1
+    fi
+    # chvt returning 0 does NOT mean the switch completed: the compositor has to
+    # acknowledge it, and one with a powered-off output has been observed not to,
+    # leaving VT $cur dead and the user stranded on $other. Verify.
+    sleep 1
+    local now; now=$(fgconsole 2>/dev/null || echo "?")
+    if [[ $now != "$cur" ]]; then
+        log "ERROR: asked for VT $cur but the foreground console is $now"
+        log "the compositor did not take the switch back; session may be stranded"
+        log "recover with: pkill -x swaylock; pkill -x sway; sudo chvt $cur"
+        return 1
+    fi
+    log "panel restored by VT bounce ($cur -> $other -> $cur)"
+}
+
 ### status -------------------------------------------------------------------
 do_status() {
     printf 'state file : %s\n' "$([[ -r $STATE ]] && echo present || echo absent)"
@@ -326,6 +411,7 @@ case "${1:-}" in
     down)   do_down ;;
     up)     do_up ;;
     status) do_status ;;
+    panel-on) do_panel_on ;;
     selftest-cores) do_selftest_cores ;;
-    *)      echo "usage: uconsole-lowpower {down|up|status|selftest-cores}" >&2; exit 2 ;;
+    *)      echo "usage: uconsole-lowpower {down|up|status|panel-on|selftest-cores}" >&2; exit 2 ;;
 esac

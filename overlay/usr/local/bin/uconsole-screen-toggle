@@ -6,17 +6,77 @@
 # on screen. Coming back up it restores everything and swaylock asks for the
 # password.
 #
-# Deliberately drives the BACKLIGHT and not `output dpms off`: on this cwu50 DSI
-# panel a dpms power-down has been observed never to come back (report S3.8),
-# which presents as a hung machine.
+# It also POWERS THE PANEL DOWN, not just its backlight. Measured on this
+# hardware: backlight 2.08 W, panel and controller a further 0.70 W.
+#
+# Report S3.8 said the DSI panel "never wakes from dpms off" and this script
+# avoided touching it for exactly that reason. S3.8 was wrong: the panel powers
+# down and comes back fine. What genuinely did not work was sway RE-ENABLING the
+# output, and why took a while to find -- each of `power on`, `enable` and `mode`
+# returns {"success": true} and changes nothing ON ITS OWN. Issued as a PAIR,
+# `power on` then `enable`, the output comes back every time. See panel_on_ipc.
 set -uo pipefail
 STATE=/run/user/$(id -u)/uconsole-backlight.save
 MUTESTATE=/run/user/$(id -u)/uconsole-mute.save
+PANELSTATE=/run/user/$(id -u)/uconsole-panel.save
 CONF=/etc/uconsole/lowpower.conf
 
 MUTE_ON_BLANK=1
 # shellcheck source=/dev/null
 [[ -r $CONF ]] && . "$CONF"
+
+# Which output is the panel? Do not hardcode DSI-2 -- read it back, so a
+# renamed connector does not silently disable the whole feature.
+panel_output() {
+    command -v swaymsg >/dev/null 2>&1 || return 0
+    swaymsg -t get_outputs -r 2>/dev/null | python3 -c '
+import json, sys
+try:
+    for o in json.load(sys.stdin):
+        if o.get("name"): print(o["name"]); break
+except Exception:
+    pass' 2>/dev/null
+}
+
+# Is the panel actually being driven? DRM is the authority, not sway's own flag.
+#
+# Measured 2026-09-12: after a VT bounce sway reports "power": false while the
+# connector is enabled with DPMS On -- the panel is lit and sway disagrees.
+# Asking sway alone therefore reports a working panel as broken and provokes
+# another needless restore. Fall back to sway only if no connector can be read.
+panel_is_on() {
+    local c
+    for c in /sys/class/drm/card*-DSI-*; do
+        [[ -r $c/enabled && -r $c/dpms ]] || continue
+        [[ $(cat "$c/enabled") == enabled && $(cat "$c/dpms") == On ]] && return 0
+        return 1
+    done
+    [[ $(swaymsg -t get_outputs -r 2>/dev/null | grep -c '"power": true') -gt 0 ]]
+}
+
+# Bring the panel back over sway IPC: no root, no VT switch.
+#
+# Measured 2026-09-12 on this hardware, 3/3 cycles, each showing the panel
+# re-initialise in dmesg (rp1dsi byte/DPI clocks, then "regulator iovcc and vci
+# defined, enabling"). The ORDER is the whole trick, and is why this was thought
+# impossible:
+#
+#     power on             alone -> 0/3, connector stays disabled/Off
+#     enable               alone -> 0/3, connector stays disabled/Off
+#     power on THEN enable       -> 3/3, connector enabled/On
+#
+# The reading that fits: `power on` sets the desired DPMS state without
+# committing anything, and `enable` forces the output reconfigure that applies
+# it. Earlier notes tried all three commands SEPARATELY, found each returned
+# success and changed nothing, and concluded sway could not do it at all. The
+# pair was never tried.
+panel_on_ipc() {
+    local out=$1
+    swaymsg output "$out" power on >/dev/null 2>&1
+    swaymsg output "$out" enable   >/dev/null 2>&1
+    sleep 1
+    panel_is_on
+}
 
 # Hand the privileged half off to uconsole-lowpower. This script runs as the
 # logged-in user from a sway binding, so it cannot touch rfkill, cpufreq or CPU
@@ -122,12 +182,68 @@ if [[ ${cur:-0} -gt 0 ]]; then
     fi
 
     brightnessctl set 0 >/dev/null 2>&1
+
+    # Power the panel down, not just its backlight.
+    #
+    # Measured on this hardware: the backlight is 2.08 W and the panel plus its
+    # controller are a FURTHER 0.70 W, which every previous version of this
+    # script left running. That 0.70 W is the single largest saving in the whole
+    # low-power path.
+    #
+    # This was avoided for years on the strength of report S3.8 -- "the DSI panel
+    # never wakes from dpms off". That was wrong. The panel powers down and comes
+    # back perfectly; what never worked was sway RE-ENABLING the output. See the
+    # wake branch.
+    # Default 0 when the conf does not say: the restore is the risky half, and a
+    # conf from before this option must not switch it on.
+    if [[ ${PANEL_OFF_ON_BLANK:-0} == 1 ]]; then
+        _out=$(panel_output)
+        if [[ -n ${_out:-} ]]; then
+            swaymsg output "$_out" power off >/dev/null 2>&1
+            echo "$_out" > "$PANELSTATE" 2>/dev/null || true
+        fi
+    fi
+
     lowpower down
     logger -t uconsole-screen-toggle "blanked, locked, pointer input silenced, low-power engaged"
 else
     # Re-enable EVERY input, not just what we silenced. If anything went wrong on
     # the way down, this is the path that has to recover it -- an input left
     # disabled with no keyboard is unrecoverable without a reboot.
+    # Panel first: everything else is invisible until the screen is back.
+    #
+    # sway CAN power this output back on, as of 2026-09-12: `power on` then
+    # `enable` restores it 3/3, with no VT switch and no root. See panel_on_ipc
+    # for why the order matters and why this was believed impossible.
+    #
+    # The VT bounce is kept only as a fallback. It is the one path that works
+    # without a live compositor socket, but it needs DRM master, it leaves sway's
+    # own "power" flag disagreeing with the connector, and driven unattended it
+    # once stranded the session on another VT.
+    if [[ -f $PANELSTATE ]]; then
+        _out=$(cat "$PANELSTATE" 2>/dev/null)
+        [[ -n ${_out:-} ]] || _out=$(panel_output)
+        # Record WHICH path restored it. A silent success is not good enough here:
+        # after the first end-to-end cycle the only evidence that IPC had worked
+        # was the absence of a fallback message, which is inference, not a
+        # measurement -- and it is exactly the thing to check if this ever
+        # regresses.
+        _how=""
+        for _try in 1 2; do
+            panel_is_on && { _how=${_how:-already on}; break; }
+            [[ -n ${_out:-} ]] && panel_on_ipc "$_out" && { _how="sway IPC (power on + enable), try $_try"; break; }
+            sleep 1
+        done
+        # Only if IPC could not do it: regain DRM master the hard way.
+        panel_is_on || { lowpower panel-on; sleep 1; _how="VT bounce fallback"; }
+        if panel_is_on; then
+            rm -f "$PANELSTATE"
+            logger -t uconsole-screen-toggle "panel restored by ${_how:-unknown path}"
+        else
+            logger -t uconsole-screen-toggle "ERROR: panel did not come back; recover with Ctrl+Alt+F2 then Ctrl+Alt+F1"
+        fi
+    fi
+
     set_inputs enabled all
     if [[ -r $STATE ]]; then
         brightnessctl set "$(cat "$STATE")" >/dev/null 2>&1
