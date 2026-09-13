@@ -619,6 +619,14 @@ check "probe does not use operstate proxy" "[[ \$(grep -v '^[[:space:]]*#' $MNT/
 check "modem uses MM low-power state"  "grep -q 'set-power-state-low' $MNT/usr/local/bin/uconsole-lowpower"
 check "modem power-down is verified"   "grep -q \"wanted 'low'\" $MNT/usr/local/bin/uconsole-lowpower"
 check "modem rail cut is opt-in"       "grep -q '^MODEM_RAIL_OFF_ON_BLANK=0' $MNT/etc/uconsole/lowpower.conf"
+# The power-down takes ~25-45 s, so the descent queues it as a stop job rather
+# than waiting for it. systemd then queues the wake's restart behind that job,
+# which is why nothing may call `disable` directly.
+check "rail-off queues a stop job, not a call" \
+      "grep -qF 'systemctl stop --no-block uconsole-modem-power.service' $MNT/usr/local/bin/uconsole-lowpower && [[ \$(grep -v '^[[:space:]]*#' $MNT/usr/local/bin/uconsole-lowpower | grep -c 'uconsole-modem-power disable') -eq 0 ]]"
+# A press killed part-way would leave the key held: pinctrl-rp1 persists outputs.
+check "a killed press lets go of the key" \
+      "grep -qF 'trap ' $MNT/usr/local/bin/uconsole-modem-power && grep -qF -- '-t 0 \"\${PWRKEY_LINE}=0\"' $MNT/usr/local/bin/uconsole-modem-power"
 # Saving the PRIOR mute state latches: once anything leaves the sink muted, every
 # later cycle faithfully re-mutes it. Record our own action instead.
 check "mute records our own action"    "grep -q 'we are muting' $MNT/usr/local/bin/uconsole-screen-toggle"

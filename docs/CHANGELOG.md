@@ -26,6 +26,14 @@ Both verbs now press the key and check the result on the USB bus:
 - At shutdown `disable` presses and returns, so a poweroff costs ~3.5 s rather than ~25 s.
 - `status` reports the key's level and ModemManager's power state.
 
+**On the blank.** `MODEM_RAIL_OFF_ON_BLANK=1` used to run the old no-op `disable`, wait
+for it to return, and check the bus one second later. It now queues `disable` as a stop job
+on `uconsole-modem-power.service`, so the descent returns at once. The wake's `restart`
+waits for a power-down that is still in progress instead of racing it; this was checked
+on the device with a throwaway unit. A press that is killed part-way now releases the key
+rather than leaving it held down. The setting stays off by default, because its saving over
+the radio's low-power state has not been measured.
+
 ## The pack is 18 Wh usable, the gauge is 35 points out, and the calibrator samples at 1 Hz
 
 **The pack.** 3828 mAh / 14.22 Wh reached the 3.50 V stop, but that stop came under a 2.3 A

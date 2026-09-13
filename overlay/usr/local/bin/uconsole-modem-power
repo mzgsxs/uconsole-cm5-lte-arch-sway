@@ -101,10 +101,16 @@ hold_line() {   # 0|1 -- drive the key line and keep holding it
 
 press_key() {   # ms -- one press: up 0.5 s, down for ms, up; then hold it up
     stop_holders
+    # Killed mid-press -- by a systemd stop timeout, say -- the gpioset below
+    # dies with the key DOWN, and pinctrl-rp1 keeps that level
+    # (persist_gpio_outputs=Y), so the module would see the key held
+    # indefinitely. Let go of it on the way out.
+    trap 'gpioset -C "$CONSUMER" -c "$CHIP" -t 0 "${PWRKEY_LINE}=0" 2>/dev/null || true; exit 143' TERM INT
     # One process for the whole sequence. Separate gpioset calls would release
     # the line between them, and with persistence off it would float.
     gpioset -C "$CONSUMER" -c "$CHIP" -t "500,$1,0" "${PWRKEY_LINE}=0"
     hold_line 0
+    trap - TERM INT
 }
 
 mm_index() {
