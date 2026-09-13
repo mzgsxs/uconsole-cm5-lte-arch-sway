@@ -1,5 +1,28 @@
 # Changelog
 
+## A hung CM5 recovers by itself: hardware watchdog and REISUB
+
+- **`RuntimeWatchdogSec=15`** (`/etc/systemd/system.conf.d/uconsole-watchdog.conf`). On a
+  CM5 the power button only works while the kernel is still responding, so a hard hang
+  used to mean opening the back panel and pulling the cells. That happened four times on
+  the test unit.
+  - `bcm2835-wdt` is built into the kernel. systemd now pets it, so a kernel that stops
+    resets within ~16 s.
+  - `RebootWatchdogSec=2min` covers a shutdown that hangs.
+  - The reset is still unclean, and the machine comes back awake rather than blanked.
+- **`kernel.sysrq = 244`,** the REISUB subset, for hangs where the kernel is alive and
+  userspace is not. The keyboard is USB, so it cannot help if USB hung too.
+- **The 10 s "hardware cut" is no longer described as a force-off.** It stays at 10 s so
+  it never cuts power mid-unmount. But on a CM5, a 10 s hold on a hung machine cleared the
+  screen and never powered the module off.
+  - USAGE, TROUBLESHOOTING, the sway config, `lowpower.conf` and `uconsole-powerkey-tune`
+    all described it as a force-off; they no longer do.
+  - TROUBLESHOOTING gains a section, "The machine is frozen and the power button does
+    nothing".
+
+Both drop-ins already run on the test unit's s2idle-branch image: `watchdog0` is active,
+with a 15 s timeout, and `RuntimeWatchdogUSec=15s`.
+
 ## Follow-ups to the panel and pack work
 
 - **`uconsole-battery-calibrate run` keeps the previous run.** It moves the old log,

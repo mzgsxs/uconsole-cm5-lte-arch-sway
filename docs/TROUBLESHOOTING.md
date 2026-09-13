@@ -234,7 +234,8 @@ whole gesture takes ~8 s.
 - **`shutdown` → 10000 ms**, the maximum. This is the PMIC's *hardware* force-off, an
   unclean cut of exactly the kind that previously corrupted the journal and left the FAT
   boot partition dirty. Pushing it to the maximum guarantees systemd's clean shutdown
-  always wins the race, leaving the hardware cut as a genuine last resort.
+  always wins the race. On a CM5 it is not a dependable force-off for a hung machine —
+  see [The machine is frozen](#the-machine-is-frozen-and-the-power-button-does-nothing).
 
 Worth checking on any given unit which of the two actually fired: if the machine cuts at
 the `shutdown` value rather than ~5 s, it was the hardware, and the filesystem took an
@@ -312,20 +313,55 @@ seconds, that was logind's own long-press, which is a hardcoded 5 s and cannot b
 ## A long press does not power the machine off
 
 If the kernel is healthy, hold for 5 s and logind will do it even when the 2 s path is
-unavailable. If the machine is genuinely wedged, only the AXP223's hardware cut remains
-and that needs a **full, uninterrupted 10 seconds** — considerably longer than it feels,
-which is why it often seems not to work.
+unavailable. If the machine is genuinely wedged, the button will not help on a CM5 — see
+[the next section](#the-machine-is-frozen-and-the-power-button-does-nothing).
 
-That 10 s is deliberate and should not be lowered. A clean shutdown takes about 8 s from
-the press (5 s for logind plus 2–3 s of shutdown), so the next value down — 8 s — would cut
-power mid-unmount. Check what is set with:
+Check what the key is set to with:
 
 ```bash
 cat /sys/bus/platform/devices/*pek*/startup /sys/bus/platform/devices/*pek*/shutdown
 ```
 
 Expect `128` and `10000`. If `startup` reads `3000`, `uconsole-powerkey-tune` has not run
-and every press is taking three seconds longer than it should.
+and every press is taking three seconds longer than it should. The `10000` is the AXP223's
+own 10 s hardware cut. It is kept above a clean shutdown (about 8 s from the press) so it
+can never cut a rail mid-unmount, but on a CM5 it was observed not to power the module off,
+so do not count on it as a force-off.
+
+## The machine is frozen and the power button does nothing
+
+Expected on CM5, and not a fault in this image. The power button only works while the
+kernel is still responding — Raspberry Pi changed the power-control pins between CM4 and
+CM5, so the CM4 trick of holding it for ten seconds does not apply.
+
+In order of what to try:
+
+1. **Wait ~15 seconds.** The hardware watchdog is armed by default; a kernel that has
+   stopped running resets itself. It comes back **awake**, even if it hung while blanked,
+   so a machine found warm in a bag may have hung and rebooted — `journalctl -b -1` shows
+   how the previous boot ended, if that reached the disk.
+2. **REISUB**, if the keyboard still responds: hold `Alt`+`SysRq` and press `R` `E` `I`
+   `S` `U` `B` with a second between each. `SysRq` is `Print` on this keyboard. This only
+   works when the kernel is alive and userspace is not — the keyboard is USB, so if the
+   hang took USB down, the keypresses never arrive.
+3. **Pull the batteries.** Still the only guaranteed method, and it means opening the back
+   panel.
+
+After any unclean stop, clear the boot partition before doing anything else — the FAT
+driver does not self-repair the way ext4 does:
+
+```bash
+sudo umount /boot && sudo fsck.vfat -a /dev/mmcblk0p1 && sudo mount /boot
+```
+
+To check the watchdog is actually armed:
+
+```bash
+cat /sys/class/watchdog/watchdog0/state /sys/class/watchdog/watchdog0/timeout
+```
+
+If a spurious reboot ever bites you, comment out `RuntimeWatchdogSec` in
+`/etc/systemd/system.conf.d/uconsole-watchdog.conf` and run `systemctl daemon-reexec`.
 
 ## My session did not come back after a poweroff
 

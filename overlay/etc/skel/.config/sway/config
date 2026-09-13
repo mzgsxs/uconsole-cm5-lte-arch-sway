@@ -136,13 +136,15 @@ bindsym --locked XF86AudioMute exec wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle
 #
 #   ~2s  here, a sway timer that re-checks the key state -> clean poweroff
 #    5s  logind's HandlePowerKeyLongPress                -> clean poweroff
-#   10s  the AXP223 cutting power in hardware            -> UNCLEAN, last resort
+#   10s  the AXP223's forced-off register                -> NOT a force-off on CM5
 #
 # 5s is a compile-time constant in logind with no setting in any systemd version
 # (systemd#28100 is the open request), and the AXP223's register offers only
 # 4/6/8/10s -- parked at 10s deliberately, since a clean shutdown takes about 8s
-# from the press and anything shorter would cut power mid-unmount. Measuring the
-# hold here is the only way to get anything shorter.
+# from the press and anything shorter would cut power mid-unmount. On a CM5 that
+# 10s hold was observed NOT to power a hung module off: the button only works
+# while the kernel responds, and a hang is recovered by the hardware watchdog.
+# Measuring the hold here is the only way to get anything shorter than 5s.
 #
 # The press binding arms a timer. That is only safe because the timer does not
 # trust the release event: when it expires it asks the KERNEL whether the key is
