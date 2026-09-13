@@ -336,6 +336,9 @@ if [[ ${_landlock:-0} -gt 0 ]]; then
 else
   bad "kernel appears to LACK Landlock (pacman would need DisableSandbox)"
 fi
+# The watchdog drop-in arms nothing unless the driver is in the kernel, and it is
+# the only recovery for a hung CM5.
+check "watchdog driver is built in"    "[[ \$(strings /tmp/vmlinux.raw 2>/dev/null | grep -c bcm2835-wdt) -gt 0 ]]"
 rm -f /tmp/vmlinux.raw
 
 echo
@@ -398,7 +401,15 @@ check "power key fires on release"        "grep -qE '^bindsym .*--release.*XF86P
 check "powerkey tuner present"         "[[ -x $MNT/usr/local/bin/uconsole-powerkey-tune ]]"
 check "powerkey tuner enabled"         "[[ -L $MNT/etc/systemd/system/multi-user.target.wants/uconsole-powerkey-tune.service ]]"
 check "tuner shortens press detection" "grep -q 'set_first_accepted \"\$f\" 128' $MNT/usr/local/bin/uconsole-powerkey-tune"
-check "tuner defers the hardware cut"  "grep -q 'set_first_accepted \"\$f\" 10000' $MNT/usr/local/bin/uconsole-powerkey-tune"
+check "tuner parks the AXP forced-off at 10s" "grep -q 'set_first_accepted \"\$f\" 10000' $MNT/usr/local/bin/uconsole-powerkey-tune"
+echo "-- hang recovery without a screwdriver --"
+# On CM5 the power button only works while the kernel responds, so a hard hang
+# otherwise means opening the back panel and pulling the 18650s. The watchdog is
+# the only software recovery that exists.
+check "runtime watchdog armed"         "grep -qE '^RuntimeWatchdogSec=[1-9]' $MNT/etc/systemd/system.conf.d/uconsole-watchdog.conf"
+check "reboot watchdog armed"          "grep -qE '^RebootWatchdogSec=' $MNT/etc/systemd/system.conf.d/uconsole-watchdog.conf"
+# 244 = unraw + signalling + sync + remount-ro + reboot, i.e. exactly REISUB.
+check "sysrq enables REISUB"           "grep -qE '^kernel.sysrq = 244$' $MNT/etc/sysctl.d/99-uconsole-sysrq.conf"
 echo "-- suspend is a hazard, not a feature (S3.9) --"
 # The kernel still has suspend compiled in, and that is fine -- what matters is
 # that nothing can REACH it. Both registered states hang this machine: `deep` is

@@ -38,7 +38,10 @@ blank is itself capable of switching the radios off. SSH works too when there is
 network, and `uconsole-unstick` behaves identically over it.
 
 Holding the power key still shuts down cleanly from here too. The ~2 s path needs sway, but
-logind's 5 s and the AXP223's 10 s hardware cut do not — see [The power button](#the-power-button).
+logind's 5 s does not — see [The power button](#the-power-button). Nothing on the button
+helps once the kernel itself has hung: on a CM5 the hardware watchdog resets it within
+~15 s instead — see
+[`TROUBLESHOOTING.md`](TROUBLESHOOTING.md#the-machine-is-frozen-and-the-power-button-does-nothing).
 
 Two other things happen on first boot without any input:
 
