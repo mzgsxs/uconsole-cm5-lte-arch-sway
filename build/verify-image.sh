@@ -563,6 +563,9 @@ check "toggle does not probe sudo -n true" "[[ \$(grep -v '^[[:space:]]*#' $MNT/
 check "toggle invokes the helper directly" "grep -q 'sudo -n /usr/local/bin/uconsole-lowpower' $MNT/usr/local/bin/uconsole-screen-toggle"
 check "unstick does not probe sudo -n true" "[[ \$(grep -v '^[[:space:]]*#' $MNT/usr/local/bin/uconsole-unstick | grep -c 'sudo -n true') -eq 0 ]]"
 check "unstick delegates to the helper" "grep -q 'uconsole-lowpower up' $MNT/usr/local/bin/uconsole-unstick"
+# The blank powers the panel down; a rescue that only restores the backlight
+# leaves it dark.
+check "unstick restores a powered-down panel" "grep -q 'uconsole-lowpower panel-on' $MNT/usr/local/bin/uconsole-unstick"
 # A descent that silently fails to engage is indistinguishable, in watts alone,
 # from one that engaged and had nothing to give. The probe must record state.
 check "probe records power state"      "grep -q '_NPROCESSORS_ONLN' $MNT/usr/local/bin/uconsole-power-probe"

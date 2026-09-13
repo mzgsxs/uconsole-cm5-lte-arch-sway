@@ -129,6 +129,24 @@ else
     skip "no sway socket found -- restoring hardware state only"
 fi
 
+### 1b. Panel ---------------------------------------------------------------
+# The power-button blank powers the DSI panel down, not just its backlight, and
+# leaves uconsole-panel.save behind until its wake restores the panel. Restoring
+# the backlight alone would leave that panel dark. `uconsole-lowpower panel-on`
+# tries sway IPC first and only bounces VTs if that fails.
+echo "== panel"
+if compgen -G '/run/user/*/uconsole-panel.save' >/dev/null; then
+    if priv /usr/local/bin/uconsole-lowpower panel-on >/dev/null 2>&1 \
+       || sudo -n /usr/local/bin/uconsole-lowpower panel-on >/dev/null 2>&1; then
+        rm -f /run/user/*/uconsole-panel.save 2>/dev/null
+        ok "panel powered back on"
+    else
+        warn "could not power the panel on -- switch VTs (Ctrl+Alt+F1) to restore it"
+    fi
+else
+    skip "the blank did not power the panel down"
+fi
+
 ### 2. Backlight ------------------------------------------------------------
 echo "== backlight"
 if command -v brightnessctl >/dev/null 2>&1; then

@@ -1,5 +1,30 @@
 # Changelog
 
+## Follow-ups to the panel and pack work
+
+- **`uconsole-battery-calibrate run` keeps the previous run.** It moves the old log,
+  `run.meta` and `table.tsv` into `archive/<timestamp>/` before opening a new log. It used to
+  truncate the log: on the test unit, a later run that was cut short by a reboot overwrote the
+  full-discharge log behind `PACK_WH`, while `run.meta` and `table.tsv` still described it.
+  An unfinished run now leaves no `run.meta`, so `report` refuses instead of mixing two runs.
+- **`uconsole-lowpower` falls back to `CPU_OFFLINE_CORES_ON_BLANK=0`, not 1.** The conf
+  already said 0. Without the conf, a blank would have offlined cores this board cannot
+  bring back (`psci: failed to boot CPU1 (-22)`), to save 8 mW.
+- **`STANDBY_POWEROFF_MIN` is removed.** It reserved a timer that would power a long blank
+  off. Nothing read it, and that timer is now declined: shutdown stays a deliberate ~2 s
+  hold on the power key.
+- **`uconsole-unstick` powers the panel back on.** Since the panel change below, the blank
+  switches the DSI panel off, but the rescue tool only restored the backlight.
+- **Docs now match the panel and pack changes:**
+  - TROUBLESHOOTING, USAGE and the sway config no longer say the panel never returns from
+    `dpms off`.
+  - The ~3.2 W figure for a blanked machine is now ~2.6 W everywhere.
+  - The pack notes no longer tell you to run `pack 2x3500`, which replaced the measured
+    18.0 Wh with the 25.9 Wh nameplate.
+  - 18 Wh is now described as optimistic: part of it is extrapolated, and the guard reads
+    loaded voltage. Expect about 6 h at the blank, not 6.8.
+  - `uconsole-power-probe` now falls back to 18.0 Wh.
+
 ## The pack is 18 Wh usable, the gauge is 35 points out, and the calibrator samples at 1 Hz
 
 **The pack.** 3828 mAh / 14.22 Wh reached the 3.50 V stop, but that stop came under a 2.3 A
