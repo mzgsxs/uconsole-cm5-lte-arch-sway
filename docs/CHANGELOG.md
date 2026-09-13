@@ -25,6 +25,75 @@
     loaded voltage. Expect about 6 h at the blank, not 6.8.
   - `uconsole-power-probe` now falls back to 18.0 Wh.
 
+## The backlight is the whole story, and cpuidle is a dead end in the firmware
+
+Every power decision for the *awake* machine in this repo had been argued from inherited
+estimates. `uconsole-power-probe` measured the blank descent — the whole bundle at once — and
+answered "is standby worth it" (yes, 1.45 W). Nobody had measured where the draw goes while
+the machine is in use, which is where a handheld actually spends its battery.
+
+`uconsole-power-budget` does that, one subsystem at a time, and it overturned the ranking
+everything here had assumed. Measured 2026-09-12 on battery in the 3.87–3.84 V part of the
+curve, against a **3.64 W idle baseline**:
+
+| Lever | Worth |
+|---|---|
+| **Backlight, off → maximum** | **1.964 W** |
+| DSI panel + controller | 0.714 W (already taken on blank) |
+| Modem powered down | 0.325 W — needs a fix not yet on `main`; see below |
+| USB autosuspend | ~0.1 W — almost all of it the modem; not taken |
+| CPU ceiling at 1.5 GHz | 0.064 W |
+| Wi-Fi power save | not resolved — the reference windows disagreed by 298 mW |
+| Ethernet PHY down | 0.009 W — nothing |
+| Parking 3 of 4 CPU cores | 0.008 W — nothing |
+
+**The backlight is worth more than the panel and both radios put together**, and the idle
+chain had never touched it until 300 s had passed. The curve is also convex — one notch
+through the middle costs up to 527 mW (6→7) while the top notch costs 111 mW (8→9) — so
+**dropping from 9 to 6 saves 839 mW** for three notches of a nine-notch scale. Brightness
+alone moves idle runtime between roughly **3.3 h and 5.0 h** against the measured 18 Wh pack.
+
+Levels 0 and 1 measured **identical, to the milliwatt**: PWM duty is zero below 2, so level 1
+is off, not dim. `verify-image` now refuses a `DIM_LEVEL` under 2.
+
+The idle chain is therefore two stages: dim to `DIM_LEVEL` (3) at 60 s, backlight off at
+300 s, with `PANEL_OFF_ON_IDLE` available for a further 0.714 W and defaulting to off — not
+because the panel cannot come back, but because nothing the user did caused this blank, so a
+failed restore would look like a machine that had died.
+
+**The modem figure is not on `main` yet.** 0.325 W was measured with the power-key
+`uconsole-modem-power disable` from the s2idle branch (`cbb4662`), which the test unit runs.
+Main's `disable` never turned the module off, and main's blank only asks ModemManager for radio
+low-power, which is unpriced. Landing that fix is the largest measured saving still missing
+from `main`.
+
+**cpuidle is closed — by the firmware source, and the measurement agrees.**
+`/sys/devices/system/cpu/cpuidle/current_driver` reads `none`: the framework is compiled in,
+`ARM_PSCI_CPUIDLE` is not, and there is no DT `cpus/idle-states` node, so the cores idle in
+plain WFI. The firmware does *advertise* `CPU_SUSPEND` — `/sys/kernel/debug/psci` prints the
+OSI and StateID lines only when `PSCI_FEATURES(CPU_SUSPEND)` succeeds — so the cheap refusal
+was not there to find. What is behind it is Raspberry Pi's TF-A fork, `plat/rpi/rpi5/rpi5_pm.c`
+on branch `bcm2712`: its retention state is `dsb(); wfi();`, exactly what the kernel already
+does; its core power-down is the `CPU_OFF` path, `write_cpupwrctlr_el1(0x1)` then WFI, which
+measured **−8 mW** for three cores; and its `pwr_domain_suspend` sends VideoCore
+`MBOX_CHAN_SUSPEND` for *any* power-down request, with `suspend_finish` under `#if 0`. The
+`bcm2712-s2ram` branch fixes that last one. A kernel rebuild would have bought one state that
+ties WFI and one that saves nothing and, on the shipped branch, can hang the machine — so it
+was not built.
+
+`CPU_OFF` is also a **one-way door** — `psci: failed to boot CPU1 (-22)`, and the cores do
+not return without a reboot. `lowpower.conf` already defaulted `CPU_OFFLINE_CORES_ON_BLANK`
+to 0 on that evidence (2026-09-08); this run adds the firmware's own error as the cause, and
+the number that makes the option pointless even if bring-up were fixed.
+
+Two measurement notes, because both produced a confident wrong answer first. The tool is
+A/B/A — the pack is discharging, so every state is bracketed between two unchanged windows
+and compared against their mean — and it says so when those two disagree by more than
+250 mW, which is how the Wi-Fi row came to be labelled indicative rather than −61 mW. And a
+row whose helper is missing or wrong is now a skip or an error, never a zero: the first
+`audio-amp` row reported +6 mW because it used libgpiod v1 syntax on a v2 system *and*
+backgrounded it, so the unrecognised-option failure was invisible.
+
 ## The pack is 18 Wh usable, the gauge is 35 points out, and the calibrator samples at 1 Hz
 
 **The pack.** 3828 mAh / 14.22 Wh reached the 3.50 V stop, but that stop came under a 2.3 A

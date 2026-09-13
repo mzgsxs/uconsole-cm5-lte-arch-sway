@@ -144,17 +144,34 @@ sudo sed -i '/uconsole-arch/,+2d' /etc/pacman.conf
 
 ## The screen goes black after 5 minutes and never comes back
 
-Idle only dims the **backlight**, and any key or trackball movement brings it back. A
-power-button tap goes further and **powers the DSI panel down**; the next tap restores it
-over sway IPC (`output … power on`, then `enable`). If a wake leaves the screen dark,
-`journalctl -t uconsole-screen-toggle -b` says which restore path it tried.
+**This entry used to blame the panel, and that was wrong.** It said `output dpms off` does
+not reverse on the `cwu50` — report S3.8 — and that the image therefore never touches the
+panel. The panel powers down and comes back fine. What never worked was sway **re-enabling
+the output**, and it takes two commands in order: `power on` **then** `enable`. Each of
+`power on`, `enable` and `mode` alone returns `{"success": true}` and leaves the screen
+dark, which is why this looked like a dead panel for so long.
 
-To recover, press `Ctrl`+`Alt`+`F2` then `Ctrl`+`Alt`+`F1` — switching VTs re-initialises
-the panel — or log in on VT2 and run `uconsole-unstick`.
+So a black screen here is a *restore* failure, not a power-down failure. What the image
+does now:
 
-This section used to say the `cwu50` panel never returns from `dpms off`. That was a
-misdiagnosis: sway needs `power on` **and** `enable`, and each alone reports success and
-changes nothing (S3.8 in [`HARDWARE.md`](HARDWARE.md)).
+- The idle chain dims to `DIM_LEVEL` at 60 s and switches the backlight off at 300 s.
+  Neither stage touches the panel unless you set `PANEL_OFF_ON_IDLE=1`.
+- A power-key tap powers the panel down as well (`PANEL_OFF_ON_BLANK=1`, worth 0.714 W).
+- Both restores try sway IPC first and fall back to `uconsole-lowpower panel-on` as root.
+
+If a wake leaves the screen dark, `journalctl -t uconsole-screen-toggle -b` says which
+restore path it tried. To get the panel back, press `Ctrl`+`Alt`+`F2` then `Ctrl`+`Alt`+`F1`
+— switching VTs re-initialises it — or log in on VT2 and run `uconsole-unstick`. If sway
+itself is wedged:
+
+```
+Ctrl+Alt+F2   ->   pkill -x swaylock; pkill -x sway; sudo chvt 1
+```
+
+**Check the backlight before assuming the panel is dead.** `brightnessctl get` returning 1
+means *off*, not dim — the PWM duty is zero below level 2, and level 1 measured identical to
+level 0 to the milliwatt. `brightnessctl set 5` is the one-line test for whether anything is
+wrong with the panel at all.
 
 ---
 
@@ -400,8 +417,20 @@ wpctl set-mute @DEFAULT_AUDIO_SINK@ 0 && rm -f /run/user/$(id -u)/uconsole-mute.
 
 ## The machine is running on one CPU core
 
-**CPU offlining is one-way on this board.** Bring-up fails with `CPU1: failed in unknown
-state : 0x0` and only a reboot recovers. Check with:
+**CPU offlining is one-way on this board, and it saves nothing anyway.** The firmware's PSCI
+refuses to bring a parked core back:
+
+```
+psci: failed to boot CPU1 (-22)
+CPU1: failed to boot: -22
+CPU2: failed to come online
+CPU2: failed in unknown state : 0x0
+```
+
+Only a reboot recovers. And there is nothing to gain by trying: three of four cores parked
+measured **−8 mW** against ±180 mW of noise (`uconsole-power-budget`). The firmware sets the
+A76's core power-down request and waits in WFI, and nothing measurable changes — the same
+reason a cpuidle kernel would not help (see `HARDWARE.md`). Check with:
 
 ```bash
 uconsole-lowpower status

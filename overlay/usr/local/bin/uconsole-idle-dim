@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# uconsole-idle-dim -- staged idle backlight, driven by swayidle.
+#
+#   uconsole-idle-dim dim      first stage: drop to DIM_LEVEL, remember current
+#   uconsole-idle-dim off      second stage: backlight off, optionally panel down
+#   uconsole-idle-dim undim    restore whatever `dim` remembered
+#
+# WHY A HELPER RATHER THAN TWO brightnessctl LINES IN THE SWAY CONFIG
+#
+# The old config was one stage:
+#
+#     timeout 300 'brightnessctl -s set 0'   resume 'brightnessctl -r'
+#
+# which left the backlight at whatever the user had chosen for five minutes, and
+# the backlight is the most expensive thing on this machine. Measured on this
+# unit, on battery, 10 s per level swept up and then down so pack drift cancels
+# (uconsole-power-budget backlight-curve):
+#
+#   level   0     1     2     3     4     5     6     7     8     9
+#   mW     +0    +0  +159  +253  +455  +703 +1125 +1652 +1853 +1964
+#
+# So the backlight spans 1.96 W -- more than the DSI panel (0.714 W) and the
+# radios put together -- and the curve is steeply convex through the middle,
+# where one notch costs up to 527 mW. A first stage at DIM_LEVEL=3 therefore
+# saves up to 1.7 W during any pause longer than DIM_SEC, which is most of them.
+#
+# Note levels 0 and 1 measured IDENTICAL: the PWM duty is zero below 2, so
+# level 1 is off, not dim. DIM_LEVEL must be >= 2 to be visible at all, and
+# there is no point setting `off` to 1 rather than 0.
+#
+# swayidle FIRES EVERY ARMED RESUME HANDLER, AND BOTH BUGS BELOW CAME FROM THAT
+#
+# On activity swayidle runs the resume handler of every stage that had elapsed,
+# not just the innermost, so after a long idle `undim` runs TWICE. Two
+# consequences, both of which produce a wrong screen rather than an error:
+#
+#   1. The save must be written ONCE PER IDLE CYCLE, by whichever stage runs
+#      first, and never overwritten. If `off` blindly saved the current level it
+#      would record the already-dimmed one, and every cycle would walk the
+#      user's brightness down a notch until the screen was black. Hence
+#      save_once, which is the only writer and only writes when nothing is
+#      recorded -- so it is also correct when `dim` bowed out because the user
+#      was already dimmer than DIM_LEVEL.
+#
+#   2. `undim` must be IDEMPOTENT. The obvious "restore, else fall back to 40%"
+#      is not: the first call restores and consumes the state, and the second
+#      then finds nothing and overrides the correct brightness with 40%. So the
+#      no-state path does nothing at all. Recovering a screen that is dark with
+#      no record of why is the power key's job -- uconsole-screen-toggle has its
+#      own 40% fallback for exactly that -- and it is reachable here because
+#      this path never locks the session.
+set -uo pipefail
+export LC_ALL=C
+
+CONF=/etc/uconsole/lowpower.conf
+DIM_LEVEL=3
+PANEL_OFF_ON_IDLE=0
+# shellcheck source=/dev/null
+[[ -r $CONF ]] && . "$CONF"
+
+STATE=/run/user/$(id -u)/uconsole-idle-dim.save
+log() { logger -t uconsole-idle-dim "$*" 2>/dev/null || true; }
+
+# The one and only writer of $STATE. Whichever stage runs first owns the value;
+# later stages in the same idle cycle leave it alone. See the header.
+save_once() { [[ -e $STATE ]] || cur > "$STATE"; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+have brightnessctl || { log "brightnessctl missing; nothing to do"; exit 0; }
+
+# Read it back rather than trusting the write: brightnessctl reports success for
+# a level the driver clamps, and a clamped save restores the wrong brightness.
+cur() { brightnessctl get 2>/dev/null || echo 0; }
+
+panel_output() {
+    have swaymsg || return 0
+    swaymsg -t get_outputs -r 2>/dev/null | python3 -c '
+import json, sys
+try:
+    for o in json.load(sys.stdin):
+        if o.get("name"): print(o["name"]); break
+except Exception:
+    pass' 2>/dev/null
+}
+
+# DRM is the authority on whether the panel is lit. sway's own reply is not:
+# every one of `power on`, `enable` and `mode` returns {"success": true} whether
+# or not the output came back, so a restore verified against sway's answer
+# verifies nothing.
+panel_is_on() {
+    local c
+    for c in /sys/class/drm/card*-DSI-*; do
+        [[ -r $c/enabled && -r $c/dpms ]] || continue
+        [[ $(cat "$c/enabled") == enabled && $(cat "$c/dpms") == On ]] && return 0
+        return 1
+    done
+    return 1
+}
+
+# `power on` THEN `enable`. Each alone reports success and leaves the output
+# dark -- the same pair uconsole-screen-toggle needs, for the same reason.
+panel_on() {
+    local out; out=$(panel_output); [[ -n $out ]] || return 1
+    swaymsg output "$out" power on >/dev/null 2>&1
+    swaymsg output "$out" enable   >/dev/null 2>&1
+    panel_is_on
+}
+panel_off() {
+    local out; out=$(panel_output); [[ -n $out ]] || return 1
+    swaymsg output "$out" power off >/dev/null 2>&1
+}
+
+case ${1:-} in
+dim)
+    c=$(cur)
+    # Already at or below the dim level: nothing to do, and deliberately nothing
+    # saved either -- the `off` stage will record the user's real level when it
+    # runs, which is the level we would have had to save anyway.
+    (( c > DIM_LEVEL )) || exit 0
+    save_once
+    brightnessctl set "$DIM_LEVEL" >/dev/null 2>&1
+    log "dimmed $c -> $DIM_LEVEL"
+    ;;
+off)
+    save_once
+    brightnessctl set 0 >/dev/null 2>&1
+    if [[ ${PANEL_OFF_ON_IDLE:-0} == 1 ]]; then
+        panel_off && log "backlight off, panel powered down" \
+                  || log "backlight off, panel power-down failed"
+    else
+        log "backlight off"
+    fi
+    ;;
+undim)
+    # Panel first, backlight second: a lit backlight behind a powered-down panel
+    # is still a black screen, so restoring them the other way round makes a
+    # failed panel restore look like a failed wake.
+    if [[ ${PANEL_OFF_ON_IDLE:-0} == 1 ]] && ! panel_is_on; then
+        if panel_on; then
+            log "panel restored over sway IPC"
+        else
+            # Only when IPC actually failed -- running this unconditionally costs
+            # a root call, and uconsole-lowpower's fallback can bounce the VT.
+            log "panel restore over IPC failed; trying root fallback"
+            sudo -n /usr/local/bin/uconsole-lowpower panel-on >/dev/null 2>&1 || true
+            panel_is_on || log "PANEL STILL OFF after both paths"
+        fi
+    fi
+    # Idempotent, because this runs once per elapsed stage. No state means a
+    # previous undim in this same wake already restored it; see the header.
+    if [[ -r $STATE ]]; then
+        _want=$(cat "$STATE")
+        rm -f "$STATE"
+        brightnessctl set "$_want" >/dev/null 2>&1
+        log "restored backlight to $_want"
+    fi
+    ;;
+*)
+    sed -n '2,6p' "$0" | sed 's/^# \?//'
+    exit 1
+    ;;
+esac
