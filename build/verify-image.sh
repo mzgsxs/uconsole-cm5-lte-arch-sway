@@ -582,6 +582,10 @@ check "core offlining spares cpu0"     "[[ \$(grep -c 'cpu\[1-9\]\*/online' $MNT
 # reboot recovers. Shipping this on by default cripples the machine after the
 # first blank, silently, because the write on the way down reports success.
 check "core parking off by default"    "grep -q '^CPU_OFFLINE_CORES_ON_BLANK=0' $MNT/etc/uconsole/lowpower.conf"
+# ...and off in the helper's own fallbacks, so a missing or unreadable conf
+# cannot park cores that never come back.
+check "helper never parks cores without the conf" \
+      "grep -q '^CPU_OFFLINE_CORES_ON_BLANK=0' $MNT/usr/local/bin/uconsole-lowpower && grep -qF 'CPU_OFFLINE_CORES_ON_BLANK:-0}' $MNT/usr/local/bin/uconsole-lowpower && ! grep -qF 'CPU_OFFLINE_CORES_ON_BLANK:-1}' $MNT/usr/local/bin/uconsole-lowpower"
 # The panel power-down, and more importantly its restore. The ORDER of those two
 # sway commands IS the fix -- each alone restored 0/3 cycles and the pair 3/3 --
 # so pin both, and pin that IPC is tried before the VT bounce, which is the path
