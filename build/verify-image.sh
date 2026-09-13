@@ -563,6 +563,9 @@ check "toggle does not probe sudo -n true" "[[ \$(grep -v '^[[:space:]]*#' $MNT/
 check "toggle invokes the helper directly" "grep -q 'sudo -n /usr/local/bin/uconsole-lowpower' $MNT/usr/local/bin/uconsole-screen-toggle"
 check "unstick does not probe sudo -n true" "[[ \$(grep -v '^[[:space:]]*#' $MNT/usr/local/bin/uconsole-unstick | grep -c 'sudo -n true') -eq 0 ]]"
 check "unstick delegates to the helper" "grep -q 'uconsole-lowpower up' $MNT/usr/local/bin/uconsole-unstick"
+# The blank powers the panel down; a rescue that only restores the backlight
+# leaves it dark.
+check "unstick restores a powered-down panel" "grep -q 'uconsole-lowpower panel-on' $MNT/usr/local/bin/uconsole-unstick"
 # A descent that silently fails to engage is indistinguishable, in watts alone,
 # from one that engaged and had nothing to give. The probe must record state.
 check "probe records power state"      "grep -q '_NPROCESSORS_ONLN' $MNT/usr/local/bin/uconsole-power-probe"
@@ -582,6 +585,10 @@ check "core offlining spares cpu0"     "[[ \$(grep -c 'cpu\[1-9\]\*/online' $MNT
 # reboot recovers. Shipping this on by default cripples the machine after the
 # first blank, silently, because the write on the way down reports success.
 check "core parking off by default"    "grep -q '^CPU_OFFLINE_CORES_ON_BLANK=0' $MNT/etc/uconsole/lowpower.conf"
+# ...and off in the helper's own fallbacks, so a missing or unreadable conf
+# cannot park cores that never come back.
+check "helper never parks cores without the conf" \
+      "grep -q '^CPU_OFFLINE_CORES_ON_BLANK=0' $MNT/usr/local/bin/uconsole-lowpower && grep -qF 'CPU_OFFLINE_CORES_ON_BLANK:-0}' $MNT/usr/local/bin/uconsole-lowpower && ! grep -qF 'CPU_OFFLINE_CORES_ON_BLANK:-1}' $MNT/usr/local/bin/uconsole-lowpower"
 # The panel power-down, and more importantly its restore. The ORDER of those two
 # sway commands IS the fix -- each alone restored 0/3 cycles and the pair 3/3 --
 # so pin both, and pin that IPC is tried before the VT bounce, which is the path
@@ -808,6 +815,10 @@ check "table carries its resistance"    "grep -q 'pack_resistance_ohm' $MNT/usr/
 check "soc corrects load to OCV"        "grep -qF 'ocv = uv/1e6 - (ua/1e6) * R' $MNT/usr/local/bin/uconsole-battery-calibrate"
 check "soc flags off-table lookups"     "grep -q 'clamped=' $MNT/usr/local/bin/uconsole-battery-calibrate"
 check "stops above the PMU cutoff"     "grep -q 'FLOOR_UV:-3500000' $MNT/usr/local/bin/uconsole-battery-calibrate"
+# A new run used to truncate the last one's log; that lost the only full-discharge
+# record on the test unit. The archive must happen BEFORE the log is opened.
+check "run archives the previous run first" \
+      "[[ \$(grep -n 'mv \"\$f\" \"\$keep\"/' $MNT/usr/local/bin/uconsole-battery-calibrate | cut -d: -f1) -lt \$(grep -n 'exec 3>\"\$CSV\"' $MNT/usr/local/bin/uconsole-battery-calibrate | cut -d: -f1) ]]"
 check "warns when the modem is powered" "grep -q 'modem_is_on' $MNT/usr/local/bin/uconsole-battery-calibrate"
 # The AXP223 driver never sets status=Full: measured at 4.213V / 100% / 5mA it
 # still read "Charging". Waiting on that string hung phase 1 forever on a pack

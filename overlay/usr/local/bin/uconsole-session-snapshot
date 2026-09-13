@@ -2,8 +2,8 @@
 """Record which applications are open, and where, so a poweroff can be undone.
 
 There is no suspend on this hardware (docs/HARDWARE.md S3.9) and the blanked
-machine still draws ~3.2W, almost all of it SoC, DSI panel and RP1/USB that
-userspace cannot switch off. The only state that reaches zero is "off". So the
+machine still draws ~2.6W, almost all of it SoC and RP1/USB that userspace
+cannot switch off. The only state that reaches zero is "off". So the
 plan is not to sleep: it is to power off and come back to where you were.
 
 WHY THIS RUNS CONTINUOUSLY INSTEAD OF SAVING AT SHUTDOWN

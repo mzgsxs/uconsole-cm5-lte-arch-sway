@@ -26,7 +26,9 @@ STAMP=/var/lib/uconsole/radios-off-by-lowpower
 RADIO_OFF_ON_BLANK=1
 MODEM_OFF_ON_BLANK=0
 CPU_CLAMP_ON_BLANK=1
-CPU_OFFLINE_CORES_ON_BLANK=1
+# 0 even without the conf: offlining is one-way on this board (psci: failed to
+# boot CPU1 (-22)), and it saved 8 mW. A missing conf must not park cores.
+CPU_OFFLINE_CORES_ON_BLANK=0
 # shellcheck source=/dev/null
 [[ -r $CONF ]] && . "$CONF"
 
@@ -92,7 +94,7 @@ do_down() {
     fi
 
     # Cores last, so the survivor is already running under the clamp.
-    if [[ ${CPU_OFFLINE_CORES_ON_BLANK:-1} == 1 ]]; then
+    if [[ ${CPU_OFFLINE_CORES_ON_BLANK:-0} == 1 ]]; then
         local off=0
         for c in /sys/devices/system/cpu/cpu[1-9]*/online; do
             [[ -w $c ]] || continue

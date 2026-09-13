@@ -176,16 +176,15 @@ bindsym --no-repeat --locked XF86PowerOff exec /usr/local/bin/uconsole-powerkey-
 bindsym --no-repeat --release --locked XF86PowerOff exec /usr/local/bin/uconsole-powerkey-hold release
 
 ### Idle behaviour
-# Dim the BACKLIGHT rather than powering the panel down.
+# Dim the BACKLIGHT only. No suspend, no lock, no power-off: the screen dims,
+# the machine keeps running, and any key or trackball movement brings it
+# straight back.
 #
-# Report S3.8: on this cwu50 DSI panel, `output dpms off` was observed never to
-# come back -- no keyboard or trackball input revived it, and it presents as a
-# completely hung machine. The kernel log showed the panel re-enable never
-# firing. Driving the backlight avoids the DSI power-down entirely, is instant,
-# and cannot strand you at a black screen.
-#
-# No suspend, no lock, no power-off: the screen dims, the machine keeps running,
-# and any key or trackball movement brings it straight back.
+# The power-button blank (uconsole-screen-toggle) goes further and powers the
+# DSI panel down, restoring it with `output ... power on` then `enable`. The old
+# S3.8 note that the panel "never comes back from dpms off" was sway being asked
+# with one of those commands instead of both. A resume here would need that same
+# restore, so the idle path keeps to the backlight.
 exec swayidle -w \
     timeout 300 'brightnessctl -s set 0' \
     resume    'brightnessctl -r'

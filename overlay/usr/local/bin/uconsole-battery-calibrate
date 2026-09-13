@@ -220,6 +220,20 @@ do_run(){
         rm -f "$fifo"
     fi
 
+    # Keep the previous run; never overwrite it. Opening the log below used to
+    # truncate it, and a run that then died left the old run.meta describing a
+    # log that no longer existed -- which is how the pack's only full-discharge
+    # log was lost on the test unit. Moving run.meta aside as well means an
+    # unfinished run leaves none, so 'report' refuses instead of mixing the two.
+    local keep f
+    keep="$DIR/archive/$(date +%Y%m%dT%H%M%S)"
+    for f in "$CSV" "$META" "$DIR/table.tsv"; do
+        [[ -e $f ]] || continue
+        mkdir -p "$keep" && mv "$f" "$keep"/ \
+            || { err "could not archive $f -- refusing to overwrite it"; exit 1; }
+    done
+    [[ -d $keep ]] && ok "previous run kept in $keep"
+
     # Hold the log open rather than reopening it 3600 times an hour.
     exec 3>"$CSV"
     # Fractional epoch seconds: at this rate whole seconds would quantise dt by
@@ -427,7 +441,7 @@ do_report(){
 # The sign is not decoration. An earlier version used |I| and so added the
 # correction while CHARGING too, where the terminal voltage is already ABOVE the
 # OCV -- asked about a pack sitting at 4.030 V taking 2.081 A it answered
-# 4.172 V and "100%" for a pack actually near 3.888 V and 54%.
+# 4.172 V and "100%" for a pack actually near 3.888 V and 51%.
 do_soc(){
     local uv=${1:-} ua=${2:-0}
     [[ -n $uv ]] || { err "usage: uconsole-battery-calibrate soc <voltage_uv> [current_ua]"; exit 2; }

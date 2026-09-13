@@ -72,8 +72,9 @@ Windows open fullscreen, which covers waybar. If you would rather see the status
 comment out the two `fullscreen enable` lines in `~/.config/sway/config` — with
 `default_border none` a single window already fills the workspace.
 
-The screen dims after 5 minutes of idle and returns on any key or trackball movement. It
-deliberately does **not** use `dpms`, which does not come back on this panel.
+The screen dims after 5 minutes of idle and returns on any key or trackball movement. A
+power-button tap goes further and powers the panel down too — see
+[Low-power blank](#low-power-blank).
 
 ## tmux — sessions survive reboots
 
@@ -288,8 +289,8 @@ machine reachable.
 
 ## Coming back where you left off
 
-There is no suspend on this hardware, and a blanked machine still draws ~3.2 W of SoC,
-DSI panel and RP1 that userspace cannot switch off. The only state that reaches zero is
+There is no suspend on this hardware, and a blanked machine still draws ~2.6 W of SoC and
+RP1 that userspace cannot switch off. The only state that reaches zero is
 **off** — so instead of sleeping, this image powers off and puts your desktop back.
 
 Nothing to run and nothing to remember. `uconsole-session-snapshot` records what is open
@@ -407,27 +408,25 @@ absolutes.**
 
 ### After a cell swap
 
-Runtime estimates use `PACK_WH` from `/etc/uconsole/lowpower.conf`. Don't edit it by hand
-and don't redo the arithmetic — tell the tool what's fitted:
+Runtime estimates use `PACK_WH` from `/etc/uconsole/lowpower.conf`, which is **measured** on
+this unit: 18.0 Wh, against 25.9 Wh on the label of the two 3500 mAh cells. The label does
+not apply here — cells are rated down to ~2.7 V and this machine stops at 3.40 V. After a
+swap, measure the pack and set what the run reports:
 
 ```bash
-sudo uconsole-power-probe pack 2x3500
+sudo uconsole-battery-calibrate run
+sudo uconsole-power-probe pack <Wh>
 ```
 
-| Cells (parallel) | `PACK_WH` |
-|---|---|
-| 2 × 2000 mAh | 14.8 Wh |
-| 2 × 3500 mAh — **fitted** | 25.9 Wh |
-
-`uconsole-power-probe pack` with no argument shows what's currently set. A bare number
-(`pack 20.35`) sets watt-hours directly, which is what you want after measuring the pack
-for real.
+A bare number sets watt-hours directly; `uconsole-power-probe pack` with no argument shows
+what's set. `pack 2x3500` still works, but writes the nameplate figure (3.7 V × mAh), which
+this machine cannot reach.
 
 Nothing safety-critical reads this value — the low-voltage guard is voltage-based and
-never consults it. The estimate it produces is an **upper bound**: the guard shuts down at
-3.40 V, well above where an 18650 is actually empty, so several percent of nominal energy
-is never available to you. Nameplate capacity is optimistic too, especially on used cells,
-so `sudo uconsole-battery-calibrate run` gives a truer figure than any datasheet.
+never consults it. The estimate is still an **upper bound**: part of the 18 Wh is
+extrapolated below the lowest voltage the calibration reached, and the guard reads loaded
+voltage, so it shuts down a little earlier than the figure assumes. Expect about 6 h at
+the ~2.6 W blank.
 
 > **Pairing cells.** The AXP223 is a single-cell PMIC: it sees the parallel pair as one
 > cell and balances nothing. Fit two cells of the **same capacity, age and charge level**.
