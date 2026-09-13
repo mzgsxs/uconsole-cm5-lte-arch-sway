@@ -808,6 +808,10 @@ check "table carries its resistance"    "grep -q 'pack_resistance_ohm' $MNT/usr/
 check "soc corrects load to OCV"        "grep -qF 'ocv = uv/1e6 - (ua/1e6) * R' $MNT/usr/local/bin/uconsole-battery-calibrate"
 check "soc flags off-table lookups"     "grep -q 'clamped=' $MNT/usr/local/bin/uconsole-battery-calibrate"
 check "stops above the PMU cutoff"     "grep -q 'FLOOR_UV:-3500000' $MNT/usr/local/bin/uconsole-battery-calibrate"
+# A new run used to truncate the last one's log; that lost the only full-discharge
+# record on the test unit. The archive must happen BEFORE the log is opened.
+check "run archives the previous run first" \
+      "[[ \$(grep -n 'mv \"\$f\" \"\$keep\"/' $MNT/usr/local/bin/uconsole-battery-calibrate | cut -d: -f1) -lt \$(grep -n 'exec 3>\"\$CSV\"' $MNT/usr/local/bin/uconsole-battery-calibrate | cut -d: -f1) ]]"
 check "warns when the modem is powered" "grep -q 'modem_is_on' $MNT/usr/local/bin/uconsole-battery-calibrate"
 # The AXP223 driver never sets status=Full: measured at 4.213V / 100% / 5mA it
 # still read "Charging". Waiting on that string hung phase 1 forever on a pack
