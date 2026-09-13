@@ -300,8 +300,8 @@ check "trackball uses flat accel"      "grep -q 'accel_profile flat' $MNT/etc/sk
 check "trackball scroll on right btn"  "grep -q 'scroll_button button3' $MNT/etc/skel/.config/sway/config"
 # S3.8: dpms must NOT be the idle action -- only mentioned in the explanatory
 # comment. Assert the backlight path is what swayidle actually runs.
-check "idle dims the backlight"        "grep -q \"timeout 300 'brightnessctl -s set 0'\" $MNT/etc/skel/.config/sway/config"
-check "idle restores the backlight"    "grep -q \"resume    'brightnessctl -r'\" $MNT/etc/skel/.config/sway/config"
+check "idle dims the backlight"        "grep -qF \"timeout 300 'uconsole-idle-dim off'\" $MNT/etc/skel/.config/sway/config"
+check "idle restores the backlight"    "grep -qF \"resume      'uconsole-idle-dim undim'\" $MNT/etc/skel/.config/sway/config"
 check "no active dpms idle action"     "! grep -vE '^\\s*#' $MNT/etc/skel/.config/sway/config | grep -q dpms"
 # Comment lines are excluded: the config now *explains* swaylock in a comment,
 # and an earlier version of this check matched that prose rather than a setting.
