@@ -142,17 +142,23 @@ do_down() {
             log "no modem to power down"
         fi
 
-        # Optionally also drop the supply rail. Off by default: it costs a full
-        # re-enumeration on wake (up to the 180s unit timeout) and buys little
-        # once the radio is already asleep.
+        # Optionally power the module itself down with its power key. Off by
+        # default; see MODEM_RAIL_OFF_ON_BLANK in lowpower.conf.
+        #
+        # Queued as a STOP JOB on the unit that owns the module, never called
+        # directly. Its ExecStop (`disable`) waits for the module to detach,
+        # ~22 s and up to 45 s, which would block a descent that runs under
+        # `sudo -n` from a key binding. The job also keeps the wake from racing
+        # a press: uconsole-modem-wake --rail-cut restarts this unit, and systemd
+        # queues that start behind a stop still in flight rather than killing it
+        # (measured on the device with a throwaway unit). So `up` must not stop
+        # anything modem-related itself.
         if [[ ${MODEM_RAIL_OFF_ON_BLANK:-0} == 1 ]]; then
             save "modem_rail_cut" 1
-            /usr/local/bin/uconsole-modem-power disable >/dev/null 2>&1
-            sleep 1
-            if grep -qs 1e0e /sys/bus/usb/devices/*/idVendor; then
-                log "WARNING: rail released but the modem is still on the USB bus"
+            if systemctl stop --no-block uconsole-modem-power.service 2>/dev/null; then
+                log "modem power-down queued (uconsole-modem-power.service stop job)"
             else
-                log "modem rail released; module off the bus"
+                log "WARNING: could not queue the modem power-down"
             fi
         fi
     fi

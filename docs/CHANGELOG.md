@@ -1,5 +1,39 @@
 # Changelog
 
+## `uconsole-modem-power disable` now actually turns the modem off
+
+It never did. It killed the process holding GPIO 24 and reported success, while the SIM7600
+stayed registered and connected. That came out when a battery calibration asked for the
+modem to be off, and it was not.
+
+Two things were wrong, both measured on the device:
+
+- **GPIO 24 is the module's power key, not its supply.** The vendor calls it `POWER_MCU`,
+  and this script held it at 1 as if it were an enable. Driving it to 0 under a running
+  module does nothing. A 3 s press powers the module down: it leaves USB about 22 s later,
+  after detaching from the network. A 1.5 s press brings it back, on USB 8 s later. GPIO 15,
+  the vendor's `RESET_MCU`, is a reset: asserted, the module drops off USB and is back 8 s
+  later.
+- **Releasing a GPIO changes nothing on this kernel anyway.** `pinctrl-rp1` defaults to
+  `persist_gpio_outputs=Y`, which leaves a freed line driving its last level.
+
+Both verbs now press the key and check the result on the USB bus:
+
+- Each press releases the key first, since a key held down since power-on is not a new
+  press, and the key is held up afterwards.
+- `disable` waits for the module to finish booting before it presses. A press 9 s after
+  power-on was ignored.
+- At shutdown `disable` presses and returns, so a poweroff costs ~3.5 s rather than ~25 s.
+- `status` reports the key's level and ModemManager's power state.
+
+**On the blank.** `MODEM_RAIL_OFF_ON_BLANK=1` used to run the old no-op `disable`, wait
+for it to return, and check the bus one second later. It now queues `disable` as a stop job
+on `uconsole-modem-power.service`, so the descent returns at once. The wake's `restart`
+waits for a power-down that is still in progress instead of racing it; this was checked
+on the device with a throwaway unit. A press that is killed part-way now releases the key
+rather than leaving it held down. The setting stays off by default, because its saving over
+the radio's low-power state has not been measured.
+
 ## A hung CM5 recovers by itself: hardware watchdog and REISUB
 
 - **`RuntimeWatchdogSec=15`** (`/etc/systemd/system.conf.d/uconsole-watchdog.conf`). On a

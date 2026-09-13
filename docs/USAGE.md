@@ -108,10 +108,16 @@ To save immediately: `prefix + Ctrl-s`. To restore by hand: `prefix + Ctrl-r`.
 ## LTE
 
 ```bash
-sudo uconsole-modem-power status      # is the module powered and enumerated?
+sudo uconsole-modem-power status      # on USB? power line held at what level?
 sudo uconsole-modem-power enable      # power it on
-sudo uconsole-modem-power disable     # release the power line
+sudo uconsole-modem-power disable     # radio off the air, supply cut, checked off USB
 ```
+
+Both verbs press the module's **power key** — GPIO 24, which the vendor calls `POWER_MCU`
+but which is not its supply — and then check the USB bus. `disable` takes about 25 s,
+because the module detaches from the network before it powers down. It used to release the
+line and report success while the modem stayed registered and connected. After `enable`,
+bring the data connection back with `sudo systemctl start uconsole-modem-connect.service`.
 
 The modem powers on at boot via `uconsole-modem-power.service`, and
 `uconsole-modem-connect.service` brings up the bearer with `raw_ip`, roaming allowed and

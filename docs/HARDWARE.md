@@ -158,7 +158,7 @@ Derived from an on-device defect report. Section numbers reference that report.
 | § | Defect | Status in this image |
 |---|---|---|
 | 3.1 | Root filesystem never expands — `parted -s` answers *No* to the in-use prompt, then the script stamps itself done and never retries | **Fixed** — uses `growpart`, asserts the partition grew, stamps only on success |
-| 3.2 | 4G power-on broken on CM5: wrong gpiochip, libgpiod v1 syntax, line released on exit, and `ExecStart=-` hiding the failure | **Fixed** — `uconsole-modem-power` detects the chip by label and holds the line; the unit no longer masks failures |
+| 3.2 | 4G power-on broken on CM5: wrong gpiochip, libgpiod v1 syntax, line released on exit, and `ExecStart=-` hiding the failure | **Fixed** — `uconsole-modem-power` detects the chip by label, and the unit no longer masks failures. Its `disable` never worked, though. GPIO 24 is the module's **power key**, not its supply, and GPIO 15 is its reset (measured). Both verbs now press the key and check the USB bus |
 | 3.3 | LTE defaults: QMI `raw_ip` off, roaming disallowed, MTU 1500 when the carrier advertises 1280 | **Fixed** — `uconsole-modem-connect` sets all three from the bearer |
 | 3.4 | `systemd-networkd` and NetworkManager both enabled: two-minute boot delay, and timesyncd never syncs because it follows networkd's online signal | **Fixed** — networkd disabled, wait-online masked |
 | 3.5 | No low-voltage protection; the gauge reads ~71 % about an hour before an undervoltage cut | **Guard shipped** — voltage-based, warns at 3.50 V, clean shutdown at 3.40 V. Root cause of the gauge error now identified — see below |
@@ -317,7 +317,7 @@ Ranked by what they are worth, which is not the order anyone here had assumed:
 |---|---|---|
 | **Backlight, off → maximum** | **1.964 W** | The most expensive component on the machine. Convex: see below |
 | **DSI panel + controller** | **0.714 W** | Already taken on blank (`PANEL_OFF_ON_BLANK`) |
-| **Modem powered down** | **0.325 W** | With the power-key `disable` from the s2idle branch (`cbb4662`). **Not on `main` yet**: main's `disable` does not power the module down, and its blank only puts the radio in low power |
+| **Modem powered down** | **0.325 W** | Against a registered, connected modem, with the power-key `uconsole-modem-power disable`. On the blank it is `MODEM_RAIL_OFF_ON_BLANK`, off by default: what it saves over the blank's radio low-power is not yet measured |
 | USB autosuspend | ~0.1 W | −98 mW on every device; −73 mW of that is the modem, −10 mW the keyboard. Not worth taking; see below |
 | CPU ceiling pinned to 1.5 GHz | **0.064 W** | At idle. Already taken on blank (`CPU_CLAMP_ON_BLANK`) |
 | Wi-Fi 802.11 power save | not resolved | −61 mW, but the two reference windows disagreed by 298 mW |
@@ -354,12 +354,12 @@ USB autosuspend is known to break data connections, for a tenth of a watt, while
 modem down entirely is worth 0.325 W. It is not enabled, and there is no longer any reason to
 test whether a keypress wakes a suspended keyboard.
 
-**The 0.325 W modem figure is not available on `main` yet.** It was measured with the
-power-key `uconsole-modem-power disable` that the test unit runs, from the s2idle branch
-(`cbb4662`). On `main`, `disable` kills the process holding GPIO 24 and reports success while
-the SIM7600 stays registered, and the blank (`MODEM_OFF_ON_BLANK`) only asks ModemManager for
-radio low-power — which has not been priced. `uconsole-power-budget measure modem-off` run
-against main's script would measure that no-op, not the saving.
+**The 0.325 W modem figure is against a registered, connected modem.** It was measured with
+the power-key `uconsole-modem-power disable`, which is now what ships: the old `disable` killed
+the process holding GPIO 24 and reported success while the SIM7600 stayed registered. The
+blank's default (`MODEM_OFF_ON_BLANK`) still only asks ModemManager for radio low-power, and
+what powering the module off saves *over that* has not been priced.
+`MODEM_RAIL_OFF_ON_BLANK=1` makes the blank power it off.
 
 ### There is no cpuidle here, and the firmware is why
 
