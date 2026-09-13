@@ -4,7 +4,8 @@
 #   uconsole-power-probe run          baseline -> blank -> wake -> report
 #   uconsole-power-probe report [F]   summarise a log
 #   uconsole-power-probe watch        live readings, one line per interval
-#   uconsole-power-probe pack 2x3500  record which cells are fitted
+#   uconsole-power-probe pack <Wh>    record the pack's measured energy
+#                                     (pack 2x3500 writes the nameplate instead)
 #
 # WHY THIS EXISTS
 #
@@ -35,8 +36,9 @@ B=/sys/class/power_supply/axp20x-battery
 AC=/sys/class/power_supply/axp22x-ac/online
 CONF=/etc/uconsole/lowpower.conf
 # Pack size varies with whatever cells are actually fitted, so it is policy, not
-# a constant. The fallback assumes 2x 18650 3500mAh in parallel (3.7V * 7.0Ah).
-PACK_WH=25.9
+# a constant. The fallback is the pack as measured on this unit (see PACK_WH in
+# lowpower.conf), not the 25.9 Wh nameplate, which this machine cannot reach.
+PACK_WH=18.0
 # shellcheck source=/dev/null
 [[ -r $CONF ]] && . "$CONF"
 OUTDIR="${XDG_STATE_HOME:-$HOME/.local/state}/uconsole/power"
@@ -393,7 +395,7 @@ do_pack() {
             "$([[ -r $CONF ]] && grep -q '^PACK_WH=' "$CONF" && echo "$CONF" || echo "built-in default")"
         printf 'implies  %.0f mAh at 3.7V nominal\n' "$(awk -v w="$PACK_WH" 'BEGIN{print w/3.7*1000}')"
         echo
-        echo "set it with, e.g.:  sudo uconsole-power-probe pack 2x3500"
+        echo "set it with:  sudo uconsole-power-probe pack <Wh>   (measure: sudo uconsole-battery-calibrate run)"
         return 0
     fi
 

@@ -183,7 +183,7 @@ PKGS_DEV=(
   mpv imv             # media and images, so the panel can actually be exercised
   neovim              # editing on the device without scp round-trips
   git htop strace     # triage
-  powertop            # wakeup counts -- the one lever left after the 3.2W floor
+  powertop            # wakeup counts -- the one lever left after the 2.6W floor
   net-tools           # ifconfig/route, for comparing against the ip(8) output
   tcpdump             # LTE vs Wi-Fi path debugging
 )

@@ -290,7 +290,10 @@ Measured on this hardware:
 - LTE connected but not routed ("hot standby"): ~0.1 W, ~4 MiB/month
 - LTE transmit burst: 4.4 A swing, 305 mV rail sag
 - Pack, **measured**: **4.47 Ah / 16.5 Wh** down to 3.50 V resting, **4.9 Ah / ~18 Wh** down
-  to the 3.40 V the guard cuts at. That is the energy this machine can actually use, and it
+  to the 3.40 V the guard cuts at. The second figure is optimistic: it extrapolates in a
+  straight line below the lowest voltage the run reached, where the curve was already
+  steepening, and the guard reads *loaded* voltage, so it fires above 3.40 V resting.
+  Expect about **6 h** at the 2.632 W blank. That is the energy this machine can use, and it
   is **not** comparable to the 2× 18650 3500 mAh nameplate: an 18650's rated capacity is
   measured down to a ~2.7 V cutoff, and this device never goes below 3.40 V. The charge
   between those two voltages is real and simply out of reach here. Parallel is not an

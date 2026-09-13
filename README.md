@@ -23,7 +23,7 @@ tarball's SHA-256 and says so when it differs.
 > pull, and this image masks them deliberately. See
 > [`docs/HARDWARE.md`](docs/HARDWARE.md) §3.9.
 >
-> Because suspend is unreachable and a blanked machine still draws ~3.2 W that userspace
+> Because suspend is unreachable and a blanked machine still draws ~2.6 W that userspace
 > cannot switch off, this image **powers off and restores your session** instead of
 > sleeping. Hold the power key ~2 s; log back in and your applications return to the
 > workspaces they were on.

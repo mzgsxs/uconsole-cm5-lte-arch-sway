@@ -102,7 +102,7 @@ Small, and each one closes a question that is currently guessed at.
 |---|---|
 | Does the boot-time clock ceiling depend on AC vs battery? | One boot on each, read `scaling_max_freq` immediately |
 | What does Wi-Fi actually cost during a blank? | `RADIO_OFF_ON_BLANK=0`, compare with `uconsole-power-probe run` |
-| Does cutting the modem rail move the 3.2 W floor? | `MODEM_RAIL_OFF_ON_BLANK=1`, same comparison |
+| Does cutting the modem rail move the 2.6 W floor? | `MODEM_RAIL_OFF_ON_BLANK=1`, same comparison |
 | What is the pack's real capacity? | `uconsole-battery-calibrate run` — now that phase 1 terminates |
 | What does the machine draw while flashing? | `uconsole-power-probe` across an OTA write |
 

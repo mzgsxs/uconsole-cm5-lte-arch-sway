@@ -144,12 +144,17 @@ sudo sed -i '/uconsole-arch/,+2d' /etc/pacman.conf
 
 ## The screen goes black after 5 minutes and never comes back
 
-Caused by `output dpms off` as the idle action. On the `cwu50` panel the power-down does
-not reverse — no keyboard or trackball input revives it, and it presents as a completely
-hung machine. The kernel log shows the panel re-enable never firing.
+Idle only dims the **backlight**, and any key or trackball movement brings it back. A
+power-button tap goes further and **powers the DSI panel down**; the next tap restores it
+over sway IPC (`output … power on`, then `enable`). If a wake leaves the screen dark,
+`journalctl -t uconsole-screen-toggle -b` says which restore path it tried.
 
-This image dims the **backlight** instead and never uses `dpms`. If you reintroduce
-`dpms off`, validate it on the panel first and keep a documented recovery key.
+To recover, press `Ctrl`+`Alt`+`F2` then `Ctrl`+`Alt`+`F1` — switching VTs re-initialises
+the panel — or log in on VT2 and run `uconsole-unstick`.
+
+This section used to say the `cwu50` panel never returns from `dpms off`. That was a
+misdiagnosis: sway needs `power on` **and** `enable`, and each alone reports success and
+changes nothing (S3.8 in [`HARDWARE.md`](HARDWARE.md)).
 
 ---
 
@@ -239,11 +244,15 @@ anything matching `power`/`pek`/`axp`, which is a guess about a device identifie
 cannot be verified in advance. It now silences **pointer devices only** and never
 keyboards, so whatever the power key's device happens to be called, it survives.
 
-**Recovering a machine that is stuck black**, over SSH:
+**Recovering a machine that is stuck black:** from `Ctrl`+`Alt`+`F2`, or over SSH if the
+blank left Wi-Fi up:
 
 ```bash
-brightnessctl set 50% && swaymsg input '*' events enabled && pkill swaylock
+sudo uconsole-unstick --unlock
 ```
+
+It re-enables input, powers the panel back on (the blank switches it off, so the backlight
+alone is not enough), restores the backlight and dismisses swaylock.
 
 A long power press also still powers off cleanly, because logind sees the power key
 directly rather than through the compositor.
@@ -422,8 +431,8 @@ journalctl -t uconsole-screen-toggle -t uconsole-lowpower -b | tail
 ```
 
 If it *did* engage and the saving is still around a watt, that is expected. Measured on
-this hardware: backlight ~0.7 W, everything else in the blank ~0.2 W, and a ~3.2 W floor
-of SoC, DSI panel and RP1/USB that userspace cannot reach.
+this hardware: 4.08 W screen-on to 2.63 W blanked, of which the DSI panel is 0.71 W. The
+~2.6 W left is a floor of SoC and RP1/USB that userspace cannot reach.
 
 ## ssh refuses to connect after an OTA flash
 
