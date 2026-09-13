@@ -38,23 +38,12 @@ in [`CHANGELOG.md`](CHANGELOG.md). Left open:
 
 ---
 
-## 2. Escalation timer — standby that ends
+## 2. Escalation timer — declined
 
-`STANDBY_POWEROFF_MIN` is reserved in `/etc/uconsole/lowpower.conf` and read by nothing.
-
-**Why it matters.** A blanked machine still draws ~3.2 W, and that is a floor set by the
-SoC, the DSI panel and the RP1/USB tree — not something userspace can reduce further. The
-measurements are unambiguous: the whole low-power blank recovers under a watt of a ~4 W
-idle. Only being *off* reaches zero, and session restore already exists to make "off"
-tolerable.
-
-**Shape.** Arm a transient timer on blank; cancel it on wake. When it fires, re-check AC
-(abort if plugged in), let the session snapshot settle, and power off. Everything needed
-already exists — `uconsole-session-snapshot` runs continuously and `tmux.service` forces a
-resurrect save in `ExecStop`.
-
-**The one thing that can lose work.** A timer that fails to cancel on wake powers the
-machine off in the user's hands. Test the cancel path before wiring anything else to it.
+**Not planned: shutdown stays manual.** A blank never powers the machine off on its own;
+hold the power key ~2 s when you want it off, and session restore brings the desktop back.
+The reserved `STANDBY_POWEROFF_MIN` key has been removed from `lowpower.conf`, so nothing
+promises a timer that will not be built.
 
 ---
 
